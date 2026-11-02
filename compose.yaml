@@ -1,0 +1,48 @@
+# Local development only. The default password is an example credential, not a secret to reuse.
+# Override POSTGRES_USER, POSTGRES_PASSWORD, and POSTGRES_DB in an untracked .env file.
+
+name: patchpilot
+
+services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-patchpilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-patchpilot_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-patchpilot}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build: .
+    image: patchpilot:local
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-patchpilot}:${POSTGRES_PASSWORD:-patchpilot_dev}@db:5432/${POSTGRES_DB:-patchpilot}
+      DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-3}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build: .
+    image: patchpilot:local
+    command: ["python", "-m", "patchpilot.worker"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-patchpilot}:${POSTGRES_PASSWORD:-patchpilot_dev}@db:5432/${POSTGRES_DB:-patchpilot}
+      WORKER_IDLE_SLEEP_SECONDS: ${WORKER_IDLE_SLEEP_SECONDS:-30}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
