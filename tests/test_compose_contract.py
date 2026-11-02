@@ -36,10 +36,33 @@ def test_project_dependencies_exclude_model_frameworks():
         assert name not in dependencies
 
 
+def test_worker_reaches_host_ollama_only_through_the_documented_gateway():
+    text = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    api, worker = text.split("\n  worker:\n", 1)
+
+    assert "OLLAMA_BASE_URL" not in api
+    assert "LLM_PROVIDER" not in api
+    assert "host.docker.internal:host-gateway" in worker
+    assert "LLM_PROVIDER: ${LLM_PROVIDER:-fake}" in worker
+    assert "OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}" in worker
+    assert "11434" not in api
+
+
+def test_readme_warns_about_ollama_network_bindings():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8").casefold()
+
+    assert "host.docker.internal" in readme
+    assert "host-gateway" in readme
+    assert "11434" in readme
+    assert "firewalld" in readme
+    assert "lan" in readme
+
+
 def test_env_example_is_present_and_env_is_ignored():
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
 
     assert "DATABASE_URL=" in example
+    assert "LLM_PROVIDER=fake" in example
     assert "patchpilot_dev" in example
     assert ".env" in ignore.splitlines()

@@ -38,10 +38,19 @@ services:
     build: .
     image: patchpilot:local
     command: ["python", "-m", "patchpilot.worker"]
+    # host-gateway is the host address on the Compose network. Port 11434 stays
+    # unpublished. See the README before pointing this service at Ollama.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-patchpilot}:${POSTGRES_PASSWORD:-patchpilot_dev}@db:5432/${POSTGRES_DB:-patchpilot}
       WORKER_IDLE_SLEEP_SECONDS: ${WORKER_IDLE_SLEEP_SECONDS:-30}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+      LLM_MODEL: ${LLM_MODEL:-gemma4:12b}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-180}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
     depends_on:
       db:
         condition: service_healthy

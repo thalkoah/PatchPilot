@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from patchpilot.config import Settings, get_settings
+from patchpilot.config import LLMSettings, Settings, get_settings
 
 
 def test_settings_load_database_url_from_environment(monkeypatch):
@@ -30,6 +30,87 @@ def test_settings_reject_missing_database_url(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_llm_settings_default_to_the_offline_provider(monkeypatch):
+    for name in (
+        "LLM_PROVIDER",
+        "LLM_MODEL",
+        "OLLAMA_BASE_URL",
+        "LLM_TIMEOUT_SECONDS",
+        "LLM_MAX_RETRIES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        _env_file=None,
+    )
+
+    assert settings.llm_provider == "fake"
+    assert settings.llm_model == "gemma4:12b"
+    assert settings.ollama_base_url == "http://127.0.0.1:11434"
+    assert settings.llm_timeout_seconds == 180
+    assert settings.llm_max_retries == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("llm_provider", "openai"),
+        ("llm_model", "gemma 4"),
+        ("ollama_base_url", "http://user:secret@127.0.0.1:11434"),
+        ("ollama_base_url", "file:///tmp/ollama"),
+        ("ollama_base_url", "http://127.0.0.1:11434/?token=secret"),
+        ("llm_max_retries", 4),
+        ("llm_timeout_seconds", 0),
+        ("llm_timeout_seconds", 601),
+    ],
+)
+def test_llm_settings_reject_unsafe_values(field, value):
+    with pytest.raises(ValidationError):
+        Settings(
+            database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+            _env_file=None,
+            **{field: value},
+        )
+
+
+def test_ollama_base_url_strips_a_trailing_slash():
+    settings = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        ollama_base_url="http://host.docker.internal:11434/",
+        _env_file=None,
+    )
+
+    assert settings.ollama_base_url == "http://host.docker.internal:11434"
+
+
+def test_llm_settings_load_without_a_database(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    for name in (
+        "LLM_PROVIDER",
+        "LLM_MODEL",
+        "OLLAMA_BASE_URL",
+        "LLM_TIMEOUT_SECONDS",
+        "LLM_MAX_RETRIES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = LLMSettings(_env_file=None)
+
+    assert settings.llm_provider == "fake"
+    assert settings.llm_model == "gemma4:12b"
+
+
+def test_llm_provider_name_is_case_insensitive():
+    settings = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        llm_provider="FAKE",
+        _env_file=None,
+    )
+
+    assert settings.llm_provider == "fake"
 
 
 def test_settings_reject_timeout_below_one_second():

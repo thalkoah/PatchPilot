@@ -1,6 +1,6 @@
 # PatchPilot
 
-Local-first, human-supervised software maintenance. PostgreSQL stores bug-report tasks. FastAPI creates and reads them. The worker process is still idle: it does not claim jobs or call a model.
+Local-first, human-supervised software maintenance. PostgreSQL stores bug-report tasks. FastAPI creates and reads them. The worker process is still idle and does not claim jobs. Model calls go through `generate_structured` and stay out of the API.
 
 ## Prerequisites
 
@@ -69,12 +69,52 @@ curl -s http://127.0.0.1:8000/api/v1/tasks/<id>
 curl -s 'http://127.0.0.1:8000/api/v1/tasks?status=queued&limit=20&offset=0'
 ```
 
+## Language model
+
+`generate_structured(prompt, schema, options)` is the model call. `TriageResult` carries classification, severity, a short summary, acceptance criteria, confidence, and `needs_clarification`. `FakeProvider` returns deterministic fixtures. `OllamaProvider` posts to Ollama `/api/chat` with `stream` false and the JSON schema in `format`. Pydantic validates every response. Invalid JSON and timeouts retry at most `LLM_MAX_RETRIES` extra times (0–3, default 2). The next failure raises `LLMResponseError` or `LLMTimeoutError`. Those messages omit the model text.
+
+`LLM_PROVIDER` defaults to `fake`. Leave that value for pytest and CI.
+
+Offline check:
+
+```bash
+uv run python scripts/check_llm.py
+```
+
+`LLM_TIMEOUT_SECONDS` defaults to 180 seconds per attempt. A cold local model can use most of that. Raise it when a larger model still times out. The ceiling is 600 seconds, and `LLM_MAX_RETRIES` stays between 0 and 3.
+
+Manual Ollama on the host, using a model you already have:
+
+```bash
+LLM_PROVIDER=ollama LLM_MODEL=gemma4:12b \
+  OLLAMA_BASE_URL=http://127.0.0.1:11434 \
+  uv run python scripts/check_llm.py
+```
+
+The script prints one schema-valid `TriageResult` as JSON.
+
+### Ollama from Compose on Fedora
+
+The worker service adds the host gateway and leaves the provider on `fake` until you opt in:
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+`host-gateway` is the host address on the Compose network. Podman Compose and Docker Compose both accept that value. When `OLLAMA_BASE_URL` is unset, the worker uses `http://host.docker.internal:11434`. A process on the host uses `http://127.0.0.1:11434`.
+
+Ollama listens on `127.0.0.1:11434` unless `OLLAMA_HOST` says otherwise. Packets that arrive on the bridge address do not reach a loopback socket. Serving the worker means Ollama has to listen on the bridge address, or on every interface.
+
+Keep port 11434 off the LAN and off the public internet. `OLLAMA_HOST=0.0.0.0:11434` accepts connections on every interface. On Fedora, leave 11434 closed in firewalld, or bind Ollama to the Compose bridge address only. PatchPilot sends no credentials to Ollama. Anyone who can open a TCP connection can use the model. Compose does not publish port 11434.
+
 ## Tests and lint
 
 ```bash
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
+uv run python scripts/check_llm.py
 ```
 
 Health and settings tests do not need a running database. The readiness failure test connects to a closed local port and checks that the password is not returned or logged.

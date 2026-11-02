@@ -1,4 +1,4 @@
-"""Idle worker process. Job claiming starts in a later task."""
+"""Idle worker process. Job claiming and model calls start in a later task."""
 
 import logging
 import time

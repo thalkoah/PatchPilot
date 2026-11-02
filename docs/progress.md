@@ -96,3 +96,45 @@ The services were left running. That smoke-test row is in the Compose database.
 ### Next task
 
 Task 03 — LLM abstraction with a deterministic test model.
+
+## Task 03 — LLM abstraction with a deterministic test model
+
+Status: complete (2026-11-02).
+
+`generate_structured(prompt, schema, options)` is the model call. `FakeProvider` returns deterministic `TriageResult` fixtures and does not open a socket. `OllamaProvider` posts to Ollama `/api/chat` with the JSON schema in `format`, validates the reply, and retries invalid JSON or a timeout at most `LLM_MAX_RETRIES` extra times (default 2, maximum 3). The failure types are `LLMResponseError`, `LLMTimeoutError`, and `LLMTransportError`. Their messages omit model text. The API and the idle worker do not call a provider. `LLM_PROVIDER` defaults to `fake`.
+
+### Evidence
+
+`uv run pytest` — 90 passed in 3.32s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 43 files already formatted.
+
+`uv run python scripts/check_llm.py` — exit 0. Stderr: `provider=fake`. Stdout was a schema-valid high-severity bug triage for the discount-endpoint prompt. The script did not need a database.
+
+`LLM_PROVIDER=ollama LLM_MODEL=gemma4:12b OLLAMA_BASE_URL=http://127.0.0.1:11434 uv run python scripts/check_llm.py` — exit 0 in about 117s. Ollama 0.34.1, model `gemma4:12b`, base URL `http://127.0.0.1:11434`. The parsed object classified the report as a high-severity bug with `needs_clarification` false. An earlier run with the 60 second default timed out on all three attempts, so the default timeout is 180 seconds per attempt.
+
+### Changed files
+
+- `src/patchpilot/llm/` — limits, triage schema, fake provider, Ollama provider, factory
+- `src/patchpilot/config.py` — provider, model, base URL, timeout, and retry settings
+- `scripts/check_llm.py`
+- `tests/test_llm.py`, `tests/test_config.py`, `tests/test_compose_contract.py`, `tests/test_task_boundaries.py`
+- `pyproject.toml`, `uv.lock` — `httpx2` is a runtime dependency
+- `compose.yaml` — worker `host-gateway` and LLM environment, provider still `fake`
+- `.env.example`, `README.md`, `docs/progress.md`
+- `src/patchpilot/worker.py` — docstring only; the process stays idle
+
+### Limitations
+
+- `docker compose` itself was not executed. The running Compose containers were not recreated, so they do not yet have the new worker environment.
+- The worker does not claim tasks or call the provider. The call is synchronous for that later worker loop.
+- Reaching Ollama from the worker container was not smoke-tested. Host Ollama is still bound to loopback, which a container cannot use until `OLLAMA_HOST` changes. Port 11434 is not published.
+- A 60 second timeout is too short for `gemma4:12b` on this host. The default is 180 seconds per attempt, and a timed-out call can be retried twice.
+- The `ollama` Python package is not a dependency. `httpx2` calls the chat API.
+- Token counts, cost, and per-stage model routing are later tasks.
+
+### Next task
+
+Task 04 — First operational LangGraph workflow.

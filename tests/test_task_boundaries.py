@@ -47,6 +47,19 @@ def test_dtos_are_not_the_http_or_repository_layer():
     assert not any(name.startswith("patchpilot.routes") for name in modules)
 
 
+def test_request_path_does_not_call_a_model():
+    for relative in (
+        "src/patchpilot/api.py",
+        "src/patchpilot/routes/tasks.py",
+        "src/patchpilot/worker.py",
+        "src/patchpilot/dependencies.py",
+    ):
+        modules = imported_modules(relative)
+        assert not any(
+            name == "patchpilot.llm" or name.startswith("patchpilot.llm.") for name in modules
+        ), relative
+
+
 def test_initial_migration_freezes_column_limits_and_rejected_status():
     text = (ROOT / "alembic/versions/20261102_0001_create_tasks.py").read_text(encoding="utf-8")
 
