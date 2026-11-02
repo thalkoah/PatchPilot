@@ -23,9 +23,8 @@ def test_live_does_not_contact_database(unreachable_database, monkeypatch):
         raise AssertionError("live probe must not open a database connection")
 
     monkeypatch.setattr("patchpilot.readiness.psycopg.connect", fail_connect)
-    client = TestClient(create_app())
-
-    response = client.get("/health/live")
+    with TestClient(create_app()) as client:
+        response = client.get("/health/live")
 
     assert response.status_code == 200
     assert response.json() == {"status": "live"}
@@ -60,18 +59,15 @@ def test_ready_reports_ok_when_postgres_answers_select_one(monkeypatch):
         return FakeConnection()
 
     monkeypatch.setattr("patchpilot.readiness.psycopg.connect", fake_connect)
-    client = TestClient(create_app())
-
-    response = client.get("/health/ready")
+    with TestClient(create_app()) as client:
+        response = client.get("/health/ready")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "database": "ready"}
 
 
 def test_ready_fails_when_database_is_unreachable(unreachable_database, caplog):
-    client = TestClient(create_app())
-
-    with caplog.at_level(logging.WARNING):
+    with TestClient(create_app()) as client, caplog.at_level(logging.WARNING):
         response = client.get("/health/ready")
 
     assert response.status_code == 503

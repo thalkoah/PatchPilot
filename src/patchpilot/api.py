@@ -1,16 +1,32 @@
 """HTTP application. Request handlers enqueue or read state; they do not run agents."""
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from patchpilot import __version__
 from patchpilot.config import get_settings
+from patchpilot.db.session import create_engine, create_session_factory
 from patchpilot.readiness import database_is_ready
+from patchpilot.routes.tasks import router as tasks_router
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="PatchPilot", version=__version__)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        engine = create_engine(settings)
+        _app.state.session_factory = create_session_factory(engine)
+        try:
+            yield
+        finally:
+            await engine.dispose()
+
+    app = FastAPI(title="PatchPilot", version=__version__, lifespan=lifespan)
+    app.include_router(tasks_router, prefix="/api/v1")
 
     @app.get("/health/live")
     def health_live() -> dict[str, str]:

@@ -16,9 +16,11 @@ FROM docker.io/library/python:3.12-slim-bookworm
 RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin app
 WORKDIR /app
 COPY --from=build --chown=app:app /app/.venv /app/.venv
+COPY --chown=app:app alembic.ini /app/alembic.ini
+COPY --chown=app:app alembic /app/alembic
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 USER app
 EXPOSE 8000
-CMD ["uvicorn", "patchpilot.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn patchpilot.api:create_app --factory --host 0.0.0.0 --port 8000"]

@@ -22,6 +22,8 @@ services:
   api:
     build: .
     image: patchpilot:local
+    # Migrate before serving. The worker does not migrate; it does not use the schema yet.
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn patchpilot.api:create_app --factory --host 0.0.0.0 --port 8000"]
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-patchpilot}:${POSTGRES_PASSWORD:-patchpilot_dev}@db:5432/${POSTGRES_DB:-patchpilot}
       DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-3}
