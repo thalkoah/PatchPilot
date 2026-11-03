@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from patchpilot.dependencies import get_event_repository, get_task_repository
 from patchpilot.repositories.events import EventRepository
-from patchpilot.repositories.tasks import TaskRepository
+from patchpilot.repositories.tasks import TaskRepository, UnregisteredRepositoryError
 from patchpilot.schemas.events import EventList, EventResponse
 from patchpilot.schemas.tasks import (
     DEFAULT_PAGE_LIMIT,
@@ -26,7 +26,14 @@ EventRepositoryDep = Annotated[EventRepository, Depends(get_event_repository)]
 
 @router.post("", status_code=201, response_model=TaskResponse)
 async def create_task(body: TaskCreate, repository: RepositoryDep) -> TaskResponse:
-    task = await repository.create(title=body.title, description=body.description)
+    try:
+        task = await repository.create(
+            title=body.title,
+            description=body.description,
+            repo_id=body.repo_id,
+        )
+    except UnregisteredRepositoryError:
+        raise HTTPException(status_code=422, detail="Repository is not registered") from None
     return TaskResponse.model_validate(task)
 
 

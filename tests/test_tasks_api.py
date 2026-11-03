@@ -3,6 +3,7 @@
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from tests.database import stamp_task
@@ -236,3 +237,87 @@ def test_invalid_list_query_is_422(client: TestClient, params: dict[str, object]
     assert response.status_code == 422
     locations = [tuple(error["loc"]) for error in response.json()["detail"]]
     assert any(field in location for location in locations)
+
+
+def insert_repository(database_url: str, *, enabled: bool = True) -> str:
+    repo_id = uuid4()
+    with psycopg.connect(database_url, autocommit=True) as connection:
+        connection.execute(
+            """
+            INSERT INTO repositories (
+                id, display_name, canonical_path, enabled, registration
+            )
+            VALUES (%s, %s, %s, %s, %s::jsonb)
+            """,
+            (
+                repo_id,
+                "Demo service",
+                "demo_service",
+                enabled,
+                '{"head": "0123456789abcdef0123456789abcdef01234567"}',
+            ),
+        )
+    return str(repo_id)
+
+
+def test_create_accepts_only_a_registered_repository(
+    client: TestClient,
+    postgres_database_url: str,
+):
+    repo_id = insert_repository(postgres_database_url)
+
+    created = client.post(
+        "/api/v1/tasks",
+        json={
+            "title": "Broken discount",
+            "description": "Unknown tier returns 500.",
+            "repo_id": repo_id,
+        },
+    )
+
+    assert created.status_code == 201, created.text
+    assert created.json()["repo_id"] == repo_id
+    assert created.json()["status"] == "queued"
+    fetched = client.get(f"/api/v1/tasks/{created.json()['id']}")
+    assert fetched.json()["repo_id"] == repo_id
+
+
+def test_unregistered_repository_is_422_and_stores_nothing(
+    client: TestClient,
+    postgres_database_url: str,
+):
+    disabled = insert_repository(postgres_database_url, enabled=False)
+    for repo_id in (str(uuid4()), disabled):
+        response = client.post(
+            "/api/v1/tasks",
+            json={
+                "title": "Broken discount",
+                "description": "Unknown tier returns 500.",
+                "repo_id": repo_id,
+            },
+        )
+
+        assert response.status_code == 422
+        assert response.json() == {"detail": "Repository is not registered"}
+
+    assert client.get("/api/v1/tasks").json()["total"] == 0
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"repo_id": "../secrets"},
+        {"repo_id": "/tmp/demo"},
+        {"path": "demo_service"},
+        {"git_url": "https://example.invalid/demo.git"},
+        {"canonical_path": "demo_service"},
+    ],
+)
+def test_task_cannot_name_a_path_or_git_url(client: TestClient, extra: dict[str, str]):
+    response = client.post(
+        "/api/v1/tasks",
+        json={"title": "Broken discount", "description": "Unknown tier returns 500.", **extra},
+    )
+
+    assert response.status_code == 422
+    assert client.get("/api/v1/tasks").json()["total"] == 0

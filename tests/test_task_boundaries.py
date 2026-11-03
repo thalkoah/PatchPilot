@@ -107,6 +107,19 @@ def test_initial_migration_freezes_column_limits_and_rejected_status():
     assert '"rejected"' in text
 
 
+def test_read_only_tools_do_not_touch_the_database_or_http():
+    modules = imported_modules("src/patchpilot/source/tools.py")
+    source = (ROOT / "src/patchpilot/source/tools.py").read_text(encoding="utf-8")
+
+    assert "patchpilot.source.paths" in modules
+    assert not any(name == "fastapi" or name.startswith("fastapi.") for name in modules)
+    assert not any(name == "sqlalchemy" or name.startswith("sqlalchemy.") for name in modules)
+    assert not any(name.startswith("patchpilot.repositories") for name in modules)
+    assert not any(name.startswith("patchpilot.db") for name in modules)
+    assert "write_text" not in source
+    assert "write_bytes" not in source
+
+
 def test_checkpoint_setup_is_not_an_alembic_migration():
     modules = imported_modules("src/patchpilot/checkpoints.py")
     alembic_text = "\n".join(

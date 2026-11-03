@@ -173,7 +173,7 @@ def fetch_status(database_url: str, task_id: UUID) -> str:
 
 def truncate_tasks(database_url: str) -> None:
     with psycopg.connect(database_url, autocommit=True) as connection:
-        connection.execute("TRUNCATE TABLE tasks CASCADE")
+        connection.execute("TRUNCATE TABLE repositories CASCADE")
 
 
 def expire_open_leases(database_url: str) -> None:

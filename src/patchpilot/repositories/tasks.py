@@ -7,7 +7,11 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from patchpilot.db.models import STAGE_MAX_LENGTH, Task, TaskStatus
+from patchpilot.db.models import STAGE_MAX_LENGTH, Repository, Task, TaskStatus
+
+
+class UnregisteredRepositoryError(Exception):
+    """The task named a repository that is missing or disabled."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,8 +29,23 @@ class TaskRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def create(self, *, title: str, description: str) -> Task:
-        task = Task(title=title, description=description, status=TaskStatus.QUEUED)
+    async def create(
+        self,
+        *,
+        title: str,
+        description: str,
+        repo_id: UUID | None = None,
+    ) -> Task:
+        if repo_id is not None:
+            repository = await self._session.get(Repository, repo_id)
+            if repository is None or not repository.enabled:
+                raise UnregisteredRepositoryError
+        task = Task(
+            title=title,
+            description=description,
+            repo_id=repo_id,
+            status=TaskStatus.QUEUED,
+        )
         self._session.add(task)
         await self._session.commit()
         await self._session.refresh(task)

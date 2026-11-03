@@ -44,6 +44,9 @@ coverage.xml
 *.pem
 *.log
 
+# Nested Git metadata created by scripts/init_demo_repo.py
+examples/demo_service/.git/
+
 # Local Compose overrides
 compose.override.yaml
 compose.override.yml

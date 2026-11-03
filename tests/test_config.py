@@ -115,6 +115,30 @@ def test_llm_provider_name_is_case_insensitive():
     assert settings.llm_provider == "fake"
 
 
+def test_repository_root_is_optional_and_must_be_absolute():
+    settings = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        repository_root="   ",
+        _env_file=None,
+    )
+
+    assert settings.repository_root is None
+
+    rooted = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        repository_root="/var/patchpilot/repositories",
+        _env_file=None,
+    )
+    assert rooted.repository_root == "/var/patchpilot/repositories"
+
+    with pytest.raises(ValidationError):
+        Settings(
+            database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+            repository_root="examples",
+            _env_file=None,
+        )
+
+
 def test_settings_reject_timeout_below_one_second():
     with pytest.raises(ValidationError):
         Settings(

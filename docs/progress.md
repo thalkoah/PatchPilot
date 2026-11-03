@@ -282,3 +282,55 @@ The running Compose stack was not recreated. It is still the Task 05 image, so i
 ### Next task
 
 Task 07 — Repository registry and safe read-only tools.
+
+## Task 07 — Repository registry and safe read-only tools
+
+Status: complete (2026-11-03).
+
+A task may name an enabled row in `repositories`. It cannot send a filesystem path or a Git URL. Registration is the local command `python -m patchpilot.source`. There is no HTTP registration route. The stored path is relative to `REPOSITORY_ROOT`. `registration` keeps the checked-out commit id and does not keep a host path or a Git remote.
+
+`list_tree`, `read_text_file`, and `search_text` read one checkout. They reject `..`, absolute paths, symlink escapes, `.git`, credential names, binaries, and files over 32768 bytes. Listings omit denied names. Search is a literal substring and does not follow symlinks. The triage worker does not call these tools. Alembic head is `0003_repositories`.
+
+`examples/demo_service` is a small FastAPI checkout. Known tiers return a discount. An unknown tier still raises `KeyError`, so the endpoint returns HTTP 500. The regression test expects HTTP 422 and fails on purpose.
+
+### Evidence
+
+`uv run pytest` — 160 passed in 11.37s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 77 files already formatted.
+
+`uv run pytest examples/demo_service/tests/test_baseline.py` — 2 passed in 0.11s.
+
+`uv run pytest examples/demo_service/tests/test_unknown_tier.py` — 1 failed, as intended. `GET /discount?customer_tier=platinum` returned HTTP 500. The assertion expected HTTP 422. Exit code 1.
+
+`uv run python scripts/init_demo_repo.py` — exit 0. It created commit `74b808a` with the message `Baseline demo service with the unknown-tier defect.` A second run printed `demo repository already initialized`. The generated `examples/demo_service/.git/` was then removed so the parent repository tracks the source files instead of a gitlink. Run the script again before registering the checkout.
+
+The Compose containers `patchpilot_db_1`, `patchpilot_api_1`, and `patchpilot_worker_1` were already up and were left running. They do not have this migration or the read-only source mount until the next image rebuild recreates the API and worker.
+
+### Changed files
+
+- `alembic/versions/20261103_0003_repositories.py` — `repositories` and `fk_tasks_repo_id`
+- `src/patchpilot/db/models.py`, `repositories/repos.py`, `repositories/tasks.py` — registry rows and task `repo_id`
+- `src/patchpilot/schemas/tasks.py`, `routes/tasks.py` — optional registered `repo_id`
+- `src/patchpilot/source/` — path checks, read-only tools, registration, CLI
+- `src/patchpilot/config.py` — absolute `REPOSITORY_ROOT`
+- `examples/demo_service/` — buggy discount service and its pytest suite
+- `scripts/init_demo_repo.py`
+- `tests/test_source_tools.py`, `tests/test_repo_registry.py`, plus API, config, checkpoint, and Compose contract updates
+- `compose.yaml`, `.env.example`, `.gitignore`, `README.md`, `docs/progress.md`
+
+### Limitations
+
+- The running Compose stack was not recreated. `docker compose` itself was not executed. Podman is the runtime on this machine.
+- The worker still only triages. A `repo_id` is stored and survives a claim, and no agent reads the checkout yet.
+- Registration refuses a `.git` symlink or a checkout symlink that leaves `REPOSITORY_ROOT`. A hard link to a file outside the checkout is not detected. A file can also be replaced between the path check and the read.
+- Files over the byte limit are refused. A file over the line limit returns the first 400 lines with `truncated` true.
+- Search skips every symlink, including one whose target stays inside the checkout. `read_text_file` follows that internal symlink and reports the target path.
+- After `scripts/init_demo_repo.py`, `git add examples/demo_service` records a gitlink. The parent `.gitignore` ignores the nested `.git` directory, not the source files.
+- The Compose database port is still unpublished. Host registration needs a `DATABASE_URL` the host can reach, or `docker compose exec` on a rebuilt worker.
+
+### Next task
+
+Task 08 — Investigator agent with citations to source files.

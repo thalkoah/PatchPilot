@@ -1,6 +1,7 @@
 """Typed runtime settings loaded from the environment."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, field_validator
@@ -58,6 +59,7 @@ class Settings(LLMSettings):
     worker_idle_sleep_seconds: float = Field(default=2.0, gt=0, le=3600)
     worker_lease_seconds: float = Field(default=DEFAULT_WORKER_LEASE_SECONDS, gt=0, le=3600)
     worker_max_attempts: int = Field(default=DEFAULT_WORKER_MAX_ATTEMPTS, ge=1, le=20)
+    repository_root: str | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     @field_validator("database_url")
@@ -67,6 +69,21 @@ class Settings(LLMSettings):
         if scheme not in {"postgresql", "postgres"}:
             raise ValueError("database_url must use a postgresql:// or postgres:// URL")
         return value
+
+    @field_validator("repository_root", mode="before")
+    @classmethod
+    def repository_root_is_absolute(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("REPOSITORY_ROOT must be an absolute path")
+        stripped = value.strip()
+        if stripped == "":
+            return None
+        path = Path(stripped).expanduser()
+        if not path.is_absolute():
+            raise ValueError("REPOSITORY_ROOT must be an absolute path")
+        return str(path)
 
 
 @lru_cache

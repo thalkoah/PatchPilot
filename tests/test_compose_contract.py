@@ -74,6 +74,20 @@ def test_readme_documents_checkpoint_setup_outside_alembic():
     assert "thread_id" in readme
 
 
+def test_worker_mounts_registered_sources_read_only():
+    text = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    api, worker = text.split("\n  worker:\n", 1)
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert "REPOSITORY_ROOT: /repositories" in worker
+    assert "${REPOSITORY_ROOT_HOST:-./examples}:/repositories:ro" in worker
+    assert "/repositories" not in api
+    assert "python -m patchpilot.source" in readme
+    assert ":ro" in readme
+    assert "REPOSITORY_ROOT_HOST=./examples" in example
+
+
 def test_env_example_is_present_and_env_is_ignored():
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")

@@ -53,6 +53,11 @@ services:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-180}
       LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
+      # Checkouts registered under this directory. The host path is
+      # REPOSITORY_ROOT_HOST. The worker sees only /repositories, read-only.
+      REPOSITORY_ROOT: /repositories
+    volumes:
+      - ${REPOSITORY_ROOT_HOST:-./examples}:/repositories:ro
     depends_on:
       db:
         condition: service_healthy

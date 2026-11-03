@@ -20,6 +20,7 @@ class TaskCreate(BaseModel):
 
     title: str = Field(min_length=1, max_length=TITLE_MAX_LENGTH)
     description: str = Field(min_length=1, max_length=DESCRIPTION_MAX_LENGTH)
+    repo_id: UUID | None = None
 
 
 class TaskResponse(BaseModel):

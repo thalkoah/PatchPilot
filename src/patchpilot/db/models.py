@@ -6,6 +6,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -30,6 +31,8 @@ WORKER_ID_MAX_LENGTH = 64
 ERROR_CODE_MAX_LENGTH = 64
 EVENT_TYPE_MAX_LENGTH = 64
 IDEMPOTENCY_KEY_MAX_LENGTH = 200
+DISPLAY_NAME_MAX_LENGTH = 200
+CANONICAL_PATH_MAX_LENGTH = 512
 
 
 class TaskStatus(enum.StrEnum):
@@ -85,8 +88,12 @@ class Task(Base):
     id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
     title: Mapped[str] = mapped_column(String(TITLE_MAX_LENGTH), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    # Reserved for the repository registry. Creation leaves this null.
-    repo_id: Mapped[UUID | None] = mapped_column(PgUUID(as_uuid=True), nullable=True)
+    # Set only when the caller names an enabled row in `repositories`.
+    repo_id: Mapped[UUID | None] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("repositories.id", name="fk_tasks_repo_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     status: Mapped[TaskStatus] = mapped_column(task_status_type, nullable=False)
     stage: Mapped[str | None] = mapped_column(String(STAGE_MAX_LENGTH), nullable=True)
     result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -107,6 +114,69 @@ class Task(Base):
 
     def __repr__(self) -> str:
         return f"Task(id={self.id!s}, status={self.status})"
+
+
+class Repository(Base):
+    """A local Git checkout under `REPOSITORY_ROOT`. Paths stay relative."""
+
+    __tablename__ = "repositories"
+    __table_args__ = (
+        CheckConstraint(
+            "length(btrim(display_name)) > 0",
+            name="ck_repositories_display_name_not_blank",
+        ),
+        CheckConstraint(
+            f"char_length(display_name) <= {DISPLAY_NAME_MAX_LENGTH}",
+            name="ck_repositories_display_name_length",
+        ),
+        CheckConstraint(
+            "canonical_path ~ "
+            "'^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}"
+            "(/[A-Za-z0-9_][A-Za-z0-9._-]{0,63})*$'",
+            name="ck_repositories_canonical_path",
+        ),
+        CheckConstraint(
+            f"char_length(canonical_path) <= {CANONICAL_PATH_MAX_LENGTH}",
+            name="ck_repositories_canonical_path_length",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(registration) = 'object'",
+            name="ck_repositories_registration_object",
+        ),
+        UniqueConstraint("canonical_path", name="uq_repositories_canonical_path"),
+        Index("ix_repositories_enabled", "enabled"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    display_name: Mapped[str] = mapped_column(String(DISPLAY_NAME_MAX_LENGTH), nullable=False)
+    canonical_path: Mapped[str] = mapped_column(String(CANONICAL_PATH_MAX_LENGTH), nullable=False)
+    enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("true"),
+    )
+    registration: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'{}'::jsonb"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        onupdate=_utcnow,
+        server_default=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return f"Repository(id={self.id!s}, path={self.canonical_path})"
 
 
 class TaskRun(Base):
