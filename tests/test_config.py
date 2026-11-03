@@ -18,7 +18,7 @@ def test_settings_load_database_url_from_environment(monkeypatch):
     assert settings.database_url.endswith("@db:5432/patchpilot")
     assert settings.db_connect_timeout_seconds == 5
     assert settings.log_level == "DEBUG"
-    assert settings.worker_idle_sleep_seconds == 30.0
+    assert settings.worker_idle_sleep_seconds == 2.0
 
 
 def test_settings_reject_non_postgresql_url():

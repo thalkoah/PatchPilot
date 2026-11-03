@@ -1,6 +1,6 @@
 # PatchPilot
 
-Local-first, human-supervised software maintenance. PostgreSQL stores bug-report tasks. FastAPI creates and reads them. The worker process is still idle and does not claim jobs. Model calls go through `generate_structured` and stay out of the API.
+Local-first, human-supervised software maintenance. PostgreSQL stores bug-report tasks. FastAPI creates and reads them. A separate worker claims each queued task and runs a LangGraph triage workflow. Model calls go through `generate_structured` and stay out of the API.
 
 ## Prerequisites
 
@@ -33,11 +33,13 @@ alembic upgrade head
 
 That command is the image command and the Compose `api` command. It reads `DATABASE_URL` and refuses to start without it. Run the same command on the host with `uv run alembic upgrade head` when the API is not running in Compose. Point `DATABASE_URL` at `localhost` for a host process; Compose uses the `db` hostname.
 
-The worker process stays running and does not claim jobs. Follow it with:
+The worker polls for `queued` tasks, claims one at a time, and triages it. It does not serve HTTP. Follow it with:
 
 ```bash
 docker compose logs worker
 ```
+
+`WORKER_IDLE_SLEEP_SECONDS` is the pause when the queue is empty. The default is 2 seconds.
 
 Podman reads the same `compose.yaml`. When the Docker CLI is absent, use `podman-compose up --build -d`. `podman compose` needs a separate Compose plugin. Image names are fully qualified so a non-interactive Podman run does not prompt for a registry.
 
@@ -45,7 +47,7 @@ Stop the stack with `docker compose down`. Data stays in the `pgdata` volume, so
 
 ## Task API
 
-`POST /api/v1/tasks` validates a title and description and inserts a `queued` task. Callers cannot set status, stage, `repo_id`, or results. Those columns exist for later milestones; `repo_id` stays null, and `stage` stays null until a worker runs.
+`POST /api/v1/tasks` validates a title and description and inserts a `queued` task. The handler does not call a model. Callers cannot set status, stage, `repo_id`, or results. `repo_id` stays null. The worker fills `stage`, `result_summary`, and `result_json`.
 
 - `201` — task created
 - `404` — unknown task id
@@ -67,6 +69,39 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/tasks \
 curl -s http://127.0.0.1:8000/api/v1/tasks
 curl -s http://127.0.0.1:8000/api/v1/tasks/<id>
 curl -s 'http://127.0.0.1:8000/api/v1/tasks?status=queued&limit=20&offset=0'
+```
+
+## Triage workflow
+
+The worker runs a LangGraph `StateGraph` with the path `START -> triage -> finalize -> END`. This version compiles the graph with no checkpointer. The task row in PostgreSQL is the result that is still there after a restart. Durable graph checkpoints are a later task.
+
+The worker claims the oldest queued row, sets `running` and stage `triage`, and commits. That commit releases the row lock before the model call. `triage` calls `generate_structured` once. `finalize` checks the object again. A success stores status `completed`, stage `finalize`, the summary, and the validated triage object in `result_json`. A provider failure or any other error stores status `failed`, stage `triage`, a short summary, and `{"error": "..."}`. Those strings omit model text. Concurrency is 1. A crash during the model call leaves the task `running` until a later recovery task.
+
+Smoke test against the running stack. The worker container claims the task:
+
+```bash
+uv run python scripts/check_workflow.py --api-url http://127.0.0.1:8000
+```
+
+One in-process iteration, for a migrated database that no other worker is polling:
+
+```bash
+uv run python scripts/check_workflow.py --once
+```
+
+Manual Ollama, still in-process. Point `DATABASE_URL` at a database the host can reach. The Compose database port is not published; use `--api-url` for the stack.
+
+```bash
+LLM_PROVIDER=ollama LLM_MODEL=gemma4:12b \
+  OLLAMA_BASE_URL=http://127.0.0.1:11434 \
+  DATABASE_URL=postgresql://patchpilot:patchpilot_dev@127.0.0.1:5432/patchpilot \
+  uv run python scripts/check_workflow.py --once
+```
+
+When the Compose worker itself uses Ollama, set `LLM_PROVIDER=ollama` and read the binding warning below. Wait longer for that poll:
+
+```bash
+uv run python scripts/check_workflow.py --api-url http://127.0.0.1:8000 --timeout 600
 ```
 
 ## Language model
@@ -116,6 +151,8 @@ uv run ruff check .
 uv run ruff format --check .
 uv run python scripts/check_llm.py
 ```
+
+`scripts/check_workflow.py --once` also needs `DATABASE_URL` and a migrated database. The pytest suite covers that path with `FakeProvider`.
 
 Health and settings tests do not need a running database. The readiness failure test connects to a closed local port and checks that the password is not returned or logged.
 

@@ -52,7 +52,7 @@ class Settings(LLMSettings):
 
     database_url: str = Field(min_length=1)
     db_connect_timeout_seconds: int = Field(default=3, ge=1, le=30)
-    worker_idle_sleep_seconds: float = Field(default=30.0, gt=0, le=3600)
+    worker_idle_sleep_seconds: float = Field(default=2.0, gt=0, le=3600)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     @field_validator("database_url")

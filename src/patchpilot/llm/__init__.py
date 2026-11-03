@@ -1,1 +1,1 @@
-"""Model providers. Callers use generate_structured; the API does not."""
+"""Model providers. The workflow calls generate_structured; the API does not."""

@@ -9,7 +9,7 @@ API_COMMAND = (
 )
 
 
-def test_compose_starts_database_api_and_idle_worker():
+def test_compose_starts_database_api_and_worker():
     text = (ROOT / "compose.yaml").read_text(encoding="utf-8")
 
     assert "image: docker.io/library/postgres:16-alpine" in text
@@ -29,11 +29,13 @@ def test_api_image_runs_migrations_before_serving():
     assert API_COMMAND in dockerfile
 
 
-def test_project_dependencies_exclude_model_frameworks():
+def test_direct_dependencies_include_langgraph_and_exclude_cloud_sdks():
     text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     dependencies = text.split("[dependency-groups]", 1)[0]
-    for name in ("langgraph", "openai", "ollama", "langchain"):
-        assert name not in dependencies
+
+    assert '"langgraph' in dependencies
+    for name in ("openai", "ollama", "langchain", "langchain-openai", "langchain-core"):
+        assert f'"{name}' not in dependencies
 
 
 def test_worker_reaches_host_ollama_only_through_the_documented_gateway():
@@ -44,6 +46,7 @@ def test_worker_reaches_host_ollama_only_through_the_documented_gateway():
     assert "LLM_PROVIDER" not in api
     assert "host.docker.internal:host-gateway" in worker
     assert "LLM_PROVIDER: ${LLM_PROVIDER:-fake}" in worker
+    assert "WORKER_IDLE_SLEEP_SECONDS: ${WORKER_IDLE_SLEEP_SECONDS:-2}" in worker
     assert "OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}" in worker
     assert "11434" not in api
 
@@ -64,5 +67,6 @@ def test_env_example_is_present_and_env_is_ignored():
 
     assert "DATABASE_URL=" in example
     assert "LLM_PROVIDER=fake" in example
+    assert "WORKER_IDLE_SLEEP_SECONDS=2" in example
     assert "patchpilot_dev" in example
     assert ".env" in ignore.splitlines()

@@ -47,17 +47,40 @@ def test_dtos_are_not_the_http_or_repository_layer():
     assert not any(name.startswith("patchpilot.routes") for name in modules)
 
 
-def test_request_path_does_not_call_a_model():
+def test_request_path_does_not_call_a_model_or_schedule_background_work():
     for relative in (
         "src/patchpilot/api.py",
         "src/patchpilot/routes/tasks.py",
-        "src/patchpilot/worker.py",
         "src/patchpilot/dependencies.py",
     ):
         modules = imported_modules(relative)
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        assert "BackgroundTasks" not in source
         assert not any(
             name == "patchpilot.llm" or name.startswith("patchpilot.llm.") for name in modules
         ), relative
+        assert not any(name == "langgraph" or name.startswith("langgraph.") for name in modules)
+        assert not any(name.startswith("patchpilot.workflow") for name in modules), relative
+
+
+def test_worker_runs_the_graph_outside_the_api():
+    modules = imported_modules("src/patchpilot/worker.py")
+    source = (ROOT / "src/patchpilot/worker.py").read_text(encoding="utf-8")
+
+    assert "patchpilot.workflow.graph" in modules
+    assert "patchpilot.llm.factory" in modules
+    assert "BackgroundTasks" not in source
+    assert not any(name == "fastapi" or name.startswith("fastapi.") for name in modules)
+
+
+def test_triage_graph_does_not_touch_the_database_or_http():
+    modules = imported_modules("src/patchpilot/workflow/graph.py")
+
+    assert "langgraph.graph" in modules
+    assert not any(name == "fastapi" or name.startswith("fastapi.") for name in modules)
+    assert not any(name.startswith("patchpilot.repositories") for name in modules)
+    assert not any(name == "sqlalchemy" or name.startswith("sqlalchemy.") for name in modules)
+    assert "psycopg" not in modules
 
 
 def test_initial_migration_freezes_column_limits_and_rejected_status():

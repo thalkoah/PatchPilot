@@ -138,3 +138,52 @@ Status: complete (2026-11-02).
 ### Next task
 
 Task 04 — First operational LangGraph workflow.
+
+## Task 04 — First operational LangGraph workflow
+
+Status: complete (2026-11-02).
+
+The worker claims the oldest `queued` task, commits, and only then runs a LangGraph graph: `START -> triage -> finalize -> END`. The graph has no checkpointer. One `generate_structured` call produces a `TriageResult`. Success stores status `completed`, stage `finalize`, the summary, and the validated object in `result_json`. Failure stores status `failed`, stage `triage`, and `{"error": "..."}` with no model text. The API still only enqueues and reads. Concurrency is 1. `WORKER_IDLE_SLEEP_SECONDS` now defaults to 2. The worker handles `SIGTERM`, which matters because it is PID 1 in the container.
+
+### Evidence
+
+`uv run pytest` — 110 passed in 4.68s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 47 files already formatted.
+
+`uvx podman-compose up --build -d` rebuilt the image. The worker log: `worker started provider=fake concurrency=1`. It then completed the Task 02 smoke row `78bb0ae9-b814-4d8b-ad61-37030e4624ed`.
+
+`uv run python scripts/check_workflow.py --api-url http://127.0.0.1:8000` — exit 0. HTTP 201 was followed by a completed read. Id `4e72a9e9-df33-4e9f-9bdc-379d76361063`, stage `finalize`, summary `An unrecognized customer tier makes the discount endpoint return HTTP 500.` The triage object is the deterministic high-severity bug fixture.
+
+`uvx podman-compose restart api worker`, then `GET /api/v1/tasks/4e72a9e9-df33-4e9f-9bdc-379d76361063` — HTTP 200 with the same JSON body, including the same `updated_at`.
+
+`LLM_PROVIDER=ollama LLM_MODEL=gemma4:12b OLLAMA_BASE_URL=http://127.0.0.1:11434 uv run python scripts/check_workflow.py --once` — exit 0 in 64.86s against a disposable PostgreSQL 16 container, which was removed afterward. Ollama 0.34.1, model `gemma4:12b`. The stored result classified the report as a high-severity bug, `needs_clarification` false, summary `Discount endpoint returns 500 instead of 422 for unknown customer tiers`.
+
+After the image containing the signal handler was running, `uvx podman-compose restart worker` stopped it without the previous SIGKILL warning. The log shows `worker stopped` and then `worker started provider=fake concurrency=1`.
+
+The services were left running.
+
+### Changed files
+
+- `src/patchpilot/workflow/` — typed triage graph, no checkpointer
+- `src/patchpilot/worker.py` — claim loop, one task at a time, SIGTERM
+- `src/patchpilot/repositories/tasks.py` — `FOR UPDATE SKIP LOCKED` claim and terminal triage write
+- `scripts/check_workflow.py`
+- `src/patchpilot/config.py` — idle poll default is 2 seconds
+- `tests/test_workflow.py`, `tests/test_worker.py`, boundary, config, and Compose contract tests
+- `pyproject.toml`, `uv.lock` — `langgraph`
+- `compose.yaml`, `.env.example`, `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` itself was not executed. Podman Compose is the verified runner.
+- The graph is not checkpointed. A crash during the model call leaves the task `running` until a later recovery task.
+- The worker container was not pointed at Ollama. Host Ollama is still bound to loopback. The Ollama smoke ran in a host process.
+- Concurrency is fixed at 1. There is no lease, event log, or second agent.
+- `updated_at` still changes only when application code updates the row.
+
+### Next task
+
+Task 05 — Real LangGraph PostgreSQL checkpointing.
