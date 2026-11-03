@@ -7,6 +7,10 @@ from typing import Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from patchpilot.agents.limits import (
+    DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
+    HARD_MAX_INVESTIGATOR_TOOL_CALLS,
+)
 from patchpilot.llm.limits import (
     MAX_LLM_RETRIES,
     MAX_LLM_TIMEOUT_SECONDS,
@@ -59,6 +63,11 @@ class Settings(LLMSettings):
     worker_idle_sleep_seconds: float = Field(default=2.0, gt=0, le=3600)
     worker_lease_seconds: float = Field(default=DEFAULT_WORKER_LEASE_SECONDS, gt=0, le=3600)
     worker_max_attempts: int = Field(default=DEFAULT_WORKER_MAX_ATTEMPTS, ge=1, le=20)
+    investigator_max_tool_calls: int = Field(
+        default=DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
+        ge=1,
+        le=HARD_MAX_INVESTIGATOR_TOOL_CALLS,
+    )
     repository_root: str | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 

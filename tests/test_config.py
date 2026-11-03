@@ -139,6 +139,21 @@ def test_repository_root_is_optional_and_must_be_absolute():
         )
 
 
+def test_investigator_budget_defaults_to_six_and_stays_bounded():
+    settings = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        _env_file=None,
+    )
+
+    assert settings.investigator_max_tool_calls == 6
+    with pytest.raises(ValidationError):
+        Settings(
+            database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+            investigator_max_tool_calls=13,
+            _env_file=None,
+        )
+
+
 def test_settings_reject_timeout_below_one_second():
     with pytest.raises(ValidationError):
         Settings(

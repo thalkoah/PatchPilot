@@ -1,5 +1,8 @@
 """Worker process. It claims queued tasks and triages them outside the API.
 
+A task that names a registered repository is investigated after triage. The
+tools open only that checkout, and only after the claim transaction commits.
+
 The process owns the LangGraph checkpointer connection: it opens one after
 checkpoint setup and closes it when the loop stops. A claim stores a lease on
 `task_runs` and commits before the model call. A separate thread renews that
@@ -10,10 +13,12 @@ checkpoint or fails it once `WORKER_MAX_ATTEMPTS` is exhausted.
 import asyncio
 import logging
 import signal
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from patchpilot.agents.limits import DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS
 from patchpilot.checkpoints import open_checkpointer, setup_checkpoints
 from patchpilot.config import (
     DEFAULT_WORKER_LEASE_SECONDS,
@@ -26,8 +31,12 @@ from patchpilot.leases import LeaseKeeper
 from patchpilot.llm.factory import create_provider
 from patchpilot.llm.provider import LLMProvider
 from patchpilot.repositories.jobs import ClaimedTask, JobRepository
+from patchpilot.repositories.repos import RepoRepository
+from patchpilot.source.errors import SourceError
+from patchpilot.source.tools import RepositoryTools, open_repository_tools
 from patchpilot.workflow.graph import (
     GENERIC_FAILURE,
+    REPOSITORY_UNAVAILABLE,
     STAGE_TRIAGE,
     CompiledStateGraph,
     LeaseLost,
@@ -51,6 +60,8 @@ async def process_one(
     lease_seconds: float = DEFAULT_WORKER_LEASE_SECONDS,
     max_attempts: int = DEFAULT_WORKER_MAX_ATTEMPTS,
     database_url: str | None = None,
+    repository_root: Path | None = None,
+    max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
 ) -> bool:
     """Claim and finish one task. Return False when there is nothing to do.
 
@@ -84,6 +95,8 @@ async def process_one(
         item.claimed,
         lease_seconds=lease_seconds,
         database_url=database_url,
+        repository_root=repository_root,
+        max_tool_calls=max_tool_calls,
     )
     return True
 
@@ -97,6 +110,8 @@ async def process_task(
     worker_id: str | None = None,
     lease_seconds: float = DEFAULT_WORKER_LEASE_SECONDS,
     database_url: str | None = None,
+    repository_root: Path | None = None,
+    max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
 ) -> bool:
     """Triage one task when it is still queued. Return False if another worker owns it."""
     compiled = graph if graph is not None else compile_triage_graph()
@@ -117,6 +132,8 @@ async def process_task(
         claimed,
         lease_seconds=lease_seconds,
         database_url=database_url,
+        repository_root=repository_root,
+        max_tool_calls=max_tool_calls,
     )
     return True
 
@@ -134,6 +151,7 @@ async def serve(
     engine = None
     factory = session_factory
     database_url = None if session_factory is not None else settings.database_url
+    repository_root = Path(settings.repository_root) if settings.repository_root else None
     if factory is None:
         engine = create_engine(settings)
         factory = create_session_factory(engine)
@@ -149,6 +167,7 @@ async def serve(
                     graph,
                     "postgres",
                     database_url=database_url,
+                    repository_root=repository_root,
                 )
         else:
             await _poll(
@@ -158,6 +177,7 @@ async def serve(
                 compile_triage_graph(),
                 "none",
                 database_url=None,
+                repository_root=repository_root,
             )
     finally:
         if owns_provider:
@@ -197,6 +217,7 @@ async def _poll(
     checkpointer_name: str,
     *,
     database_url: str | None,
+    repository_root: Path | None,
 ) -> None:
     worker_id = new_worker_id()
     logger.info(
@@ -216,6 +237,8 @@ async def _poll(
                 lease_seconds=settings.worker_lease_seconds,
                 max_attempts=settings.worker_max_attempts,
                 database_url=database_url,
+                repository_root=repository_root,
+                max_tool_calls=settings.investigator_max_tool_calls,
             )
         except Exception as exc:
             logger.error("worker iteration failed: %s", type(exc).__name__)
@@ -233,8 +256,11 @@ async def _finish(
     *,
     lease_seconds: float,
     database_url: str | None,
+    repository_root: Path | None,
+    max_tool_calls: int,
 ) -> None:
     logger.info("claimed task=%s", claimed.id)
+    tools, repository_error = await _open_tools(session_factory, claimed, repository_root)
     keeper = None
     if database_url is not None:
         keeper = LeaseKeeper(
@@ -253,6 +279,10 @@ async def _finish(
                 description=claimed.description,
                 provider=provider,
                 lease_lost=None if keeper is None else keeper.lost,
+                repo_id=claimed.repo_id,
+                repository_tools=tools,
+                max_tool_calls=max_tool_calls,
+                repository_error=repository_error,
             )
         except LeaseLost:
             logger.warning("lease lost task=%s", claimed.id)
@@ -284,6 +314,26 @@ async def _finish(
         outcome.status.value,
         outcome.stage,
     )
+
+
+async def _open_tools(
+    session_factory: async_sessionmaker[AsyncSession],
+    claimed: ClaimedTask,
+    repository_root: Path | None,
+) -> tuple[RepositoryTools | None, str | None]:
+    """Open the claimed checkout. A task with no repository does not touch the disk."""
+    if claimed.repo_id is None:
+        return None, None
+    if repository_root is None:
+        return None, REPOSITORY_UNAVAILABLE
+    async with session_factory() as session:
+        row = await RepoRepository(session).get(claimed.repo_id)
+    if row is None or not row.enabled:
+        return None, REPOSITORY_UNAVAILABLE
+    try:
+        return open_repository_tools(repository_root, row.canonical_path), None
+    except SourceError:
+        return None, REPOSITORY_UNAVAILABLE
 
 
 if __name__ == "__main__":

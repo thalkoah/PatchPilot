@@ -50,8 +50,10 @@ from patchpilot.audit import (
 from patchpilot.db.models import Task, TaskRun, TaskStatus
 from patchpilot.repositories.events import append_event
 
-# Stage names written when one triage invocation covers both graph nodes.
+# Stage names written when the graph finishes. Investigate is present only when
+# the task named a repository and the report was stored.
 _STAGE_TRIAGE = "triage"
+_STAGE_INVESTIGATE = "investigate"
 _STAGE_FINALIZE = "finalize"
 
 
@@ -65,6 +67,7 @@ class ClaimedTask:
     run_id: UUID
     attempt: int
     worker_id: str
+    repo_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +257,7 @@ class JobRepository:
             run_id=run_id,
             attempt=attempt,
             worker_id=checked_worker,
+            repo_id=task.repo_id,
         )
         await self._session.commit()
         return WorkItem(claimed=claimed, acted=True, recovered=True)
@@ -348,7 +352,7 @@ class JobRepository:
                 ordinal=0,
             )
         else:
-            await self._record_success(task.id, claimed)
+            await self._record_success(task.id, claimed, result_json)
         await self._session.commit()
         return True
 
@@ -400,6 +404,7 @@ class JobRepository:
             run_id=run_id,
             attempt=attempt,
             worker_id=checked_worker,
+            repo_id=task.repo_id,
         )
         await self._session.commit()
         return claimed
@@ -428,8 +433,14 @@ class JobRepository:
             ordinal=0,
         )
 
-    async def _record_success(self, task_id: UUID, claimed: ClaimedTask) -> None:
+    async def _record_success(
+        self,
+        task_id: UUID,
+        claimed: ClaimedTask,
+        result_json: dict[str, Any],
+    ) -> None:
         attempt = {"attempt": claimed.attempt}
+        ordinal = 0
         await append_event(
             self._session,
             task_id=task_id,
@@ -443,8 +454,43 @@ class JobRepository:
                 event_type=STAGE_COMPLETED,
                 stage=_STAGE_TRIAGE,
             ),
-            ordinal=0,
+            ordinal=ordinal,
         )
+        ordinal += 1
+        investigation = _investigation_payload(result_json, claimed.attempt)
+        if investigation is not None:
+            await append_event(
+                self._session,
+                task_id=task_id,
+                run_id=claimed.run_id,
+                stage=_STAGE_INVESTIGATE,
+                event_type=STAGE_STARTED,
+                payload=attempt,
+                idempotency_key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_STARTED,
+                    stage=_STAGE_INVESTIGATE,
+                ),
+                ordinal=ordinal,
+            )
+            ordinal += 1
+            await append_event(
+                self._session,
+                task_id=task_id,
+                run_id=claimed.run_id,
+                stage=_STAGE_INVESTIGATE,
+                event_type=STAGE_COMPLETED,
+                payload=investigation,
+                idempotency_key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_COMPLETED,
+                    stage=_STAGE_INVESTIGATE,
+                ),
+                ordinal=ordinal,
+            )
+            ordinal += 1
         await append_event(
             self._session,
             task_id=task_id,
@@ -458,8 +504,9 @@ class JobRepository:
                 event_type=STAGE_STARTED,
                 stage=_STAGE_FINALIZE,
             ),
-            ordinal=1,
+            ordinal=ordinal,
         )
+        ordinal += 1
         await append_event(
             self._session,
             task_id=task_id,
@@ -473,8 +520,9 @@ class JobRepository:
                 event_type=STAGE_COMPLETED,
                 stage=_STAGE_FINALIZE,
             ),
-            ordinal=2,
+            ordinal=ordinal,
         )
+        ordinal += 1
         await append_event(
             self._session,
             task_id=task_id,
@@ -483,7 +531,7 @@ class JobRepository:
             event_type=TASK_COMPLETED,
             payload={**attempt, "status": TaskStatus.COMPLETED.value},
             idempotency_key=task_completed_key(task_id),
-            ordinal=3,
+            ordinal=ordinal,
         )
 
     async def _insert_run(
@@ -511,6 +559,31 @@ class JobRepository:
             select(func.max(TaskRun.attempt)).where(TaskRun.task_id == task_id)
         )
         return int(current or 0) + 1
+
+
+def _investigation_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any] | None:
+    """Citation labels only. File text and rejected paths stay out of the audit row."""
+    investigation = result_json.get("investigation")
+    if not isinstance(investigation, dict):
+        return None
+    report = investigation.get("report")
+    if not isinstance(report, dict):
+        return None
+    citations: list[str] = []
+    evidence = report.get("evidence")
+    if isinstance(evidence, list):
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("citation")
+            if isinstance(label, str) and label.strip():
+                citations.append(label)
+    return {
+        "attempt": attempt,
+        "tool_calls": investigation.get("tool_calls"),
+        "rejected_citations": investigation.get("rejected_citations"),
+        "citations": citations,
+    }
 
 
 def _lease_deadline(lease_seconds: float):

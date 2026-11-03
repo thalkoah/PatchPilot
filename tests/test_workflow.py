@@ -114,14 +114,16 @@ def client(postgres_database_url: str, clean_tasks: None, monkeypatch: pytest.Mo
         yield test_client
 
 
-def test_triage_graph_is_a_straight_line_without_a_checkpointer():
+def test_triage_graph_investigates_only_when_a_repository_is_attached():
     graph = compile_triage_graph()
 
     assert graph.checkpointer is False
     edges = {(edge.source, edge.target) for edge in graph.get_graph().edges}
     assert edges == {
         ("__start__", "triage"),
+        ("triage", "investigate"),
         ("triage", "finalize"),
+        ("investigate", "finalize"),
         ("finalize", "__end__"),
     }
 

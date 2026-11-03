@@ -1,4 +1,9 @@
-"""Triage workflow: START -> triage -> finalize -> END.
+"""Triage workflow.
+
+A task with no repository follows `START -> triage -> finalize -> END`. A task
+with a repo_id follows `START -> triage -> investigate -> finalize -> END`.
+The investigate node is the only place that reads a checkout. It does not run
+when triage failed or the task has no repository.
 
 The worker compiles this graph with an AsyncPostgresSaver. The task UUID is the
 LangGraph thread id. Checkpoint rows are not the business task record: the
@@ -20,16 +25,23 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
 from pydantic import ValidationError
 
+from patchpilot.agents.investigator import InvestigatorAgent, StopForLease
+from patchpilot.agents.limits import DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS
 from patchpilot.db.models import TaskStatus
 from patchpilot.llm.errors import LLMError
+from patchpilot.llm.investigation import InvestigationReport
 from patchpilot.llm.provider import LLMProvider
 from patchpilot.llm.triage import TriageResult
+from patchpilot.source.tools import RepositoryTools
 
 logger = logging.getLogger(__name__)
 
 STAGE_TRIAGE = "triage"
+STAGE_INVESTIGATE = "investigate"
 STAGE_FINALIZE = "finalize"
 GENERIC_FAILURE = "Triage failed before a valid result was produced."
+INVESTIGATION_FAILURE = "Investigation failed before a valid report was produced."
+REPOSITORY_UNAVAILABLE = "The registered repository could not be opened."
 MAX_FAILURE_CHARS = 500
 # Persist the checkpoint before the next node. "async" can still be in flight
 # when a node, or the process, ends.
@@ -44,9 +56,12 @@ class TriageState(TypedDict):
     task_id: str
     title: str
     description: str
+    repo_id: str | None
     triage: dict[str, Any] | None
+    investigation: dict[str, Any] | None
     result_summary: str | None
     error: str | None
+    failed_stage: str | None
     status: WorkflowStatus
 
 
@@ -60,6 +75,9 @@ class WorkflowContext:
 
     provider: LLMProvider
     lease_lost: Callable[[], bool] | None = None
+    repository_tools: RepositoryTools | None = None
+    max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS
+    repository_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,14 +100,23 @@ def thread_config(task_id: UUID) -> dict[str, Any]:
     return {"configurable": {"thread_id": str(task_id)}}
 
 
-def initial_triage_state(*, task_id: UUID, title: str, description: str) -> TriageState:
+def initial_triage_state(
+    *,
+    task_id: UUID,
+    title: str,
+    description: str,
+    repo_id: UUID | None = None,
+) -> TriageState:
     return {
         "task_id": str(task_id),
         "title": title,
         "description": description,
+        "repo_id": None if repo_id is None else str(repo_id),
         "triage": None,
+        "investigation": None,
         "result_summary": None,
         "error": None,
+        "failed_stage": None,
         "status": "running",
     }
 
@@ -110,9 +137,15 @@ def compile_triage_graph(
         context_schema=WorkflowContext,
     )
     builder.add_node("triage", triage_node)
+    builder.add_node("investigate", investigate_node)
     builder.add_node("finalize", finalize_node)
     builder.add_edge(START, "triage")
-    builder.add_edge("triage", "finalize")
+    builder.add_conditional_edges(
+        "triage",
+        route_after_triage,
+        {"investigate": "investigate", "finalize": "finalize"},
+    )
+    builder.add_edge("investigate", "finalize")
     builder.add_edge("finalize", END)
     options: dict[str, Any] = {}
     if interrupt_after:
@@ -128,9 +161,18 @@ async def run_triage(
     description: str,
     provider: LLMProvider,
     lease_lost: Callable[[], bool] | None = None,
+    repo_id: UUID | None = None,
+    repository_tools: RepositoryTools | None = None,
+    max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
+    repository_error: str | None = None,
 ) -> TriageOutcome:
     """Run one triage. Provider failures become a failed outcome instead of raw text."""
-    state = initial_triage_state(task_id=task_id, title=title, description=description)
+    state = initial_triage_state(
+        task_id=task_id,
+        title=title,
+        description=description,
+        repo_id=repo_id,
+    )
     try:
         final = await invoke_triage(
             graph,
@@ -138,6 +180,9 @@ async def run_triage(
             task_id=task_id,
             provider=provider,
             lease_lost=lease_lost,
+            repository_tools=repository_tools,
+            max_tool_calls=max_tool_calls,
+            repository_error=repository_error,
         )
     except LeaseLost:
         raise
@@ -155,6 +200,10 @@ async def run_claimed_triage(
     description: str,
     provider: LLMProvider,
     lease_lost: Callable[[], bool] | None = None,
+    repo_id: UUID | None = None,
+    repository_tools: RepositoryTools | None = None,
+    max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
+    repository_error: str | None = None,
 ) -> TriageOutcome:
     """Resume a checkpointed thread, or start one when no checkpoint exists.
 
@@ -171,6 +220,9 @@ async def run_claimed_triage(
                     provider=provider,
                     resume=True,
                     lease_lost=lease_lost,
+                    repository_tools=repository_tools,
+                    max_tool_calls=max_tool_calls,
+                    repository_error=repository_error,
                 )
             except LeaseLost:
                 raise
@@ -185,6 +237,10 @@ async def run_claimed_triage(
         description=description,
         provider=provider,
         lease_lost=lease_lost,
+        repo_id=repo_id,
+        repository_tools=repository_tools,
+        max_tool_calls=max_tool_calls,
+        repository_error=repository_error,
     )
 
 
@@ -196,6 +252,9 @@ async def invoke_triage(
     provider: LLMProvider,
     resume: bool = False,
     lease_lost: Callable[[], bool] | None = None,
+    repository_tools: RepositoryTools | None = None,
+    max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
+    repository_error: str | None = None,
 ) -> dict[str, Any]:
     """Run or resume one thread. `resume=True` passes no new input."""
     options: dict[str, Any] = {}
@@ -204,7 +263,13 @@ async def invoke_triage(
     result = await graph.ainvoke(
         None if resume else state,
         thread_config(task_id),
-        context=WorkflowContext(provider=provider, lease_lost=lease_lost),
+        context=WorkflowContext(
+            provider=provider,
+            lease_lost=lease_lost,
+            repository_tools=repository_tools,
+            max_tool_calls=max_tool_calls,
+            repository_error=repository_error,
+        ),
         **options,
     )
     if not isinstance(result, dict):
@@ -219,6 +284,13 @@ async def read_thread_state(graph: CompiledStateGraph, task_id: UUID) -> dict[st
     if not isinstance(values, dict) or not values:
         return {}
     return dict(values)
+
+
+def route_after_triage(state: TriageState) -> str:
+    """Investigate only after a successful triage of a task that names a repository."""
+    if state.get("status") == "failed" or state.get("error") or not state.get("repo_id"):
+        return "finalize"
+    return "investigate"
 
 
 def triage_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:
@@ -239,29 +311,73 @@ def triage_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[s
     }
 
 
+def investigate_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:
+    """Read the registered checkout and keep only citations that were actually read."""
+    context = runtime.context
+    if context.repository_error or context.repository_tools is None:
+        return _failed_update(
+            context.repository_error or REPOSITORY_UNAVAILABLE,
+            stage=STAGE_INVESTIGATE,
+        )
+    try:
+        triage = TriageResult.model_validate(state.get("triage"))
+    except ValidationError:
+        logger.error("investigate rejected the triage payload")
+        return _failed_update(GENERIC_FAILURE, stage=STAGE_TRIAGE)
+    try:
+        outcome = InvestigatorAgent(
+            context.provider,
+            context.repository_tools,
+            max_tool_calls=context.max_tool_calls,
+            lease_lost=context.lease_lost,
+        ).run(title=state["title"], description=state["description"], triage=triage)
+    except StopForLease:
+        raise LeaseLost() from None
+    except LLMError as exc:
+        return _failed_update(failure_text(exc), stage=STAGE_INVESTIGATE)
+    except Exception as exc:
+        logger.error("investigate node failed: %s", type(exc).__name__)
+        return _failed_update(INVESTIGATION_FAILURE, stage=STAGE_INVESTIGATE)
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    return {
+        "investigation": outcome.as_state(),
+        "error": None,
+        "failed_stage": None,
+        "status": "completed",
+    }
+
+
 def finalize_node(state: TriageState) -> dict[str, Any]:
     """Re-validate before the summary becomes user-facing state."""
     if state.get("status") == "failed" or state.get("error"):
         message = _message(state.get("error"))
-        return _failed_update(message)
+        stage = state.get("failed_stage") or STAGE_TRIAGE
+        return _failed_update(message, stage=stage if isinstance(stage, str) else STAGE_TRIAGE)
     try:
         checked = TriageResult.model_validate(state.get("triage"))
-    except ValidationError:
-        logger.error("finalize rejected the triage payload")
+        investigation = _checked_investigation(state.get("investigation"))
+    except (ValidationError, ValueError):
+        logger.error("finalize rejected the stored payload")
         return _failed_update(GENERIC_FAILURE)
+    summary = checked.summary
+    if investigation is not None:
+        summary = str(investigation["report"]["summary"])
     return {
         "status": "completed",
         "error": None,
-        "result_summary": checked.summary,
+        "failed_stage": None,
+        "result_summary": summary,
         "triage": checked.model_dump(mode="json"),
+        "investigation": investigation,
     }
 
 
-def failure_outcome(message: str) -> TriageOutcome:
+def failure_outcome(message: str, *, stage: str = STAGE_TRIAGE) -> TriageOutcome:
     text = _message(message)
     return TriageOutcome(
         status=TaskStatus.FAILED,
-        stage=STAGE_TRIAGE,
+        stage=stage if stage in {STAGE_TRIAGE, STAGE_INVESTIGATE} else STAGE_TRIAGE,
         result_summary=text,
         result_json={"error": text},
     )
@@ -269,16 +385,28 @@ def failure_outcome(message: str) -> TriageOutcome:
 
 def outcome_from_state(state: TriageState) -> TriageOutcome:
     if state.get("status") != "completed" or state.get("error"):
-        return failure_outcome(_message(state.get("error") or state.get("result_summary")))
+        stage = state.get("failed_stage")
+        return failure_outcome(
+            _message(state.get("error") or state.get("result_summary")),
+            stage=stage if isinstance(stage, str) else STAGE_TRIAGE,
+        )
     try:
         checked = TriageResult.model_validate(state.get("triage"))
-    except ValidationError:
+        investigation = _checked_investigation(state.get("investigation"))
+    except (ValidationError, ValueError):
         return failure_outcome(GENERIC_FAILURE)
+    if investigation is None:
+        return TriageOutcome(
+            status=TaskStatus.COMPLETED,
+            stage=STAGE_FINALIZE,
+            result_summary=checked.summary,
+            result_json=checked.model_dump(mode="json"),
+        )
     return TriageOutcome(
         status=TaskStatus.COMPLETED,
         stage=STAGE_FINALIZE,
-        result_summary=checked.summary,
-        result_json=checked.model_dump(mode="json"),
+        result_summary=str(investigation["report"]["summary"]),
+        result_json={"triage": checked.model_dump(mode="json"), "investigation": investigation},
     )
 
 
@@ -293,12 +421,33 @@ def _lease_is_lost(runtime: Runtime[WorkflowContext]) -> bool:
     return bool(probe())
 
 
-def _failed_update(message: str) -> dict[str, Any]:
+def _checked_investigation(value: object) -> dict[str, Any] | None:
+    """Re-validate a stored report. None means this task did not investigate."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("investigation payload is not an object")
+    report = InvestigationReport.model_validate(value.get("report"))
+    tool_calls = value.get("tool_calls")
+    rejected = value.get("rejected_citations")
+    if isinstance(tool_calls, bool) or not isinstance(tool_calls, int) or tool_calls < 0:
+        raise ValueError("investigation tool count is not a count")
+    if isinstance(rejected, bool) or not isinstance(rejected, int) or rejected < 0:
+        raise ValueError("investigation rejection count is not a count")
+    return {
+        "report": report.model_dump(mode="json"),
+        "tool_calls": tool_calls,
+        "rejected_citations": rejected,
+    }
+
+
+def _failed_update(message: str, *, stage: str = STAGE_TRIAGE) -> dict[str, Any]:
     text = _message(message)
     return {
         "status": "failed",
         "error": text,
         "result_summary": text,
+        "failed_stage": stage if stage in {STAGE_TRIAGE, STAGE_INVESTIGATE} else STAGE_TRIAGE,
         "triage": None,
     }
 

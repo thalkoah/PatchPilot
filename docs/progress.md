@@ -334,3 +334,50 @@ The Compose containers `patchpilot_db_1`, `patchpilot_api_1`, and `patchpilot_wo
 ### Next task
 
 Task 08 — Investigator agent with citations to source files.
+
+## Task 08 — Investigator agent with citations to source files
+
+Status: complete (2026-11-03).
+
+A task with a `repo_id` follows `START -> triage -> investigate -> finalize -> END`. A task without one still follows `START -> triage -> finalize -> END` and stores the same triage object in `result_json`. `InvestigatorAgent` may call `list_tree`, `read_text_file`, and `search_text` at most `INVESTIGATOR_MAX_TOOL_CALLS` times (default 6, hard maximum 12). The stored `InvestigationReport` has hypotheses, `relative_path:line` citations, probable files, and unanswered questions. A citation is kept only when `read_text_file` returned that path and those line numbers. An invented path is omitted from the task and from the event payload. File text is not stored. The investigate stage is in `GET /api/v1/tasks/{id}/events` when a report was saved.
+
+`FakeProvider` scripts the demo bug and three bad replies: missing evidence, a citation of `invented/not_read.py`, and a reply that obeys `PATCHPILOT_INJECT` in a source comment.
+
+### Evidence
+
+`uv run pytest` — 172 passed in 11.62s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 82 files already formatted.
+
+The demo investigation cites `src/demo_service/discounts.py` at the `return KNOWN_TIERS[customer_tier]` line and `src/demo_service/app.py` at the `discount_percent` call. Those strings are the file lines, not text copied into `result_json`. The docstring sentence `Known tiers return a percent.` is absent from the task JSON and from the checkpoint rows. A registered-repo worker run stored `rejected_citations` 0 and an investigate `stage_completed` event whose payload lists the citation labels.
+
+The missing-evidence fixture stores no citations after list and search. The bogus-path fixture and the injection comment both leave `rejected_citations` at least 1, and neither `invented/not_read.py` nor `secrets/api_token.txt` appears in the stored report. A `../` read is rejected as `invalid_path` before the tool opens the parent. A tool budget of 2 stops on the second call. A task with no repository makes one model call. A repository id with no opened checkout fails at stage `investigate` and does not call the model again.
+
+The running Compose stack was left as it was. It does not include this graph until the next image rebuild recreates the worker.
+
+### Changed files
+
+- `src/patchpilot/llm/investigation.py` — report, citation, and tool-step schemas
+- `src/patchpilot/agents/` — budget and `InvestigatorAgent`
+- `src/patchpilot/llm/fake.py` — demo, missing-evidence, bogus-citation, and injection fixtures
+- `src/patchpilot/workflow/graph.py` — conditional `investigate` node
+- `src/patchpilot/worker.py`, `repositories/jobs.py` — open the registered checkout and record the stage
+- `src/patchpilot/config.py` — `INVESTIGATOR_MAX_TOOL_CALLS`
+- `tests/test_investigator.py`, plus workflow, config, and Compose contract updates
+- `compose.yaml`, `.env.example`, `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` was not executed. The Compose containers were left running and do not include this graph yet.
+- Host Ollama was not asked to investigate. The tool loop and the citation filter were exercised with `FakeProvider`.
+- A search hit is not a citation. Only lines returned by `read_text_file` can be cited.
+- The filter drops an unread path. It does not rewrite a hypothesis that also cites a line that was read and happens to repeat comment text.
+- Resuming an investigate node that did not finish repeats the read-only tool calls. The reads are not checkpointed.
+- There is no separate artifact table. The report lives on `result_json`, and the event stores citation labels only.
+- The Task 07 limits still apply: a hard link out of the checkout is not detected, and a file can change between the path check and the read.
+
+### Next task
+
+Task 09 — Structured planning agent.

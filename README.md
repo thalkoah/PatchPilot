@@ -47,7 +47,7 @@ Stop the stack with `docker compose down`. Data stays in the `pgdata` volume, so
 
 ## Task API
 
-`POST /api/v1/tasks` validates a title and description and inserts a `queued` task. The handler does not call a model. Callers cannot set status, stage, or results. `repo_id` is optional. Omit it, or set it to the id of an enabled row in `repositories`. An unknown id, a disabled id, a filesystem path, or a Git URL is HTTP 422 and stores nothing. The worker fills `stage`, `result_summary`, and `result_json`. It does not read the checkout yet.
+`POST /api/v1/tasks` validates a title and description and inserts a `queued` task. The handler does not call a model. Callers cannot set status, stage, or results. `repo_id` is optional. Omit it, or set it to the id of an enabled row in `repositories`. An unknown id, a disabled id, a filesystem path, or a Git URL is HTTP 422 and stores nothing. The worker fills `stage`, `result_summary`, and `result_json`. When `repo_id` is set, it investigates that checkout after triage.
 
 - `201` — task created
 - `404` — unknown task id
@@ -105,11 +105,11 @@ docker compose exec worker python -m patchpilot.source register \
 
 `examples/demo_service` is a small FastAPI project. Known customer tiers return a discount. An unknown tier currently produces HTTP 500; the intended response is HTTP 422. See `examples/demo_service/README.md` for the baseline pytest command and the regression that fails on purpose.
 
-Read-only tools are `list_tree`, `read_text_file`, and `search_text`. Each takes a relative path under that one checkout. They refuse `..`, absolute paths, symlink escapes, `.git`, credential names, binaries, and files past the byte limit. Listings omit denied names. Search uses a literal substring and skips symlinks. These tools are not called by the triage worker. The limits are 200 tree entries, depth 6, 32768 bytes, 400 lines, 100 searched files, and 40 matches.
+Read-only tools are `list_tree`, `read_text_file`, and `search_text`. Each takes a relative path under that one checkout. They refuse `..`, absolute paths, symlink escapes, `.git`, credential names, binaries, and files past the byte limit. Listings omit denied names. Search uses a literal substring and skips symlinks. The investigator is the only caller. The limits are 200 tree entries, depth 6, 32768 bytes, 400 lines, 100 searched files, and 40 matches. One investigation may make at most `INVESTIGATOR_MAX_TOOL_CALLS` tool calls (default 6, hard maximum 12).
 
 ## Triage workflow
 
-The worker runs a LangGraph `StateGraph` with the path `START -> triage -> finalize -> END`. It compiles that graph with the async Postgres checkpointer from `langgraph-checkpoint-postgres`. The LangGraph `thread_id` is the task UUID, with no extra prefix. Each finished node is stored before the next node starts (`durability="sync"`).
+The worker runs a LangGraph `StateGraph`. A task with no `repo_id` follows `START -> triage -> finalize -> END`. A task with a `repo_id` follows `START -> triage -> investigate -> finalize -> END`. The graph is compiled with the async Postgres checkpointer from `langgraph-checkpoint-postgres`. The LangGraph `thread_id` is the task UUID, with no extra prefix. Each finished node is stored before the next node starts (`durability="sync"`).
 
 Checkpoint tables live in the same PostgreSQL database and stay out of Alembic. `AsyncPostgresSaver.setup()` creates `checkpoint_migrations`, `checkpoints`, `checkpoint_blobs`, and `checkpoint_writes`. The business result stays on `tasks`: status, stage, `result_summary`, and `result_json`.
 
@@ -127,7 +127,9 @@ A second worker will not take a task whose lease is still in the future, so two 
 
 If the worker process dies, the lease expires. The next poll closes that run with `lease_expired`, writes a `recovery` event, and starts the next attempt when the attempt count is below `WORKER_MAX_ATTEMPTS` (default 3). The new attempt resumes the LangGraph thread when a checkpoint exists, and otherwise replays triage from the start. Event writes use an idempotency key, so replaying a stage does not insert a second copy. When the expired attempt is already the last one, the task becomes `failed` with `recovery_exhausted` and stays there.
 
-`triage` calls `generate_structured` once. `finalize` checks the object again. A success stores status `completed`, stage `finalize`, the summary, and the validated triage object in `result_json`. A provider failure or any other error stores status `failed`, stage `triage`, a short summary, and `{"error": "..."}`. Those strings omit model text. Concurrency is 1. A new process can load a finished thread by the same task UUID, and resuming after a completed node does not call the model again.
+`triage` calls `generate_structured` once. `investigate` runs only when triage succeeded and the task names a repository. It calls the three read-only tools under a fixed budget and returns an `InvestigationReport`: hypotheses, `relative_path:line` citations, probable files, and unanswered questions. A citation is stored only when `read_text_file` returned that file and those line numbers. A path the model invented is omitted, and the omitted path is not written into the task or the event payload. File text stays out of `result_json` and the audit events.
+
+`finalize` checks the objects again. A task with no repository stores status `completed`, stage `finalize`, the triage summary, and the validated triage object as `result_json`. An investigated task stores the same status and stage, uses the investigation summary, and sets `result_json` to `{"triage": ..., "investigation": ...}`. The investigate events list the citation labels. A provider failure stores status `failed`, stage `triage` or `investigate`, a short summary, and `{"error": "..."}`. Those strings omit model text. Concurrency is 1. A new process can load a finished thread by the same task UUID, and resuming after a completed node does not call the model again.
 
 Smoke test against the running stack. The worker container claims the task:
 
