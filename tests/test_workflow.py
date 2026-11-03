@@ -114,7 +114,7 @@ def client(postgres_database_url: str, clean_tasks: None, monkeypatch: pytest.Mo
         yield test_client
 
 
-def test_triage_graph_investigates_only_when_a_repository_is_attached():
+def test_triage_graph_plans_only_after_investigation():
     graph = compile_triage_graph()
 
     assert graph.checkpointer is False
@@ -123,7 +123,9 @@ def test_triage_graph_investigates_only_when_a_repository_is_attached():
         ("__start__", "triage"),
         ("triage", "investigate"),
         ("triage", "finalize"),
+        ("investigate", "plan"),
         ("investigate", "finalize"),
+        ("plan", "finalize"),
         ("finalize", "__end__"),
     }
 

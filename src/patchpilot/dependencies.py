@@ -6,6 +6,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from patchpilot.repositories.artifacts import ArtifactRepository
 from patchpilot.repositories.events import EventRepository
 from patchpilot.repositories.tasks import TaskRepository
 
@@ -26,3 +27,9 @@ def get_event_repository(
     session: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> EventRepository:
     return EventRepository(session)
+
+
+def get_artifact_repository(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> ArtifactRepository:
+    return ArtifactRepository(session)

@@ -69,6 +69,7 @@ class Settings(LLMSettings):
         le=HARD_MAX_INVESTIGATOR_TOOL_CALLS,
     )
     repository_root: str | None = None
+    artifacts_root: str | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     @field_validator("database_url")
@@ -79,19 +80,19 @@ class Settings(LLMSettings):
             raise ValueError("database_url must use a postgresql:// or postgres:// URL")
         return value
 
-    @field_validator("repository_root", mode="before")
+    @field_validator("repository_root", "artifacts_root", mode="before")
     @classmethod
-    def repository_root_is_absolute(cls, value: object) -> object:
+    def optional_path_is_absolute(cls, value: object) -> object:
         if value is None:
             return None
         if not isinstance(value, str):
-            raise ValueError("REPOSITORY_ROOT must be an absolute path")
+            raise ValueError("path settings must be absolute paths")
         stripped = value.strip()
         if stripped == "":
             return None
         path = Path(stripped).expanduser()
         if not path.is_absolute():
-            raise ValueError("REPOSITORY_ROOT must be an absolute path")
+            raise ValueError("path settings must be absolute paths")
         return str(path)
 
 

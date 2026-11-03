@@ -89,6 +89,20 @@ def test_worker_mounts_registered_sources_read_only():
     assert "REPOSITORY_ROOT_HOST=./examples" in example
 
 
+def test_plan_artifacts_are_shared_by_the_api_and_the_worker():
+    text = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    api, worker = text.split("\n  worker:\n", 1)
+
+    assert "ARTIFACTS_ROOT: /artifacts" in api
+    assert "ARTIFACTS_ROOT: /artifacts" in worker
+    assert "artifacts:/artifacts" in api
+    assert "artifacts:/artifacts" in worker
+    assert "GET /api/v1/tasks/{id}/plan" in readme
+    assert "ARTIFACTS_ROOT" in example
+
+
 def test_env_example_is_present_and_env_is_ignored():
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")

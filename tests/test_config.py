@@ -139,6 +139,30 @@ def test_repository_root_is_optional_and_must_be_absolute():
         )
 
 
+def test_artifacts_root_is_optional_and_must_be_absolute():
+    settings = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        artifacts_root="   ",
+        _env_file=None,
+    )
+
+    assert settings.artifacts_root is None
+
+    rooted = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        artifacts_root="/var/patchpilot/artifacts",
+        _env_file=None,
+    )
+    assert rooted.artifacts_root == "/var/patchpilot/artifacts"
+
+    with pytest.raises(ValidationError):
+        Settings(
+            database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+            artifacts_root="artifacts",
+            _env_file=None,
+        )
+
+
 def test_investigator_budget_defaults_to_six_and_stays_bounded():
     settings = Settings(
         database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",

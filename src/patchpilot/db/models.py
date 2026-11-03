@@ -33,6 +33,9 @@ EVENT_TYPE_MAX_LENGTH = 64
 IDEMPOTENCY_KEY_MAX_LENGTH = 200
 DISPLAY_NAME_MAX_LENGTH = 200
 CANONICAL_PATH_MAX_LENGTH = 512
+ARTIFACT_TYPE_MAX_LENGTH = 32
+ARTIFACT_PATH_MAX_LENGTH = 200
+ARTIFACT_CHECKSUM_LENGTH = 64
 
 
 class TaskStatus(enum.StrEnum):
@@ -247,3 +250,54 @@ class TaskEvent(Base):
 
     def __repr__(self) -> str:
         return f"TaskEvent(id={self.id!s}, event_type={self.event_type})"
+
+
+class Artifact(Base):
+    """Metadata for one file on the artifact volume. The body is not in this row."""
+
+    __tablename__ = "artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "artifact_type",
+            "version",
+            name="uq_artifacts_task_type_version",
+        ),
+        CheckConstraint("version >= 1 AND version <= 1000", name="ck_artifacts_version"),
+        CheckConstraint(
+            "artifact_type ~ '^[a-z][a-z0-9-]{0,31}$'",
+            name="ck_artifacts_type",
+        ),
+        CheckConstraint(
+            r"relative_path ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$'",
+            name="ck_artifacts_relative_path",
+        ),
+        CheckConstraint(
+            r"relative_path !~ '\.\.'",
+            name="ck_artifacts_relative_path_no_dotdot",
+        ),
+        CheckConstraint("checksum ~ '^[0-9a-f]{64}$'", name="ck_artifacts_checksum"),
+        CheckConstraint("size > 0 AND size <= 32768", name="ck_artifacts_size"),
+        Index("ix_artifacts_task_type", "task_id", "artifact_type"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("tasks.id", name="fk_artifacts_task_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    artifact_type: Mapped[str] = mapped_column(String(ARTIFACT_TYPE_MAX_LENGTH), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    relative_path: Mapped[str] = mapped_column(String(ARTIFACT_PATH_MAX_LENGTH), nullable=False)
+    checksum: Mapped[str] = mapped_column(String(ARTIFACT_CHECKSUM_LENGTH), nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return f"Artifact(id={self.id!s}, type={self.artifact_type}, version={self.version})"

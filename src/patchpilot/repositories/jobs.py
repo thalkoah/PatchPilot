@@ -22,12 +22,14 @@ not change the stored payload.
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from patchpilot.artifacts import ArtifactStoreError
 from patchpilot.audit import (
     ERROR_LEASE_EXPIRED,
     ERROR_MODEL,
@@ -48,12 +50,15 @@ from patchpilot.audit import (
     task_completed_key,
 )
 from patchpilot.db.models import Task, TaskRun, TaskStatus
+from patchpilot.llm.plan import ChangePlan
+from patchpilot.repositories.artifacts import persist_plan
 from patchpilot.repositories.events import append_event
 
 # Stage names written when the graph finishes. Investigate is present only when
 # the task named a repository and the report was stored.
 _STAGE_TRIAGE = "triage"
 _STAGE_INVESTIGATE = "investigate"
+_STAGE_PLAN = "plan"
 _STAGE_FINALIZE = "finalize"
 
 
@@ -291,11 +296,15 @@ class JobRepository:
         stage: str,
         result_summary: str,
         result_json: dict[str, Any],
+        plan: ChangePlan | None = None,
+        artifacts_root: Path | None = None,
     ) -> bool:
         """Store a terminal outcome when this worker still holds the lease.
 
         Return False when another worker has taken the run. The caller must not
-        treat that as a failure of the task.
+        treat that as a failure of the task. A completed plan is written to the
+        artifact volume before this commit. `ArtifactStoreError` means nothing
+        was committed.
         """
         if status not in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
             raise ValueError("triage persistence only accepts completed or failed")
@@ -319,10 +328,19 @@ class JobRepository:
         if owned is None:
             await self._session.rollback()
             return False
+        stored = dict(result_json)
+        if plan is not None and status == TaskStatus.COMPLETED:
+            if artifacts_root is None:
+                raise ArtifactStoreError
+            version = await persist_plan(self._session, artifacts_root, claimed.id, plan)
+            meta = stored.get("plan")
+            plan_meta = dict(meta) if isinstance(meta, dict) else {}
+            plan_meta["version"] = version
+            stored["plan"] = plan_meta
         task.status = status
         task.stage = checked_stage
         task.result_summary = result_summary
-        task.result_json = result_json
+        task.result_json = stored
         await self._session.execute(
             update(TaskRun)
             .where(TaskRun.id == claimed.run_id)
@@ -352,7 +370,7 @@ class JobRepository:
                 ordinal=0,
             )
         else:
-            await self._record_success(task.id, claimed, result_json)
+            await self._record_success(task.id, claimed, stored)
         await self._session.commit()
         return True
 
@@ -491,6 +509,40 @@ class JobRepository:
                 ordinal=ordinal,
             )
             ordinal += 1
+        plan = _plan_payload(result_json, claimed.attempt)
+        if plan is not None:
+            await append_event(
+                self._session,
+                task_id=task_id,
+                run_id=claimed.run_id,
+                stage=_STAGE_PLAN,
+                event_type=STAGE_STARTED,
+                payload=attempt,
+                idempotency_key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_STARTED,
+                    stage=_STAGE_PLAN,
+                ),
+                ordinal=ordinal,
+            )
+            ordinal += 1
+            await append_event(
+                self._session,
+                task_id=task_id,
+                run_id=claimed.run_id,
+                stage=_STAGE_PLAN,
+                event_type=STAGE_COMPLETED,
+                payload=plan,
+                idempotency_key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_COMPLETED,
+                    stage=_STAGE_PLAN,
+                ),
+                ordinal=ordinal,
+            )
+            ordinal += 1
         await append_event(
             self._session,
             task_id=task_id,
@@ -559,6 +611,24 @@ class JobRepository:
             select(func.max(TaskRun.attempt)).where(TaskRun.task_id == task_id)
         )
         return int(current or 0) + 1
+
+
+def _plan_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any] | None:
+    """Paths and the decision only. The plan body stays in the artifact file."""
+    plan = result_json.get("plan")
+    if not isinstance(plan, dict):
+        return None
+    raw_paths = plan.get("paths")
+    paths = (
+        [item for item in raw_paths if isinstance(item, str)] if isinstance(raw_paths, list) else []
+    )
+    return {
+        "attempt": attempt,
+        "can_proceed": plan.get("can_proceed") is True,
+        "version": plan.get("version"),
+        "rejected_paths": plan.get("rejected_paths"),
+        "paths": paths,
+    }
 
 
 def _investigation_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any] | None:

@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from patchpilot.agents.errors import StopForLease
 from patchpilot.agents.limits import require_tool_budget
 from patchpilot.llm.investigation import (
     EvidenceCitation,
@@ -34,10 +35,6 @@ _MAX_QUESTIONS = 8
 _OMITTED = "Citations were omitted because those lines were not read."
 _NONE_READ = "No cited line was present in a file the investigator read."
 _KEPT_ONLY = "The investigator kept only lines it had read."
-
-
-class StopForLease(Exception):
-    """The worker lost the lease. The node must not checkpoint a report."""
 
 
 @dataclass

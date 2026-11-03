@@ -267,6 +267,7 @@ def client(postgres_database_url: str, clean_tasks: None, monkeypatch: pytest.Mo
 async def test_worker_investigates_the_registered_demo_bug(
     client: TestClient,
     postgres_database_url: str,
+    tmp_path: Path,
 ):
     engine, factory = open_session_factory(postgres_database_url)
     try:
@@ -286,6 +287,8 @@ async def test_worker_investigates_the_registered_demo_bug(
         )
         assert response.status_code == 201, response.text
         task_id = response.json()["id"]
+        artifacts = tmp_path / "artifacts"
+        artifacts.mkdir()
         async with compiled_worker_graph(postgres_database_url) as graph:
             assert (
                 await process_one(
@@ -293,6 +296,7 @@ async def test_worker_investigates_the_registered_demo_bug(
                     FakeProvider(),
                     graph,
                     repository_root=DEMO_ROOT.resolve(),
+                    artifacts_root=artifacts,
                 )
                 is True
             )
@@ -315,7 +319,9 @@ async def test_worker_investigates_the_registered_demo_bug(
         "src/demo_service/discounts.py",
     )
     assert body["result_json"]["investigation"]["rejected_citations"] == 0
-    assert body["result_summary"] == report.summary
+    assert body["result_json"]["investigation"]["report"]["summary"] == report.summary
+    assert body["result_json"]["plan"]["can_proceed"] is True
+    assert "KNOWN_TIERS" in body["result_summary"]
 
     events = client.get(f"/api/v1/tasks/{task_id}/events")
     assert events.status_code == 200
@@ -325,6 +331,8 @@ async def test_worker_investigates_the_registered_demo_bug(
         "triage",
         "investigate",
         "investigate",
+        "plan",
+        "plan",
         "finalize",
         "finalize",
         "finalize",

@@ -381,3 +381,52 @@ The running Compose stack was left as it was. It does not include this graph unt
 ### Next task
 
 Task 09 — Structured planning agent.
+
+## Task 09 — Structured planning agent
+
+Status: complete (2026-11-03).
+
+A task with a `repo_id` follows `START -> triage -> investigate -> plan -> finalize -> END`. A task without one still stops after triage. `PlannerAgent` makes one `generate_structured` call and returns a `ChangePlan`: problem statement, assumptions, modifications, test strategy, risks, confidence, and `can_proceed`. A modification is an existing `.py` file in the registered checkout, or a new `tests/test_*.py` path under a `tests` directory that already exists. The planner sets `can_proceed` false when triage needs clarification, when the investigation cited no line, or when every proposed path is unsafe. Unsafe paths are omitted from the stored plan. Nothing in this stage writes the checkout.
+
+A finished plan is a versioned artifact. The file is `{task_id}/plan/v{n}.json` under `ARTIFACTS_ROOT`. The `artifacts` row stores that relative path, the sha256, the size, and the version. The same bytes keep the same version. `GET /api/v1/tasks/{id}/plan` returns the newest revision, and `?version=` returns an older one. The response has no filesystem path. Alembic head is `0004_artifacts`.
+
+### Evidence
+
+`uv run pytest` — 186 passed in 12.63s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 91 files already formatted.
+
+The demo plan names `src/demo_service/discounts.py` and `src/demo_service/app.py` as existing files and `tests/test_unknown_tier_added.py` as a new test. That new file is not created. A snapshot of `examples/demo_service` is unchanged. `GET /api/v1/tasks/{id}/plan` returns version 1, `can_proceed` true, and a checksum that matches the artifact file. `?version=2` is 404. Changing the file bytes makes the same GET return 404. The plan event lists the accepted paths and does not include source text.
+
+An ambiguous report is stored as a plan with `can_proceed` false and no modifications. A draft that also names `../etc/passwd`, `Dockerfile`, and `.github/workflows/ci.yml` keeps only `src/demo_service/discounts.py`. A draft with only those unsafe paths declines, and none of those paths are in the stored plan. A symlink, a parent path, and a checkout with no cited line also decline. Invalid plan JSON fails at stage `plan` with `ChangePlan rejected model output`, and the secret in the prompt is not in `result_json`. Saving the same plan twice stays on version 1. A different plan becomes version 2, and version 1 is still readable.
+
+The running Compose stack was left as it was. It does not include this migration, the plan node, or the `artifacts` volume until the next image rebuild recreates the API and worker.
+
+### Changed files
+
+- `alembic/versions/20261103_0004_artifacts.py` — `artifacts`
+- `src/patchpilot/llm/plan.py` — `ChangePlan` and proposed modifications
+- `src/patchpilot/agents/planner.py`, `plan_paths.py` — one model call, then the path and evidence check
+- `src/patchpilot/artifacts.py`, `repositories/artifacts.py`, `schemas/plans.py` — versioned plan files and `GET /api/v1/tasks/{id}/plan`
+- `src/patchpilot/workflow/graph.py` — `plan` node after investigation
+- `src/patchpilot/worker.py`, `repositories/jobs.py` — store the artifact and record the plan stage
+- `src/patchpilot/llm/fake.py` — valid, ambiguous, unsafe, and schema-failure fixtures
+- `tests/test_planner.py`, plus workflow, investigator, checkpoint, config, and Compose contract updates
+- `compose.yaml`, `.env.example`, `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` was not executed. The Compose containers were left running and do not include this graph or the artifact volume yet.
+- Host Ollama was not asked to plan. The path filter and the artifact API were exercised with `FakeProvider`.
+- A decline is a completed task with `can_proceed` false. A schema failure is a failed task at stage `plan`, and that failure row stores the error without the investigation.
+- Once any line was cited, the planner may name an existing `.py` file that was not itself cited. A new test path does not have to be cited. The path still has to sit inside the checkout and match the allowlist.
+- The plan does not write the checkout, and it does not record file bytes. A later edit has to check the file again.
+- A hard link that leaves the checkout is still not detected. A symlink is not a permissible path.
+- If the database transaction rolls back after the plan file is written, the file can remain without a row. A checksum mismatch is returned as a missing plan.
+- `can_proceed` does not authorize a write. Approval is the next task.
+
+### Next task
+
+Task 10 — Human approval with LangGraph interrupt/resume.

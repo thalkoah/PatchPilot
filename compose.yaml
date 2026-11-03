@@ -27,9 +27,12 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-patchpilot}:${POSTGRES_PASSWORD:-patchpilot_dev}@db:5432/${POSTGRES_DB:-patchpilot}
       DB_CONNECT_TIMEOUT_SECONDS: ${DB_CONNECT_TIMEOUT_SECONDS:-3}
+      ARTIFACTS_ROOT: /artifacts
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - artifacts:/artifacts
     depends_on:
       db:
         condition: service_healthy
@@ -48,6 +51,7 @@ services:
       WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-30}
       WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-3}
       INVESTIGATOR_MAX_TOOL_CALLS: ${INVESTIGATOR_MAX_TOOL_CALLS:-6}
+      ARTIFACTS_ROOT: /artifacts
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LLM_PROVIDER: ${LLM_PROVIDER:-fake}
       LLM_MODEL: ${LLM_MODEL:-gemma4:12b}
@@ -59,9 +63,11 @@ services:
       REPOSITORY_ROOT: /repositories
     volumes:
       - ${REPOSITORY_ROOT_HOST:-./examples}:/repositories:ro
+      - artifacts:/artifacts
     depends_on:
       db:
         condition: service_healthy
 
 volumes:
   pgdata:
+  artifacts:

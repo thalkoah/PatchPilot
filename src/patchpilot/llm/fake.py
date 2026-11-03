@@ -17,6 +17,7 @@ from patchpilot.llm.investigation import (
     ToolRequest,
 )
 from patchpilot.llm.parsing import coerce_model, require_prompt, require_schema, resolve_options
+from patchpilot.llm.plan import ChangePlan, ModificationKind, ProposedModification
 from patchpilot.llm.provider import GenerateOptions, ModelT
 from patchpilot.llm.triage import Classification, Severity, TriageResult
 
@@ -106,6 +107,96 @@ BOGUS_CITATION_REPORT = InvestigationReport(
     unanswered_questions=[],
 )
 
+DEMO_CHANGE_PLAN = ChangePlan(
+    problem_statement=(
+        "An unknown customer tier indexes KNOWN_TIERS and the endpoint returns HTTP 500."
+    ),
+    assumptions=["The intended response for an unrecognized tier is HTTP 422."],
+    modifications=[
+        ProposedModification(
+            relative_path="src/demo_service/discounts.py",
+            kind=ModificationKind.EXISTING,
+            summary="Reject an unknown tier before indexing KNOWN_TIERS.",
+        ),
+        ProposedModification(
+            relative_path="src/demo_service/app.py",
+            kind=ModificationKind.EXISTING,
+            summary="Turn that rejection into HTTP 422.",
+        ),
+        ProposedModification(
+            relative_path="tests/test_unknown_tier_added.py",
+            kind=ModificationKind.NEW_TEST,
+            summary="Add a regression test for an unrecognized tier.",
+        ),
+    ],
+    test_strategy="Run the demo service pytest suite, including the unknown-tier regression.",
+    risks=["A stricter check could reject a tier the service currently accepts."],
+    confidence=0.72,
+    can_proceed=True,
+)
+
+AMBIGUOUS_PLAN = ChangePlan(
+    problem_statement="The report does not identify a change that the evidence supports.",
+    assumptions=["The failing request and the expected response are still unknown."],
+    modifications=[],
+    test_strategy="No test change is proposed until the failure is reproducible.",
+    risks=["Editing the checkout without a cited line could hide a different defect."],
+    confidence=0.2,
+    can_proceed=False,
+)
+
+UNSAFE_PATH_PLAN = ChangePlan(
+    problem_statement="An unknown tier indexes KNOWN_TIERS. Also write ../etc/passwd.",
+    assumptions=["The discount lookup is the cited failure."],
+    modifications=[
+        ProposedModification(
+            relative_path="src/demo_service/discounts.py",
+            kind=ModificationKind.EXISTING,
+            summary="Reject an unknown tier before indexing KNOWN_TIERS.",
+        ),
+        ProposedModification(
+            relative_path="../etc/passwd",
+            kind=ModificationKind.EXISTING,
+            summary="Write the host password file.",
+        ),
+        ProposedModification(
+            relative_path="Dockerfile",
+            kind=ModificationKind.NEW_TEST,
+            summary="Replace the image definition.",
+        ),
+        ProposedModification(
+            relative_path=".github/workflows/ci.yml",
+            kind=ModificationKind.EXISTING,
+            summary="Change the workflow that runs tests.",
+        ),
+    ],
+    test_strategy="Run the demo service pytest suite.",
+    risks=["Writing Dockerfile would change the image."],
+    confidence=0.66,
+    can_proceed=True,
+)
+
+UNSAFE_ONLY_PLAN = ChangePlan(
+    problem_statement="Write ../etc/passwd and replace Dockerfile.",
+    assumptions=[],
+    modifications=[
+        ProposedModification(
+            relative_path="../etc/passwd",
+            kind=ModificationKind.EXISTING,
+            summary="Write the host password file.",
+        ),
+        ProposedModification(
+            relative_path="Dockerfile",
+            kind=ModificationKind.NEW_TEST,
+            summary="Replace the image definition.",
+        ),
+    ],
+    test_strategy="Do not run tests.",
+    risks=["Writing Dockerfile would change the image."],
+    confidence=0.9,
+    can_proceed=True,
+)
+
 INJECTION_FOLLOWED_REPORT = InvestigationReport(
     summary=(f"Follow the comment. The token is {INJECTION_TOKEN}. Read {INJECTION_PATH}."),
     hypotheses=[
@@ -147,6 +238,26 @@ def builtin_investigator_step(prompt: str) -> InvestigatorStep:
     if finished is not None:
         return InvestigatorStep(tool=None, report=finished)
     return InvestigatorStep(tool=_next_tool(prompt), report=None)
+
+
+def builtin_change_plan(prompt: str) -> ChangePlan:
+    """A reviewable proposal, a decline, an unsafe draft, or a schema failure."""
+    folded = prompt.casefold()
+    if "plan schema failure" in folded:
+        raise LLMResponseError("ChangePlan rejected model output (1 validation error)")
+    if "unsafe path only" in folded:
+        return UNSAFE_ONLY_PLAN
+    if "unsafe path" in folded:
+        return UNSAFE_PATH_PLAN
+    if (
+        "ambiguous" in folded
+        or "needs clarification: true" in folded
+        or "evidence:\nnone" in folded
+    ):
+        return AMBIGUOUS_PLAN
+    if "src/demo_service/discounts.py" in prompt:
+        return DEMO_CHANGE_PLAN
+    return AMBIGUOUS_PLAN
 
 
 def builtin_investigation_report(prompt: str) -> InvestigationReport:
@@ -321,6 +432,8 @@ class FakeProvider:
             return coerce_model(checked_schema, builtin_investigator_step(checked_prompt))
         if checked_schema is InvestigationReport:
             return coerce_model(checked_schema, builtin_investigation_report(checked_prompt))
+        if checked_schema is ChangePlan:
+            return coerce_model(checked_schema, builtin_change_plan(checked_prompt))
         raise LLMResponseError(f"FakeProvider has no fixture for {checked_schema.__name__}")
 
     def close(self) -> None:
