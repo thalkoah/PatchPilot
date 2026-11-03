@@ -2,14 +2,16 @@
 
 import json
 import time
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from tests.database import open_session_factory
+from tests.workflow_support import compiled_worker_graph
 
 from patchpilot.api import create_app
+from patchpilot.checkpoints import CHECKPOINTER_APPLICATION_NAME
 from patchpilot.config import get_settings
 from patchpilot.db.models import TaskStatus
 from patchpilot.llm.errors import LLMResponseError
@@ -20,6 +22,7 @@ from patchpilot.worker import WORKER_CONCURRENCY, process_one
 from patchpilot.workflow.graph import (
     GENERIC_FAILURE,
     compile_triage_graph,
+    read_thread_state,
     run_triage,
 )
 
@@ -82,11 +85,22 @@ class LockProbe(FakeProvider):
                   AND pid <> pg_backend_pid()
                 """
             ).fetchone()
+            saver = connection.execute(
+                """
+                SELECT state
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND application_name = %s
+                  AND pid <> pg_backend_pid()
+                """,
+                (CHECKPOINTER_APPLICATION_NAME,),
+            ).fetchall()
             connection.rollback()
         assert row is not None
         assert row[0] == "running"
         assert idle is not None
         assert idle[0] == 0
+        assert [item[0] for item in saver] == ["idle"]
         self.saw_running_without_a_lock = True
         return super().generate_structured(prompt, schema, options)
 
@@ -111,12 +125,12 @@ def test_triage_graph_is_a_straight_line_without_a_checkpointer():
     }
 
 
-def test_fake_provider_triage_completes_without_a_database():
+async def test_fake_provider_triage_completes_without_a_database():
     provider = FakeProvider()
     title = DEMO_TITLE
     description = "Unknown tier returns HTTP 500."
 
-    outcome = run_triage(
+    outcome = await run_triage(
         compile_triage_graph(),
         task_id=uuid4(),
         title=title,
@@ -133,10 +147,10 @@ def test_fake_provider_triage_completes_without_a_database():
     assert provider.calls[0].schema_name == "TriageResult"
 
 
-def test_unexpected_model_error_does_not_keep_the_exception_text():
+async def test_unexpected_model_error_does_not_keep_the_exception_text():
     provider = ExplodingProvider()
 
-    outcome = run_triage(
+    outcome = await run_triage(
         compile_triage_graph(),
         task_id=uuid4(),
         title="Broken save",
@@ -153,10 +167,10 @@ def test_unexpected_model_error_does_not_keep_the_exception_text():
     assert SECRET not in str(outcome.result_json)
 
 
-def test_schema_rejection_is_stored_as_the_provider_error():
+async def test_schema_rejection_is_stored_as_the_provider_error():
     provider = RejectingProvider()
 
-    outcome = run_triage(
+    outcome = await run_triage(
         compile_triage_graph(),
         task_id=uuid4(),
         title="Broken save",
@@ -196,8 +210,11 @@ async def test_post_returns_queued_and_the_worker_completes_it(
     provider = FakeProvider()
     engine, factory = open_session_factory(postgres_database_url)
     try:
-        assert await process_one(factory, provider) is True
-        assert await process_one(factory, provider) is False
+        async with compiled_worker_graph(postgres_database_url) as graph:
+            assert await process_one(factory, provider, graph) is True
+            assert await process_one(factory, provider, graph) is False
+        async with compiled_worker_graph(postgres_database_url) as graph:
+            values = await read_thread_state(graph, UUID(created["id"]))
     finally:
         await engine.dispose()
 
@@ -216,6 +233,8 @@ async def test_post_returns_queued_and_the_worker_completes_it(
         again = restarted.get(f"/api/v1/tasks/{created['id']}")
     assert again.status_code == 200
     assert again.json() == body
+    assert values["task_id"] == created["id"]
+    assert values["result_summary"] == body["result_summary"]
 
 
 async def test_model_call_does_not_hold_the_task_lock(
@@ -230,7 +249,8 @@ async def test_model_call_does_not_hold_the_task_lock(
                 description=DEMO_DESCRIPTION,
             )
         provider = LockProbe(postgres_database_url, created.id)
-        assert await process_one(factory, provider) is True
+        async with compiled_worker_graph(postgres_database_url) as graph:
+            assert await process_one(factory, provider, graph) is True
         async with factory() as session:
             stored = await TaskRepository(session).get(created.id)
     finally:
@@ -256,9 +276,11 @@ async def test_provider_error_is_saved_without_model_text(
                 description=f"failure text must stay out of the row {SECRET}",
             )
         with caplog.at_level("ERROR"):
-            assert await process_one(factory, provider) is True
+            async with compiled_worker_graph(postgres_database_url) as graph:
+                assert await process_one(factory, provider, graph) is True
         async with factory() as session:
             stored = await TaskRepository(session).get(created.id)
+        _assert_checkpoint_omits(postgres_database_url, created.id, "parser blew up")
     finally:
         await engine.dispose()
 
@@ -291,6 +313,38 @@ def test_check_workflow_once_prints_a_completed_triage(
     assert body["status"] == "completed"
     assert body["stage"] == "finalize"
     assert TriageResult.model_validate(body["result_json"]) == DISCOUNT_TIER_TRIAGE
+    assert "reloaded=true" in captured.err
+    assert "checkpoint thread_id=" in captured.err
+
+
+def _assert_checkpoint_omits(database_url: str, task_id: UUID, phrase: str) -> None:
+    """Model exception text must not land in the checkpoint tables."""
+    needle = phrase.encode()
+    with psycopg.connect(database_url, autocommit=True) as connection:
+        documents = connection.execute(
+            """
+            SELECT checkpoint::text, metadata::text
+            FROM checkpoints
+            WHERE thread_id = %s
+            """,
+            (str(task_id),),
+        ).fetchall()
+        blobs = connection.execute(
+            """
+            SELECT blob FROM checkpoint_blobs
+            WHERE thread_id = %s AND blob IS NOT NULL
+            UNION ALL
+            SELECT blob FROM checkpoint_writes
+            WHERE thread_id = %s AND blob IS NOT NULL
+            """,
+            (str(task_id), str(task_id)),
+        ).fetchall()
+    assert documents
+    for checkpoint, metadata in documents:
+        assert phrase not in checkpoint
+        assert phrase not in metadata
+    for (blob,) in blobs:
+        assert needle not in blob
 
 
 def test_check_workflow_requires_one_mode():

@@ -187,3 +187,53 @@ The services were left running.
 ### Next task
 
 Task 05 — Real LangGraph PostgreSQL checkpointing.
+
+## Task 05 — Real LangGraph PostgreSQL checkpointing
+
+Status: complete (2026-11-03).
+
+The worker compiles the triage graph with `AsyncPostgresSaver`. The LangGraph `thread_id` is the task UUID. Each finished node is stored with `durability="sync"` before the next node starts. The saver's tables are `checkpoint_migrations`, `checkpoints`, `checkpoint_blobs`, and `checkpoint_writes`, created by `AsyncPostgresSaver.setup()`. Alembic's only revision is still `0001_create_tasks`. The business result stays on `tasks`.
+
+The worker calls setup when it starts, then keeps one autocommit connection until it stops. The same setup is the command `uv run python -m patchpilot.checkpoints`.
+
+### Evidence
+
+`uv run pytest` — 119 passed in 6.34s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 50 files already formatted.
+
+`uvx podman-compose up --build -d` built `localhost/patchpilot:local` with `langgraph-checkpoint-postgres==3.2.0`. That command did not replace the containers that had been up for 20 hours. `uvx podman-compose up -d --force-recreate api worker` did. The database volume stayed. The worker log: `worker started provider=fake concurrency=1 checkpointer=postgres`. `\dt` listed `tasks`, `alembic_version`, and the four checkpoint tables. `alembic_version` was still `0001_create_tasks`.
+
+`uv run python scripts/check_workflow.py --api-url http://127.0.0.1:8000` — exit 0. Id `01ae80ba-bb4e-4f42-b503-761137a1c8d7`, status `completed`, stage `finalize`, summary `An unrecognized customer tier makes the discount endpoint return HTTP 500.` `checkpoints` had 4 rows for that thread id and no other thread.
+
+`uvx podman-compose restart api worker` logged `worker stopped` and then `worker started provider=fake concurrency=1 checkpointer=postgres`. `GET /api/v1/tasks/01ae80ba-bb4e-4f42-b503-761137a1c8d7` returned the same JSON body. The checkpoint count stayed 4. A new Python process in the restarted worker loaded that thread and printed the same task id and summary.
+
+`podman exec patchpilot_worker_1 python -m patchpilot.checkpoints` — exit 0. `checkpoint tables ready`.
+
+The services were left running.
+
+### Changed files
+
+- `src/patchpilot/checkpoints.py` — async saver, setup command, named connection
+- `src/patchpilot/workflow/graph.py` — thread id, sync durability, resume and reload helpers
+- `src/patchpilot/worker.py` — setup, one checkpointer connection, close on stop
+- `scripts/check_workflow.py` — `--once` reloads the thread through a second saver
+- `tests/test_checkpoints.py`, `tests/workflow_support.py`
+- `tests/test_workflow.py`, `tests/test_worker.py`, `tests/test_task_boundaries.py`, `tests/test_compose_contract.py`
+- `pyproject.toml`, `uv.lock` — `langgraph-checkpoint-postgres`
+- `.env.example`, `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` itself was not executed. Podman Compose is the verified runner. `up --build -d` did not recreate containers that were already running.
+- A crash during the model call still leaves the business row `running`. This worker does not claim that row again or resume the thread. The checkpoint is there for the next task.
+- Tasks completed by the previous worker have no checkpoint rows.
+- The saver is one connection, which matches concurrency 1. There is no pool.
+- `compile_triage_graph()` without a saver is still the path for unit tests that do not need PostgreSQL. LangGraph 1.2.19 raises `AttributeError` if `durability` is passed with no checkpointer, so durability is set only when a saver is attached.
+- Host Ollama was not part of this run. The checkpoint path was exercised with `FakeProvider`.
+
+### Next task
+
+Task 06 — Event audit trail, recoverable jobs and worker leases.

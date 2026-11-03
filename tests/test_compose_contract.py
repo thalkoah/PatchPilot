@@ -34,6 +34,7 @@ def test_direct_dependencies_include_langgraph_and_exclude_cloud_sdks():
     dependencies = text.split("[dependency-groups]", 1)[0]
 
     assert '"langgraph' in dependencies
+    assert '"langgraph-checkpoint-postgres' in dependencies
     for name in ("openai", "ollama", "langchain", "langchain-openai", "langchain-core"):
         assert f'"{name}' not in dependencies
 
@@ -59,6 +60,16 @@ def test_readme_warns_about_ollama_network_bindings():
     assert "11434" in readme
     assert "firewalld" in readme
     assert "lan" in readme
+
+
+def test_readme_documents_checkpoint_setup_outside_alembic():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert "python -m patchpilot.checkpoints" in readme
+    assert "python -m patchpilot.checkpoints" in example
+    assert "stay out of Alembic" in readme
+    assert "thread_id" in readme
 
 
 def test_env_example_is_present_and_env_is_ignored():

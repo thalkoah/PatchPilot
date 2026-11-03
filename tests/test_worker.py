@@ -192,7 +192,7 @@ async def test_idle_loop_sleeps_without_opening_an_engine(monkeypatch, caplog):
         await serve(_settings(), provider=FakeProvider(), session_factory=object())
 
     assert sleeps == [2.0]
-    assert "worker started provider=fake concurrency=1" in caplog.text
+    assert "worker started provider=fake concurrency=1 checkpointer=none" in caplog.text
 
 
 def test_main_logs_a_clean_stop(monkeypatch, caplog):
@@ -248,4 +248,5 @@ def test_sigterm_stops_the_worker_process(postgres_database_url: str, clean_task
             proc.wait(timeout=5)
 
     assert code == 0
+    assert "worker started provider=fake concurrency=1 checkpointer=postgres" in output
     assert "worker stopped" in output

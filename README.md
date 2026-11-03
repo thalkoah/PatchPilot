@@ -73,9 +73,19 @@ curl -s 'http://127.0.0.1:8000/api/v1/tasks?status=queued&limit=20&offset=0'
 
 ## Triage workflow
 
-The worker runs a LangGraph `StateGraph` with the path `START -> triage -> finalize -> END`. This version compiles the graph with no checkpointer. The task row in PostgreSQL is the result that is still there after a restart. Durable graph checkpoints are a later task.
+The worker runs a LangGraph `StateGraph` with the path `START -> triage -> finalize -> END`. It compiles that graph with the async Postgres checkpointer from `langgraph-checkpoint-postgres`. The LangGraph `thread_id` is the task UUID, with no extra prefix. Each finished node is stored before the next node starts (`durability="sync"`).
 
-The worker claims the oldest queued row, sets `running` and stage `triage`, and commits. That commit releases the row lock before the model call. `triage` calls `generate_structured` once. `finalize` checks the object again. A success stores status `completed`, stage `finalize`, the summary, and the validated triage object in `result_json`. A provider failure or any other error stores status `failed`, stage `triage`, a short summary, and `{"error": "..."}`. Those strings omit model text. Concurrency is 1. A crash during the model call leaves the task `running` until a later recovery task.
+Checkpoint tables live in the same PostgreSQL database and stay out of Alembic. `AsyncPostgresSaver.setup()` creates `checkpoint_migrations`, `checkpoints`, `checkpoint_blobs`, and `checkpoint_writes`. The business result stays on `tasks`: status, stage, `result_summary`, and `result_json`.
+
+Initialize those tables with:
+
+```bash
+uv run python -m patchpilot.checkpoints
+```
+
+The command is idempotent. Point `DATABASE_URL` at a database the host can reach. The worker runs the same setup when it starts, then holds one autocommit connection until the process stops. Compose does not need a separate checkpoint service. The API does not open the checkpointer.
+
+The worker claims the oldest queued row, sets `running` and stage `triage`, and commits. That commit releases the row lock before the model call. `triage` calls `generate_structured` once. `finalize` checks the object again. A success stores status `completed`, stage `finalize`, the summary, and the validated triage object in `result_json`. A provider failure or any other error stores status `failed`, stage `triage`, a short summary, and `{"error": "..."}`. Those strings omit model text. Concurrency is 1. A crash during the model call leaves the task `running`. The checkpoint for that thread remains. Automatic reclaim of a crashed task is a later task. A new process can load a finished thread by the same task UUID, and resuming after a completed node does not call the model again.
 
 Smoke test against the running stack. The worker container claims the task:
 
@@ -152,7 +162,7 @@ uv run ruff format --check .
 uv run python scripts/check_llm.py
 ```
 
-`scripts/check_workflow.py --once` also needs `DATABASE_URL` and a migrated database. The pytest suite covers that path with `FakeProvider`.
+`scripts/check_workflow.py --once` needs `DATABASE_URL` and a migrated database. It triages one task, closes the checkpointer, opens a second one, and reloads that thread. Stderr includes `checkpoint thread_id=<uuid> reloaded=true`. The pytest suite covers that path with `FakeProvider`.
 
 Health and settings tests do not need a running database. The readiness failure test connects to a closed local port and checks that the password is not returned or logged.
 

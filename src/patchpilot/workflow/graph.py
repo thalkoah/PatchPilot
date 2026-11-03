@@ -1,7 +1,11 @@
 """Triage workflow: START -> triage -> finalize -> END.
 
-The compiled graph has no checkpointer. PostgreSQL stores the business result.
-Durable graph checkpoints arrive in a later task.
+The worker compiles this graph with an AsyncPostgresSaver. The task UUID is the
+LangGraph thread id. Checkpoint rows are not the business task record: the
+worker still writes status, stage, summary, and result_json on `tasks`.
+
+`durability="sync"` stores each finished node before the next one starts, so a
+later resume does not run that node again.
 """
 
 import logging
@@ -9,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
 from uuid import UUID
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
@@ -25,6 +30,9 @@ STAGE_TRIAGE = "triage"
 STAGE_FINALIZE = "finalize"
 GENERIC_FAILURE = "Triage failed before a valid result was produced."
 MAX_FAILURE_CHARS = 500
+# Persist the checkpoint before the next node. "async" can still be in flight
+# when a node, or the process, ends.
+CHECKPOINT_DURABILITY = "sync"
 
 WorkflowStatus = Literal["running", "completed", "failed"]
 
@@ -63,8 +71,34 @@ def triage_prompt(*, title: str, description: str) -> str:
     return f"Title: {title}\nDescription:\n{description}\n"
 
 
-def compile_triage_graph() -> CompiledStateGraph:
-    """Build the one-shot triage graph. `checkpointer=False` disables inheritance."""
+def thread_config(task_id: UUID) -> dict[str, Any]:
+    """Stable LangGraph thread. The id is the task UUID and nothing else."""
+    return {"configurable": {"thread_id": str(task_id)}}
+
+
+def initial_triage_state(*, task_id: UUID, title: str, description: str) -> TriageState:
+    return {
+        "task_id": str(task_id),
+        "title": title,
+        "description": description,
+        "triage": None,
+        "result_summary": None,
+        "error": None,
+        "status": "running",
+    }
+
+
+def compile_triage_graph(
+    checkpointer: BaseCheckpointSaver | Literal[False] = False,
+    *,
+    interrupt_after: list[str] | None = None,
+) -> CompiledStateGraph:
+    """Compile the triage graph.
+
+    The default saver is off so a graph unit test can run without PostgreSQL.
+    Pass `checkpointer=False` explicitly when that is the intent. The worker
+    passes the Postgres saver instead.
+    """
     builder: StateGraph[TriageState, WorkflowContext, TriageState, TriageState] = StateGraph(
         TriageState,
         context_schema=WorkflowContext,
@@ -74,10 +108,13 @@ def compile_triage_graph() -> CompiledStateGraph:
     builder.add_edge(START, "triage")
     builder.add_edge("triage", "finalize")
     builder.add_edge("finalize", END)
-    return builder.compile(checkpointer=False)
+    options: dict[str, Any] = {}
+    if interrupt_after:
+        options["interrupt_after"] = interrupt_after
+    return builder.compile(checkpointer=checkpointer, **options)
 
 
-def run_triage(
+async def run_triage(
     graph: CompiledStateGraph,
     *,
     task_id: UUID,
@@ -86,21 +123,45 @@ def run_triage(
     provider: LLMProvider,
 ) -> TriageOutcome:
     """Run one triage. Provider failures become a failed outcome instead of raw text."""
-    state: TriageState = {
-        "task_id": str(task_id),
-        "title": title,
-        "description": description,
-        "triage": None,
-        "result_summary": None,
-        "error": None,
-        "status": "running",
-    }
+    state = initial_triage_state(task_id=task_id, title=title, description=description)
     try:
-        final = graph.invoke(state, context=WorkflowContext(provider=provider))
+        final = await invoke_triage(graph, state, task_id=task_id, provider=provider)
     except Exception as exc:
         logger.error("triage graph failed: %s", type(exc).__name__)
         return failure_outcome(GENERIC_FAILURE)
     return outcome_from_state(final)
+
+
+async def invoke_triage(
+    graph: CompiledStateGraph,
+    state: TriageState | None,
+    *,
+    task_id: UUID,
+    provider: LLMProvider,
+    resume: bool = False,
+) -> dict[str, Any]:
+    """Run or resume one thread. `resume=True` passes no new input."""
+    options: dict[str, Any] = {}
+    if graph.checkpointer:
+        options["durability"] = CHECKPOINT_DURABILITY
+    result = await graph.ainvoke(
+        None if resume else state,
+        thread_config(task_id),
+        context=WorkflowContext(provider=provider),
+        **options,
+    )
+    if not isinstance(result, dict):
+        raise TypeError(type(result).__name__)
+    return result
+
+
+async def read_thread_state(graph: CompiledStateGraph, task_id: UUID) -> dict[str, Any]:
+    """Load the latest checkpoint values for this task. Empty when none exist."""
+    snapshot = await graph.aget_state(thread_config(task_id))
+    values = snapshot.values
+    if not isinstance(values, dict) or not values:
+        return {}
+    return dict(values)
 
 
 def triage_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:

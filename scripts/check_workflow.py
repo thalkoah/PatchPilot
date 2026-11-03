@@ -17,6 +17,7 @@ from uuid import UUID
 import httpx2
 from pydantic import ValidationError
 
+from patchpilot.checkpoints import open_checkpointer, setup_checkpoints
 from patchpilot.config import Settings, get_settings
 from patchpilot.db.models import Task, TaskStatus
 from patchpilot.db.session import create_engine, create_session_factory
@@ -25,7 +26,7 @@ from patchpilot.llm.triage import TriageResult
 from patchpilot.repositories.tasks import TaskRepository
 from patchpilot.schemas.tasks import TaskResponse
 from patchpilot.worker import process_task
-from patchpilot.workflow.graph import compile_triage_graph
+from patchpilot.workflow.graph import compile_triage_graph, read_thread_state
 
 DEMO_TITLE = "Unknown customer tier crashes discount endpoint"
 DEMO_DESCRIPTION = (
@@ -66,19 +67,24 @@ async def run_once(timeout: float) -> int:
     provider = create_provider(settings)
     engine = create_engine(settings)
     try:
+        await setup_checkpoints(settings.database_url)
         factory = create_session_factory(engine)
-        graph = compile_triage_graph()
-        async with factory() as session:
-            created = await TaskRepository(session).create(
-                title=DEMO_TITLE,
-                description=DEMO_DESCRIPTION,
-            )
-        claimed = await process_task(factory, provider, created.id, graph)
-        if claimed:
+        async with open_checkpointer(settings.database_url) as checkpointer:
+            graph = compile_triage_graph(checkpointer)
             async with factory() as session:
-                stored = await TaskRepository(session).get(created.id)
-        else:
-            stored = await _wait_for_terminal(factory, created.id, timeout)
+                created = await TaskRepository(session).create(
+                    title=DEMO_TITLE,
+                    description=DEMO_DESCRIPTION,
+                )
+            task_id = created.id
+            claimed = await process_task(factory, provider, task_id, graph)
+            if claimed:
+                async with factory() as session:
+                    stored = await TaskRepository(session).get(task_id)
+            else:
+                stored = await _wait_for_terminal(factory, task_id, timeout)
+        async with open_checkpointer(settings.database_url) as checkpointer:
+            reloaded = await read_thread_state(compile_triage_graph(checkpointer), task_id)
     except Exception as exc:
         print(f"error: {type(exc).__name__}", file=sys.stderr)
         return 1
@@ -87,6 +93,13 @@ async def run_once(timeout: float) -> int:
         await engine.dispose()
 
     _print_provider(settings)
+    if stored is None or stored.result_summary != reloaded.get("result_summary"):
+        print("error: checkpoint did not reload", file=sys.stderr)
+        return 1
+    if str(reloaded.get("task_id")) != str(task_id):
+        print("error: checkpoint thread did not match the task", file=sys.stderr)
+        return 1
+    print(f"checkpoint thread_id={task_id} reloaded=true", file=sys.stderr)
     return _emit_task(stored)
 
 

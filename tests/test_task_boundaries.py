@@ -61,6 +61,7 @@ def test_request_path_does_not_call_a_model_or_schedule_background_work():
         ), relative
         assert not any(name == "langgraph" or name.startswith("langgraph.") for name in modules)
         assert not any(name.startswith("patchpilot.workflow") for name in modules), relative
+        assert "patchpilot.checkpoints" not in modules
 
 
 def test_worker_runs_the_graph_outside_the_api():
@@ -68,6 +69,7 @@ def test_worker_runs_the_graph_outside_the_api():
     source = (ROOT / "src/patchpilot/worker.py").read_text(encoding="utf-8")
 
     assert "patchpilot.workflow.graph" in modules
+    assert "patchpilot.checkpoints" in modules
     assert "patchpilot.llm.factory" in modules
     assert "BackgroundTasks" not in source
     assert not any(name == "fastapi" or name.startswith("fastapi.") for name in modules)
@@ -77,6 +79,8 @@ def test_triage_graph_does_not_touch_the_database_or_http():
     modules = imported_modules("src/patchpilot/workflow/graph.py")
 
     assert "langgraph.graph" in modules
+    assert "patchpilot.checkpoints" not in modules
+    assert not any("checkpoint.postgres" in name for name in modules)
     assert not any(name == "fastapi" or name.startswith("fastapi.") for name in modules)
     assert not any(name.startswith("patchpilot.repositories") for name in modules)
     assert not any(name == "sqlalchemy" or name.startswith("sqlalchemy.") for name in modules)
@@ -91,3 +95,17 @@ def test_initial_migration_freezes_column_limits_and_rejected_status():
     assert "sa.String(length=200)" in text
     assert "char_length(description) <= 20000" in text
     assert '"rejected"' in text
+
+
+def test_checkpoint_setup_is_not_an_alembic_migration():
+    modules = imported_modules("src/patchpilot/checkpoints.py")
+    alembic_text = "\n".join(
+        path.read_text(encoding="utf-8") for path in (ROOT / "alembic").rglob("*.py")
+    )
+
+    assert "langgraph.checkpoint.postgres.aio" in modules
+    assert not any(name == "alembic" or name.startswith("alembic.") for name in modules)
+    assert not any(name.startswith("patchpilot.repositories") for name in modules)
+    assert not any(name.startswith("patchpilot.db") for name in modules)
+    assert "checkpoint_migrations" not in alembic_text
+    assert "checkpoint_blobs" not in alembic_text

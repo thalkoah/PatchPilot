@@ -9,6 +9,7 @@ dependencies = [
     "fastapi>=0.115",
     "httpx2>=2.0",
     "langgraph>=1.2.19",
+    "langgraph-checkpoint-postgres>=3",
     "psycopg[binary]>=3.2",
     "pydantic-settings>=2.6",
     "sqlalchemy[asyncio]>=2.0",
