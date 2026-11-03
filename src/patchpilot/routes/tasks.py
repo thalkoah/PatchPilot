@@ -5,8 +5,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from patchpilot.dependencies import get_task_repository
+from patchpilot.dependencies import get_event_repository, get_task_repository
+from patchpilot.repositories.events import EventRepository
 from patchpilot.repositories.tasks import TaskRepository
+from patchpilot.schemas.events import EventList, EventResponse
 from patchpilot.schemas.tasks import (
     DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
@@ -19,6 +21,7 @@ from patchpilot.schemas.tasks import (
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 RepositoryDep = Annotated[TaskRepository, Depends(get_task_repository)]
+EventRepositoryDep = Annotated[EventRepository, Depends(get_event_repository)]
 
 
 @router.post("", status_code=201, response_model=TaskResponse)
@@ -49,3 +52,19 @@ async def get_task(task_id: UUID, repository: RepositoryDep) -> TaskResponse:
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return TaskResponse.model_validate(task)
+
+
+@router.get("/{task_id}/events", response_model=EventList)
+async def list_task_events(
+    task_id: UUID,
+    repository: RepositoryDep,
+    events: EventRepositoryDep,
+) -> EventList:
+    task = await repository.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    rows, truncated = await events.list_for_task(task_id)
+    return EventList(
+        items=[EventResponse.model_validate(row) for row in rows],
+        truncated=truncated,
+    )

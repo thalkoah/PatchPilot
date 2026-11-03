@@ -15,6 +15,7 @@ from tests.database import fetch_status, open_session_factory, stamp_task
 from patchpilot.config import Settings, get_settings
 from patchpilot.db.models import TaskStatus
 from patchpilot.llm.fake import FakeProvider
+from patchpilot.repositories.jobs import JobRepository
 from patchpilot.repositories.tasks import TaskRepository
 from patchpilot.worker import main, process_one, serve
 from patchpilot.workflow.graph import STAGE_TRIAGE
@@ -44,7 +45,11 @@ async def test_claim_commits_before_the_session_closes(
 
         async def claim():
             async with factory() as session:
-                return await TaskRepository(session).claim_next_queued(stage=STAGE_TRIAGE)
+                return await JobRepository(session).claim_next_queued(
+                    stage=STAGE_TRIAGE,
+                    worker_id="worker-a",
+                    lease_seconds=30,
+                )
 
         first = await claim()
         second = await claim()
@@ -79,7 +84,11 @@ async def test_oldest_queued_task_is_claimed_first(
 
         async def claim():
             async with factory() as session:
-                return await TaskRepository(session).claim_next_queued(stage=STAGE_TRIAGE)
+                return await JobRepository(session).claim_next_queued(
+                    stage=STAGE_TRIAGE,
+                    worker_id="worker-a",
+                    lease_seconds=30,
+                )
 
         first = await claim()
         second = await claim()
@@ -102,7 +111,11 @@ async def test_overlapping_claims_do_not_share_a_task(
 
         async def claim():
             async with factory() as session:
-                return await TaskRepository(session).claim_next_queued(stage=STAGE_TRIAGE)
+                return await JobRepository(session).claim_next_queued(
+                    stage=STAGE_TRIAGE,
+                    worker_id="worker-a",
+                    lease_seconds=30,
+                )
 
         claimed = await asyncio.gather(claim(), claim())
     finally:
@@ -122,9 +135,19 @@ async def test_claim_by_id_does_not_take_a_different_task(
         wanted = await _create(factory, title="wanted")
         other = await _create(factory, title="other")
         async with factory() as session:
-            claimed = await TaskRepository(session).claim_queued(wanted.id, stage=STAGE_TRIAGE)
+            claimed = await JobRepository(session).claim_queued(
+                wanted.id,
+                stage=STAGE_TRIAGE,
+                worker_id="worker-a",
+                lease_seconds=30,
+            )
         async with factory() as session:
-            again = await TaskRepository(session).claim_queued(wanted.id, stage=STAGE_TRIAGE)
+            again = await JobRepository(session).claim_queued(
+                wanted.id,
+                stage=STAGE_TRIAGE,
+                worker_id="worker-b",
+                lease_seconds=30,
+            )
     finally:
         await engine.dispose()
 
@@ -174,7 +197,7 @@ async def test_empty_queue_does_not_call_the_provider(
 async def test_idle_loop_sleeps_without_opening_an_engine(monkeypatch, caplog):
     sleeps: list[float] = []
 
-    async def no_work(session_factory, provider, graph=None):
+    async def no_work(session_factory, provider, graph=None, **kwargs):
         return False
 
     async def stop(seconds):

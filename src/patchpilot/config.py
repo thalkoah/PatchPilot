@@ -13,6 +13,9 @@ from patchpilot.llm.limits import (
     normalize_ollama_base_url,
 )
 
+DEFAULT_WORKER_LEASE_SECONDS = 30.0
+DEFAULT_WORKER_MAX_ATTEMPTS = 3
+
 
 class LLMSettings(BaseSettings):
     """Model provider settings. The smoke script can load these without a database."""
@@ -53,6 +56,8 @@ class Settings(LLMSettings):
     database_url: str = Field(min_length=1)
     db_connect_timeout_seconds: int = Field(default=3, ge=1, le=30)
     worker_idle_sleep_seconds: float = Field(default=2.0, gt=0, le=3600)
+    worker_lease_seconds: float = Field(default=DEFAULT_WORKER_LEASE_SECONDS, gt=0, le=3600)
+    worker_max_attempts: int = Field(default=DEFAULT_WORKER_MAX_ATTEMPTS, ge=1, le=20)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     @field_validator("database_url")

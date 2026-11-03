@@ -21,6 +21,7 @@ from patchpilot.repositories.tasks import TaskRepository
 from patchpilot.worker import WORKER_CONCURRENCY, process_one
 from patchpilot.workflow.graph import (
     GENERIC_FAILURE,
+    LeaseLost,
     compile_triage_graph,
     read_thread_state,
     run_triage,
@@ -145,6 +146,22 @@ async def test_fake_provider_triage_completes_without_a_database():
     assert len(provider.calls) == 1
     assert provider.calls[0].prompt == f"Title: {title}\nDescription:\n{description}\n"
     assert provider.calls[0].schema_name == "TriageResult"
+
+
+async def test_lost_lease_does_not_become_a_stored_failure():
+    provider = FakeProvider()
+
+    with pytest.raises(LeaseLost):
+        await run_triage(
+            compile_triage_graph(),
+            task_id=uuid4(),
+            title="Broken save",
+            description="The button fails.",
+            provider=provider,
+            lease_lost=lambda: True,
+        )
+
+    assert len(provider.calls) == 1
 
 
 async def test_unexpected_model_error_does_not_keep_the_exception_text():
@@ -292,6 +309,16 @@ async def test_provider_error_is_saved_without_model_text(
     assert SECRET not in (stored.result_summary or "")
     assert SECRET not in str(stored.result_json)
     assert SECRET not in caplog.text
+    with psycopg.connect(postgres_database_url, autocommit=True) as connection:
+        payloads = connection.execute(
+            "SELECT event_type, payload::text FROM events WHERE task_id = %s",
+            (created.id,),
+        ).fetchall()
+    assert any(row[0] == "model_error" for row in payloads)
+    for event_type, payload in payloads:
+        assert SECRET not in payload
+        assert "parser blew up" not in payload
+        assert event_type != "task_completed"
 
 
 def test_check_workflow_once_prints_a_completed_triage(

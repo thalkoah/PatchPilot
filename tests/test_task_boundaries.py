@@ -87,6 +87,16 @@ def test_triage_graph_does_not_touch_the_database_or_http():
     assert "psycopg" not in modules
 
 
+def test_job_repository_does_not_depend_on_http_or_the_graph():
+    modules = imported_modules("src/patchpilot/repositories/jobs.py")
+
+    assert "patchpilot.db.models" in modules
+    assert not any(name == "fastapi" or name.startswith("fastapi.") for name in modules)
+    assert not any(name.startswith("patchpilot.workflow") for name in modules)
+    assert not any(name.startswith("patchpilot.schemas") for name in modules)
+    assert not any(name == "langgraph" or name.startswith("langgraph.") for name in modules)
+
+
 def test_initial_migration_freezes_column_limits_and_rejected_status():
     text = (ROOT / "alembic/versions/20261102_0001_create_tasks.py").read_text(encoding="utf-8")
 

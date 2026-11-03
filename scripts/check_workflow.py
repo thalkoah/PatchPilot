@@ -77,7 +77,14 @@ async def run_once(timeout: float) -> int:
                     description=DEMO_DESCRIPTION,
                 )
             task_id = created.id
-            claimed = await process_task(factory, provider, task_id, graph)
+            claimed = await process_task(
+                factory,
+                provider,
+                task_id,
+                graph,
+                lease_seconds=settings.worker_lease_seconds,
+                database_url=settings.database_url,
+            )
             if claimed:
                 async with factory() as session:
                     stored = await TaskRepository(session).get(task_id)

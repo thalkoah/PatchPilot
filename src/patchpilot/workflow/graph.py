@@ -9,6 +9,7 @@ later resume does not run that node again.
 """
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
 from uuid import UUID
@@ -49,11 +50,16 @@ class TriageState(TypedDict):
     status: WorkflowStatus
 
 
+class LeaseLost(Exception):
+    """This worker no longer holds the lease, so the node must not checkpoint a success."""
+
+
 @dataclass(frozen=True, slots=True)
 class WorkflowContext:
     """Dependencies for one run. They are not written to a checkpoint."""
 
     provider: LLMProvider
+    lease_lost: Callable[[], bool] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,15 +127,65 @@ async def run_triage(
     title: str,
     description: str,
     provider: LLMProvider,
+    lease_lost: Callable[[], bool] | None = None,
 ) -> TriageOutcome:
     """Run one triage. Provider failures become a failed outcome instead of raw text."""
     state = initial_triage_state(task_id=task_id, title=title, description=description)
     try:
-        final = await invoke_triage(graph, state, task_id=task_id, provider=provider)
+        final = await invoke_triage(
+            graph,
+            state,
+            task_id=task_id,
+            provider=provider,
+            lease_lost=lease_lost,
+        )
+    except LeaseLost:
+        raise
     except Exception as exc:
         logger.error("triage graph failed: %s", type(exc).__name__)
         return failure_outcome(GENERIC_FAILURE)
     return outcome_from_state(final)
+
+
+async def run_claimed_triage(
+    graph: CompiledStateGraph,
+    *,
+    task_id: UUID,
+    title: str,
+    description: str,
+    provider: LLMProvider,
+    lease_lost: Callable[[], bool] | None = None,
+) -> TriageOutcome:
+    """Resume a checkpointed thread, or start one when no checkpoint exists.
+
+    A finished thread returns its stored outcome and does not call the model again.
+    """
+    if graph.checkpointer:
+        existing = await read_thread_state(graph, task_id)
+        if existing:
+            try:
+                final = await invoke_triage(
+                    graph,
+                    None,
+                    task_id=task_id,
+                    provider=provider,
+                    resume=True,
+                    lease_lost=lease_lost,
+                )
+            except LeaseLost:
+                raise
+            except Exception as exc:
+                logger.error("triage resume failed: %s", type(exc).__name__)
+                return failure_outcome(GENERIC_FAILURE)
+            return outcome_from_state(final)
+    return await run_triage(
+        graph,
+        task_id=task_id,
+        title=title,
+        description=description,
+        provider=provider,
+        lease_lost=lease_lost,
+    )
 
 
 async def invoke_triage(
@@ -139,6 +195,7 @@ async def invoke_triage(
     task_id: UUID,
     provider: LLMProvider,
     resume: bool = False,
+    lease_lost: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Run or resume one thread. `resume=True` passes no new input."""
     options: dict[str, Any] = {}
@@ -147,7 +204,7 @@ async def invoke_triage(
     result = await graph.ainvoke(
         None if resume else state,
         thread_config(task_id),
-        context=WorkflowContext(provider=provider),
+        context=WorkflowContext(provider=provider, lease_lost=lease_lost),
         **options,
     )
     if not isinstance(result, dict):
@@ -173,6 +230,8 @@ def triage_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[s
     except Exception as exc:
         logger.error("triage node failed: %s", type(exc).__name__)
         return _failed_update(GENERIC_FAILURE)
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
     return {
         "triage": result.model_dump(mode="json"),
         "error": None,
@@ -225,6 +284,13 @@ def outcome_from_state(state: TriageState) -> TriageOutcome:
 
 def failure_text(exc: LLMError) -> str:
     return _message(str(exc))
+
+
+def _lease_is_lost(runtime: Runtime[WorkflowContext]) -> bool:
+    probe = runtime.context.lease_lost
+    if probe is None:
+        return False
+    return bool(probe())
 
 
 def _failed_update(message: str) -> dict[str, Any]:

@@ -68,8 +68,11 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/tasks \
 
 curl -s http://127.0.0.1:8000/api/v1/tasks
 curl -s http://127.0.0.1:8000/api/v1/tasks/<id>
+curl -s http://127.0.0.1:8000/api/v1/tasks/<id>/events
 curl -s 'http://127.0.0.1:8000/api/v1/tasks?status=queued&limit=20&offset=0'
 ```
+
+`GET /api/v1/tasks/{id}/events` returns the append-only trail, oldest first. A missing task is HTTP 404. A task with no events yet returns `{"items": [], "truncated": false}`. The event names are `stage_started`, `stage_completed`, `model_error`, `task_completed`, `retry`, and `recovery`. Payloads are small JSON objects. Fields whose names look like passwords, tokens, or database URLs are stored as `[redacted]`.
 
 ## Triage workflow
 
@@ -85,7 +88,13 @@ uv run python -m patchpilot.checkpoints
 
 The command is idempotent. Point `DATABASE_URL` at a database the host can reach. The worker runs the same setup when it starts, then holds one autocommit connection until the process stops. Compose does not need a separate checkpoint service. The API does not open the checkpointer.
 
-The worker claims the oldest queued row, sets `running` and stage `triage`, and commits. That commit releases the row lock before the model call. `triage` calls `generate_structured` once. `finalize` checks the object again. A success stores status `completed`, stage `finalize`, the summary, and the validated triage object in `result_json`. A provider failure or any other error stores status `failed`, stage `triage`, a short summary, and `{"error": "..."}`. Those strings omit model text. Concurrency is 1. A crash during the model call leaves the task `running`. The checkpoint for that thread remains. Automatic reclaim of a crashed task is a later task. A new process can load a finished thread by the same task UUID, and resuming after a completed node does not call the model again.
+The worker claims the oldest queued row with `FOR UPDATE SKIP LOCKED`, opens a `task_runs` row, and commits. That commit releases the row lock before the model call. The run's `lease_until` is the database clock plus `WORKER_LEASE_SECONDS` (default 30). A background thread renews that lease only while this worker still holds it and the run is open, so a blocking model call does not freeze the lease.
+
+A second worker will not take a task whose lease is still in the future, so two workers do not run the same task at the same time.
+
+If the worker process dies, the lease expires. The next poll closes that run with `lease_expired`, writes a `recovery` event, and starts the next attempt when the attempt count is below `WORKER_MAX_ATTEMPTS` (default 3). The new attempt resumes the LangGraph thread when a checkpoint exists, and otherwise replays triage from the start. Event writes use an idempotency key, so replaying a stage does not insert a second copy. When the expired attempt is already the last one, the task becomes `failed` with `recovery_exhausted` and stays there.
+
+`triage` calls `generate_structured` once. `finalize` checks the object again. A success stores status `completed`, stage `finalize`, the summary, and the validated triage object in `result_json`. A provider failure or any other error stores status `failed`, stage `triage`, a short summary, and `{"error": "..."}`. Those strings omit model text. Concurrency is 1. A new process can load a finished thread by the same task UUID, and resuming after a completed node does not call the model again.
 
 Smoke test against the running stack. The worker container claims the task:
 

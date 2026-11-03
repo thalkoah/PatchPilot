@@ -237,3 +237,48 @@ The services were left running.
 ### Next task
 
 Task 06 — Event audit trail, recoverable jobs and worker leases.
+
+## Task 06 — Event audit trail, recoverable jobs and worker leases
+
+Status: complete (2026-11-03).
+
+A claim still uses `FOR UPDATE SKIP LOCKED`, and it now opens a `task_runs` row before the commit that releases the task lock. `lease_until` is the database clock plus `WORKER_LEASE_SECONDS` (default 30). A background thread renews that lease only while the same worker still holds an open run, including while a synchronous model call blocks the event loop. A second worker does not take a task whose lease is in the future.
+
+When a lease expires, the next poll locks the task, closes the run with `lease_expired`, and starts the next attempt if the attempt count is below `WORKER_MAX_ATTEMPTS` (default 3). That attempt resumes the LangGraph thread when a checkpoint exists, and otherwise replays triage. At the last attempt the task is stored as `failed` with `recovery_exhausted`. Events are append-only. A repeated idempotency key does not change the stored payload. `GET /api/v1/tasks/{id}/events` returns the trail, oldest first. Alembic head is `0002_task_runs_and_events`. Checkpoint tables are still created by `AsyncPostgresSaver.setup()`.
+
+### Evidence
+
+`uv run pytest` — 134 passed in 11.16s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 58 files already formatted, after one format pass on the new event writer.
+
+The suite's crash test starts a worker subprocess, waits until a fake model call is inside `time.sleep`, sends `SIGKILL`, expires the lease, and runs `process_one` again. The task ends `completed`. The first run is `lease_expired`, the second run has no error, and the event rows include `stage_started`, `recovery`, `retry`, and `task_completed`. The restarted model call happens once. Two competing workers produce one model call. An expired lease at `max_attempts=1` becomes `failed` and is not claimed again. A blocking one-second model call still moves `lease_until` forward. `UPDATE` and `DELETE` on `events` raise `events are append-only`.
+
+The running Compose stack was not recreated. It is still the Task 05 image, so it does not have `task_runs` or `events` until the next `podman-compose up --build` recreates the API and worker. `alembic upgrade head` in that new API process applies `0002_task_runs_and_events`.
+
+### Changed files
+
+- `alembic/versions/20261103_0002_task_runs_and_events.py` — `task_runs`, append-only `events`
+- `src/patchpilot/db/models.py` — `TaskRun`, `TaskEvent`
+- `src/patchpilot/audit.py`, `repositories/events.py`, `repositories/jobs.py`, `leases.py`
+- `src/patchpilot/worker.py` — claim, renewal, recovery, resume
+- `src/patchpilot/workflow/graph.py` — resume helper, lease-lost abort
+- `src/patchpilot/routes/tasks.py`, `schemas/events.py`, `dependencies.py` — event API
+- `src/patchpilot/config.py` — lease seconds and max attempts
+- `tests/test_events.py`, `tests/test_recovery.py`, plus worker, workflow, checkpoint, and contract updates
+- `compose.yaml`, `.env.example`, `README.md`, `scripts/check_workflow.py`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` was not executed. The Compose containers from Task 05 were left running and do not include this schema yet.
+- A model error is a terminal `failed` task. Recovery retries expired leases, not a triage result the graph already stored as failed.
+- If a worker is still inside a model call after its lease has expired, the recovering worker may start. The first worker discards its result when the lease check fails, but the two calls can overlap until that return. Healthy workers renew the lease and do not overlap.
+- Concurrency stays 1. The renewal thread is one short-lived connection per active run.
+- Event payloads omit the idempotency key. Rows written in one transaction are ordered by adding microseconds to `clock_timestamp()`.
+- Host Ollama was not part of this run. Recovery was exercised with `FakeProvider`.
+
+### Next task
+
+Task 07 — Repository registry and safe read-only tools.
