@@ -2,14 +2,15 @@
 
 A task with no repository follows `START -> triage -> finalize -> END`. A task
 with a repo_id follows `START -> triage -> investigate -> plan`, then either
-`finalize` or `request_plan_approval -> finalize`. The approval node runs only
-when the plan names a code change. It calls `interrupt()` and does no I/O
-before that call, because resume runs the node from the top.
+`finalize` or `request_plan_approval`. Approval runs only when the plan names a
+code change. It calls `interrupt()` and does no I/O before that call, because
+resume runs the node from the top. An approval continues to `prepare_workspace`
+and then `finalize`. A rejection goes straight to `finalize`.
 
-The investigate node is the only place that reads a checkout. The plan node
-proposes paths and does not write them. Neither node runs when triage failed,
-and plan does not run when investigation failed. Nothing in this graph writes
-the registered checkout.
+The investigate node reads the registered checkout. The plan node proposes
+paths and does not write them. `prepare_workspace` clones that checkout into
+the workspace volume. It does not read a path from the plan. Nothing in this
+graph writes the registered checkout.
 
 The worker compiles this graph with an AsyncPostgresSaver. The task UUID is the
 LangGraph thread id. Checkpoint rows are not the business task record: the
@@ -22,6 +23,7 @@ later resume does not run that node again.
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, TypedDict
 from uuid import UUID
 
@@ -43,6 +45,9 @@ from patchpilot.llm.plan import ChangePlan
 from patchpilot.llm.provider import LLMProvider
 from patchpilot.llm.triage import TriageResult
 from patchpilot.source.tools import RepositoryTools
+from patchpilot.workspace.errors import WorkspaceError
+from patchpilot.workspace.git import prepare_isolated_workspace
+from patchpilot.workspace.layout import IsolatedWorkspace, workspace_from_state
 
 logger = logging.getLogger(__name__)
 
@@ -50,16 +55,20 @@ STAGE_TRIAGE = "triage"
 STAGE_INVESTIGATE = "investigate"
 STAGE_PLAN = "plan"
 STAGE_APPROVAL = "request_plan_approval"
+STAGE_WORKSPACE = "prepare_workspace"
 STAGE_FINALIZE = "finalize"
 GENERIC_FAILURE = "Triage failed before a valid result was produced."
 INVESTIGATION_FAILURE = "Investigation failed before a valid report was produced."
 PLAN_FAILURE = "Planning failed before a valid change plan was produced."
 APPROVAL_FAILURE = "Approval resume did not continue the workflow."
+WORKSPACE_FAILURE = "The isolated workspace could not be created."
 ARTIFACT_FAILURE = "The plan artifact could not be stored."
 REPOSITORY_UNAVAILABLE = "The registered repository could not be opened."
 REJECTED_SUMMARY = "The plan was rejected."
 MAX_FAILURE_CHARS = 500
-_FAILURE_STAGES = frozenset({STAGE_TRIAGE, STAGE_INVESTIGATE, STAGE_PLAN, STAGE_APPROVAL})
+_FAILURE_STAGES = frozenset(
+    {STAGE_TRIAGE, STAGE_INVESTIGATE, STAGE_PLAN, STAGE_APPROVAL, STAGE_WORKSPACE}
+)
 _INTERRUPT = "__interrupt__"
 # Persist the checkpoint before the next node. "async" can still be in flight
 # when a node, or the process, ends.
@@ -79,6 +88,7 @@ class TriageState(TypedDict):
     investigation: dict[str, Any] | None
     plan: dict[str, Any] | None
     approval: dict[str, Any] | None
+    workspace: dict[str, Any] | None
     result_summary: str | None
     error: str | None
     failed_stage: str | None
@@ -96,6 +106,7 @@ class WorkflowContext:
     provider: LLMProvider
     lease_lost: Callable[[], bool] | None = None
     repository_tools: RepositoryTools | None = None
+    workspace_root: Path | None = None
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS
     repository_error: str | None = None
 
@@ -109,6 +120,7 @@ class TriageOutcome:
     result_summary: str
     result_json: dict[str, Any]
     plan: ChangePlan | None = None
+    workspace: IsolatedWorkspace | None = None
 
 
 def triage_prompt(*, title: str, description: str) -> str:
@@ -137,6 +149,7 @@ def initial_triage_state(
         "investigation": None,
         "plan": None,
         "approval": None,
+        "workspace": None,
         "result_summary": None,
         "error": None,
         "failed_stage": None,
@@ -163,6 +176,7 @@ def compile_triage_graph(
     builder.add_node("investigate", investigate_node)
     builder.add_node("plan", plan_node)
     builder.add_node("request_plan_approval", request_plan_approval)
+    builder.add_node("prepare_workspace", prepare_workspace_node)
     builder.add_node("finalize", finalize_node)
     builder.add_edge(START, "triage")
     builder.add_conditional_edges(
@@ -180,7 +194,12 @@ def compile_triage_graph(
         route_after_plan,
         {"request_plan_approval": "request_plan_approval", "finalize": "finalize"},
     )
-    builder.add_edge("request_plan_approval", "finalize")
+    builder.add_conditional_edges(
+        "request_plan_approval",
+        route_after_approval,
+        {"prepare_workspace": "prepare_workspace", "finalize": "finalize"},
+    )
+    builder.add_edge("prepare_workspace", "finalize")
     builder.add_edge("finalize", END)
     options: dict[str, Any] = {}
     if interrupt_after:
@@ -198,6 +217,7 @@ async def run_triage(
     lease_lost: Callable[[], bool] | None = None,
     repo_id: UUID | None = None,
     repository_tools: RepositoryTools | None = None,
+    workspace_root: Path | None = None,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     repository_error: str | None = None,
 ) -> TriageOutcome:
@@ -216,6 +236,7 @@ async def run_triage(
             provider=provider,
             lease_lost=lease_lost,
             repository_tools=repository_tools,
+            workspace_root=workspace_root,
             max_tool_calls=max_tool_calls,
             repository_error=repository_error,
         )
@@ -237,6 +258,7 @@ async def run_claimed_triage(
     lease_lost: Callable[[], bool] | None = None,
     repo_id: UUID | None = None,
     repository_tools: RepositoryTools | None = None,
+    workspace_root: Path | None = None,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     repository_error: str | None = None,
     resume_decision: dict[str, Any] | None = None,
@@ -262,6 +284,7 @@ async def run_claimed_triage(
                     resume_decision=resume_decision,
                     lease_lost=lease_lost,
                     repository_tools=repository_tools,
+                    workspace_root=workspace_root,
                     max_tool_calls=max_tool_calls,
                     repository_error=repository_error,
                 )
@@ -285,6 +308,7 @@ async def run_claimed_triage(
                     resume=True,
                     lease_lost=lease_lost,
                     repository_tools=repository_tools,
+                    workspace_root=workspace_root,
                     max_tool_calls=max_tool_calls,
                     repository_error=repository_error,
                 )
@@ -303,6 +327,7 @@ async def run_claimed_triage(
         lease_lost=lease_lost,
         repo_id=repo_id,
         repository_tools=repository_tools,
+        workspace_root=workspace_root,
         max_tool_calls=max_tool_calls,
         repository_error=repository_error,
     )
@@ -318,6 +343,7 @@ async def invoke_triage(
     resume_decision: dict[str, Any] | None = None,
     lease_lost: Callable[[], bool] | None = None,
     repository_tools: RepositoryTools | None = None,
+    workspace_root: Path | None = None,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     repository_error: str | None = None,
 ) -> dict[str, Any]:
@@ -342,6 +368,7 @@ async def invoke_triage(
             provider=provider,
             lease_lost=lease_lost,
             repository_tools=repository_tools,
+            workspace_root=workspace_root,
             max_tool_calls=max_tool_calls,
             repository_error=repository_error,
         ),
@@ -391,6 +418,16 @@ def route_after_plan(state: TriageState) -> str:
     return "request_plan_approval"
 
 
+def route_after_approval(state: TriageState) -> str:
+    """Create a workspace only after an approval. Rejection stores no clone."""
+    if state.get("status") in {"failed", "rejected"} or state.get("error"):
+        return "finalize"
+    approval = state.get("approval")
+    if isinstance(approval, dict) and approval.get("decision") == "approve":
+        return "prepare_workspace"
+    return "finalize"
+
+
 def request_plan_approval(state: TriageState) -> dict[str, Any]:
     """Pause until a person decides. Resume runs this function from the top.
 
@@ -409,7 +446,46 @@ def request_plan_approval(state: TriageState) -> dict[str, Any]:
         "approval": parsed,
         "error": None,
         "failed_stage": None,
-        "status": "rejected" if parsed["decision"] == "reject" else "completed",
+        "status": "rejected" if parsed["decision"] == "reject" else "running",
+    }
+
+
+def prepare_workspace_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:
+    """Clone the opened checkout. The plan's paths are not used as destinations."""
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    context = runtime.context
+    if (
+        context.repository_error
+        or context.repository_tools is None
+        or context.workspace_root is None
+    ):
+        logger.error("workspace failed: unavailable")
+        return _failed_update(WORKSPACE_FAILURE, stage=STAGE_WORKSPACE)
+    try:
+        approval = _checked_approval(state.get("approval"))
+        task_id = UUID(str(state.get("task_id")))
+    except (TypeError, ValueError):
+        logger.error("workspace rejected the approval payload")
+        return _failed_update(APPROVAL_FAILURE, stage=STAGE_APPROVAL)
+    if approval is None or approval["decision"] != "approve":
+        return _failed_update(APPROVAL_FAILURE, stage=STAGE_APPROVAL)
+    try:
+        created = prepare_isolated_workspace(
+            source=context.repository_tools.root,
+            workspace_root=context.workspace_root,
+            task_id=task_id,
+        )
+    except WorkspaceError as exc:
+        logger.error("workspace failed: %s", exc.code)
+        return _failed_update(WORKSPACE_FAILURE, stage=STAGE_WORKSPACE)
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    return {
+        "workspace": created.as_state(),
+        "error": None,
+        "failed_stage": None,
+        "status": "completed",
     }
 
 
@@ -540,6 +616,11 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
         return _failed_update(GENERIC_FAILURE)
     if _plan_requests_changes(plan) and (approval is None or approval["decision"] != "approve"):
         return _failed_update(APPROVAL_FAILURE, stage=STAGE_APPROVAL)
+    try:
+        workspace = _accepted_workspace(state, plan)
+    except ValueError:
+        logger.error("finalize rejected the workspace payload")
+        return _failed_update(WORKSPACE_FAILURE, stage=STAGE_WORKSPACE)
     summary = checked.summary
     if plan is not None:
         summary = str(plan["plan"]["problem_statement"])
@@ -552,6 +633,7 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
         "investigation": investigation,
         "plan": plan,
         "approval": approval,
+        "workspace": None if workspace is None else workspace.as_state(),
     }
 
 
@@ -592,6 +674,10 @@ def outcome_from_state(state: TriageState) -> TriageOutcome:
         return failure_outcome(GENERIC_FAILURE)
     if _plan_requests_changes(plan) and (approval is None or approval["decision"] != "approve"):
         return failure_outcome(APPROVAL_FAILURE, stage=STAGE_APPROVAL)
+    try:
+        workspace = _accepted_workspace(state, plan)
+    except ValueError:
+        return failure_outcome(WORKSPACE_FAILURE, stage=STAGE_WORKSPACE)
     if plan is None or investigation is None:
         return TriageOutcome(
             status=TaskStatus.COMPLETED,
@@ -599,13 +685,14 @@ def outcome_from_state(state: TriageState) -> TriageOutcome:
             result_summary=checked.summary,
             result_json=checked.model_dump(mode="json"),
         )
-    body, accepted = _planned_body(checked, investigation, plan, approval)
+    body, accepted = _planned_body(checked, investigation, plan, approval, workspace)
     return TriageOutcome(
         status=TaskStatus.COMPLETED,
         stage=STAGE_FINALIZE,
         result_summary=accepted.problem_statement,
         result_json=body,
         plan=accepted,
+        workspace=workspace,
     )
 
 
@@ -670,7 +757,27 @@ def _rejected_update(state: TriageState) -> dict[str, Any]:
         "investigation": outcome.result_json["investigation"],
         "plan": _checked_plan(state.get("plan")),
         "approval": _checked_approval(state.get("approval")),
+        "workspace": None,
     }
+
+
+def _accepted_workspace(
+    state: dict[str, Any],
+    plan: dict[str, Any] | None,
+) -> IsolatedWorkspace | None:
+    """Return the derived workspace, or None when the plan names no edit."""
+    raw = state.get("workspace")
+    if not _plan_requests_changes(plan):
+        if raw is not None:
+            raise ValueError("workspace without a code change")
+        return None
+    task_raw = state.get("task_id")
+    if not isinstance(task_raw, str):
+        raise ValueError("task id missing")
+    workspace = workspace_from_state(raw, task_id=UUID(task_raw))
+    if workspace is None:
+        raise ValueError("approved plan has no workspace")
+    return workspace
 
 
 def _planned_body(
@@ -678,6 +785,7 @@ def _planned_body(
     investigation: dict[str, Any],
     plan: dict[str, Any],
     approval: dict[str, Any] | None,
+    workspace: IsolatedWorkspace | None = None,
 ) -> tuple[dict[str, Any], ChangePlan]:
     accepted = ChangePlan.model_validate(plan["plan"])
     body: dict[str, Any] = {
@@ -698,6 +806,8 @@ def _planned_body(
         if approval.get("reason"):
             recorded["reason"] = approval["reason"]
         body["approval"] = recorded
+    if workspace is not None:
+        body["workspace"] = {"base_sha": workspace.base_sha, "branch": workspace.branch}
     return body, accepted
 
 

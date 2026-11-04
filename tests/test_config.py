@@ -163,6 +163,30 @@ def test_artifacts_root_is_optional_and_must_be_absolute():
         )
 
 
+def test_workspace_root_is_optional_and_must_be_absolute():
+    settings = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        workspace_root="   ",
+        _env_file=None,
+    )
+
+    assert settings.workspace_root is None
+
+    rooted = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        workspace_root="/var/patchpilot/workspaces",
+        _env_file=None,
+    )
+    assert rooted.workspace_root == "/var/patchpilot/workspaces"
+
+    with pytest.raises(ValidationError):
+        Settings(
+            database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+            workspace_root="workspaces",
+            _env_file=None,
+        )
+
+
 def test_investigator_budget_defaults_to_six_and_stays_bounded():
     settings = Settings(
         database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",

@@ -483,3 +483,54 @@ The running Compose stack was left as it was. It does not include this migration
 ### Next task
 
 Task 11 — Isolated Git workspace and immutable baseline.
+
+## Task 11 — Isolated Git workspace and immutable baseline
+
+Status: complete (2026-11-04).
+
+An approved plan follows `request_plan_approval -> prepare_workspace -> finalize`. Rejection and a declined plan skip the workspace. `prepare_workspace` makes a bare clone of the registered checkout under `WORKSPACE_ROOT/<task-id>/clone` with `--no-hardlinks`, removes `origin`, and adds a worktree at `WORKSPACE_ROOT/<task-id>/worktree` on `patchpilot/<task-id>` at the source HEAD. `git worktree add` runs against that clone. The registered `.git` is not a worktree parent. There is no fetch and no push. Git hooks are pointed at `/dev/null`, and protocols other than `file` are refused.
+
+The branch and both relative paths are derived from the task id. A checkpoint value that names another path is rejected. `result_json.workspace` stores the base commit and the branch. The `workspaces` row stores those plus the relative paths, with check constraints that tie them to the task id. Alembic head is `0006_workspaces`. Completing the task leaves the worktree in place. `WorkspaceRepository.retire` deletes that task directory and marks the row `removed`. A second retire returns the same row.
+
+### Evidence
+
+`uv run pytest` — 202 passed in 15.25s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 102 files already formatted.
+
+The source snapshot covers the working tree and `.git`, including the index and refs. It matches after the clone, after a second prepare, and after teardown. `.git/worktrees` is absent on the source. The worktree HEAD equals the source HEAD, its common directory is the private clone, and that clone has no remotes and no `http` URL. Editing `app.py` in the worktree leaves the source file unchanged. A read-only source still clones. A symlink where the task directory should be, a symlink `.git`, and a workspace root inside the source are refused, and the outside directory stays empty. A junk directory at the task path is replaced. A stored path of `../elsewhere/clone` is rejected in Python and a mismatched branch is rejected by PostgreSQL.
+
+The approve test copies `examples/demo_service`, commits it, and resumes after approval. The task completes with `patchpilot/<task-id>` and the copy's HEAD. `tests/test_unknown_tier_added.py` is not created in the source or the worktree. The absolute workspace path is absent from the task JSON and the workspace events. One `workspaces` row records `<task-id>/clone` and `<task-id>/worktree` as `active`. Retire removes the directory, leaves the source snapshot unchanged, and a second retire stays `removed`. Rejection and a declined plan leave the workspace directory empty and insert no row. The demo checkout used by those two tests is unchanged.
+
+The running Compose stack was left as it was. It does not include this migration, git, or the `workspaces` volume until the next image rebuild recreates the worker.
+
+### Changed files
+
+- `alembic/versions/20261104_0006_workspaces.py` — `workspaces`
+- `src/patchpilot/db/models.py` — `Workspace`
+- `src/patchpilot/workspace/` — path layout, clone, and worktree cleanup
+- `src/patchpilot/repositories/workspaces.py`, `repositories/jobs.py` — association and `prepare_workspace` events
+- `src/patchpilot/workflow/graph.py`, `worker.py` — node after approval
+- `src/patchpilot/config.py` — `WORKSPACE_ROOT`
+- `tests/test_workspace.py`, `tests/test_approvals.py`, plus workflow, checkpoint, config, and Compose contract updates
+- `Dockerfile`, `compose.yaml`, `.env.example`, `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` was not executed. The Compose containers were left running and do not include this migration, git, or the workspace volume yet.
+- Host Ollama was not asked to plan. The clone, the approval resume, and the rejection were exercised with `FakeProvider`.
+- The completed task keeps its worktree. Retirement is explicit. This milestone does not apply the plan.
+- The baseline is the source HEAD. Uncommitted files in the registered checkout are not copied.
+- A second prepare reuses the worktree when the branch and commit still match, including edits already in that worktree.
+- If the workspace row cannot be stored, the worker deletes the task directory and marks the task failed.
+- A crash after the clone and before the row commit leaves the directory. The next attempt reuses it when the branch and commit still match.
+- `result_json` does not include the relative path. The row does, and the delete path is computed from the task id again.
+- Git is installed in the runtime image. The host tests used the system `git`.
+- `safe.directory` is set for the source, the clone, and the worktree so a checkout owned by another user can be read. The command list still does not take a path from the model.
+- A checkpoint that already moved past approval and is waiting on the old edge to `finalize` fails closed on resume, because that state has no workspace. A task parked on the interrupt resumes into `prepare_workspace`.
+
+### Next task
+
+Task 12 — Developer agent produces a validated patch.

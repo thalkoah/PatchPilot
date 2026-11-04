@@ -127,7 +127,9 @@ def test_triage_graph_plans_only_after_investigation():
         ("investigate", "finalize"),
         ("plan", "request_plan_approval"),
         ("plan", "finalize"),
+        ("request_plan_approval", "prepare_workspace"),
         ("request_plan_approval", "finalize"),
+        ("prepare_workspace", "finalize"),
         ("finalize", "__end__"),
     }
 

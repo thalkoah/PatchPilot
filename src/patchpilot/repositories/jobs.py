@@ -61,6 +61,9 @@ from patchpilot.llm.plan import ChangePlan
 from patchpilot.repositories.approvals import insert_pending_approval
 from patchpilot.repositories.artifacts import persist_plan
 from patchpilot.repositories.events import append_event
+from patchpilot.repositories.workspaces import insert_workspace
+from patchpilot.workspace.errors import WorkspaceStoreError
+from patchpilot.workspace.layout import IsolatedWorkspace
 
 # Stage names written when the graph finishes. Investigate is present only when
 # the task named a repository and the report was stored.
@@ -68,6 +71,7 @@ _STAGE_TRIAGE = "triage"
 _STAGE_INVESTIGATE = "investigate"
 _STAGE_PLAN = "plan"
 _STAGE_APPROVAL = "request_plan_approval"
+_STAGE_WORKSPACE = "prepare_workspace"
 _STAGE_FINALIZE = "finalize"
 
 
@@ -306,6 +310,7 @@ class JobRepository:
         result_summary: str,
         result_json: dict[str, Any],
         plan: ChangePlan | None = None,
+        workspace: IsolatedWorkspace | None = None,
         artifacts_root: Path | None = None,
     ) -> bool:
         """Store a terminal outcome when this worker still holds the lease.
@@ -332,6 +337,15 @@ class JobRepository:
                 plan,
                 artifacts_root,
             )
+        if workspace is not None:
+            if status != TaskStatus.COMPLETED or claimed.repo_id is None:
+                raise WorkspaceStoreError
+            await insert_workspace(
+                self._session,
+                task_id=claimed.id,
+                repo_id=claimed.repo_id,
+                workspace=workspace,
+            )
         task.status = status
         task.stage = checked_stage
         task.result_summary = result_summary
@@ -357,6 +371,7 @@ class JobRepository:
                 claimed,
                 stored,
                 terminal=status,
+                workspace=workspace if status == TaskStatus.COMPLETED else None,
             )
         await self._session.commit()
         return True
@@ -564,6 +579,7 @@ class JobRepository:
         waiting: bool = False,
         approval_id: UUID | None = None,
         terminal: TaskStatus = TaskStatus.COMPLETED,
+        workspace: IsolatedWorkspace | None = None,
     ) -> None:
         attempt = {"attempt": claimed.attempt}
         ordinal = 0
@@ -671,6 +687,36 @@ class JobRepository:
                 run_id=claimed.run_id,
             )
             return
+        if workspace is not None and not await self._stage_completed(task_id, _STAGE_WORKSPACE):
+            workspace_payload = {
+                "attempt": claimed.attempt,
+                "base_sha": workspace.base_sha,
+                "branch": workspace.branch,
+            }
+            await emit(
+                stage=_STAGE_WORKSPACE,
+                event_type=STAGE_STARTED,
+                payload=attempt,
+                key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_STARTED,
+                    stage=_STAGE_WORKSPACE,
+                ),
+                run_id=claimed.run_id,
+            )
+            await emit(
+                stage=_STAGE_WORKSPACE,
+                event_type=STAGE_COMPLETED,
+                payload=workspace_payload,
+                key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_COMPLETED,
+                    stage=_STAGE_WORKSPACE,
+                ),
+                run_id=claimed.run_id,
+            )
         await emit(
             stage=_STAGE_FINALIZE,
             event_type=STAGE_STARTED,

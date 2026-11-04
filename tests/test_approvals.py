@@ -1,6 +1,9 @@
 """Human approval pauses a code-changing plan and resumes the same thread."""
 
+import json
+import subprocess
 from pathlib import Path
+from uuid import UUID
 
 import psycopg
 import pytest
@@ -34,6 +37,13 @@ def artifacts_root(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def workspace_root(tmp_path: Path) -> Path:
+    root = tmp_path / "workspaces"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
 def client(
     postgres_database_url: str,
     clean_tasks: None,
@@ -51,11 +61,24 @@ async def test_approve_survives_restart_and_a_repeated_decision(
     client: TestClient,
     postgres_database_url: str,
     artifacts_root: Path,
+    workspace_root: Path,
+    tmp_path: Path,
 ):
-    before = _snapshot(DEMO_CHECKOUT)
+    from tests.test_workspace import copy_demo_repository, git_snapshot
+
+    repo_root = copy_demo_repository(tmp_path / "repos")
+    checkout = repo_root / "demo_service"
+    before = git_snapshot(checkout)
     provider = FakeProvider()
-    task_id, calls = await _pause_demo(client, postgres_database_url, artifacts_root, provider)
-    assert _snapshot(DEMO_CHECKOUT) == before
+    task_id, calls = await _pause_demo(
+        client,
+        postgres_database_url,
+        artifacts_root,
+        provider,
+        repository_root=repo_root,
+        workspace_root=workspace_root,
+    )
+    assert git_snapshot(checkout) == before
     assert _checkpoint_count(postgres_database_url, task_id) >= 1
 
     waiting = client.get(f"/api/v1/tasks/{task_id}")
@@ -81,8 +104,9 @@ async def test_approve_survives_restart_and_a_repeated_decision(
                     factory,
                     provider,
                     graph,
-                    repository_root=DEMO_ROOT.resolve(),
+                    repository_root=repo_root,
                     artifacts_root=artifacts_root,
+                    workspace_root=workspace_root,
                 )
                 is False
             )
@@ -106,8 +130,9 @@ async def test_approve_survives_restart_and_a_repeated_decision(
                     factory,
                     provider,
                     graph,
-                    repository_root=DEMO_ROOT.resolve(),
+                    repository_root=repo_root,
                     artifacts_root=artifacts_root,
+                    workspace_root=workspace_root,
                 )
                 is True
             )
@@ -116,8 +141,9 @@ async def test_approve_survives_restart_and_a_repeated_decision(
                     factory,
                     provider,
                     graph,
-                    repository_root=DEMO_ROOT.resolve(),
+                    repository_root=repo_root,
                     artifacts_root=artifacts_root,
+                    workspace_root=workspace_root,
                 )
                 is False
             )
@@ -134,7 +160,17 @@ async def test_approve_survives_restart_and_a_repeated_decision(
     assert body["stage"] == "finalize"
     assert body["result_json"]["approval"]["decision"] == "approve"
     assert body["result_json"]["approval"]["reason"] == APPROVE_REASON
-    assert _snapshot(DEMO_CHECKOUT) == before
+    assert body["result_json"]["workspace"]["branch"] == f"patchpilot/{task_id}"
+    assert body["result_json"]["workspace"]["base_sha"] == _rev_parse(checkout)
+    assert "clone_path" not in body["result_json"]["workspace"]
+    assert str(workspace_root) not in done.text
+    assert str(checkout) not in done.text
+    assert git_snapshot(checkout) == before
+    assert not (checkout / ".git" / "worktrees").exists()
+    worktree = workspace_root / task_id / "worktree"
+    assert (worktree / "src/demo_service/discounts.py").is_file()
+    assert not (worktree / "tests/test_unknown_tier_added.py").exists()
+    assert not (checkout / "tests/test_unknown_tier_added.py").exists()
     events = client.get(f"/api/v1/tasks/{task_id}/events").json()["items"]
     kinds = [item["event_type"] for item in events]
     assert kinds.count("approval_requested") == 1
@@ -144,17 +180,35 @@ async def test_approve_survives_restart_and_a_repeated_decision(
     decided = next(item for item in events if item["event_type"] == "approval_decided")
     assert decided["payload"]["decision"] == "approve"
     assert decided["payload"]["reason"] == APPROVE_REASON
+    prepared = [item for item in events if item["stage"] == "prepare_workspace"]
+    assert [item["event_type"] for item in prepared] == ["stage_started", "stage_completed"]
+    assert prepared[1]["payload"]["base_sha"] == body["result_json"]["workspace"]["base_sha"]
+    assert prepared[1]["payload"]["branch"] == f"patchpilot/{task_id}"
+    assert str(workspace_root) not in json.dumps(prepared)
     assert _approval_count(postgres_database_url, task_id) == 1
+    stored = _workspace_row(postgres_database_url, task_id)
+    assert stored == (f"{task_id}/clone", f"{task_id}/worktree", "active")
+    await _retire(postgres_database_url, task_id, workspace_root)
+    assert git_snapshot(checkout) == before
+    assert not (workspace_root / task_id).exists()
+    assert _workspace_row(postgres_database_url, task_id)[2] == "removed"
 
 
 async def test_reject_is_terminal_and_a_second_decision_does_not_resume(
     client: TestClient,
     postgres_database_url: str,
     artifacts_root: Path,
+    workspace_root: Path,
 ):
     before = _snapshot(DEMO_CHECKOUT)
     provider = FakeProvider()
-    task_id, calls = await _pause_demo(client, postgres_database_url, artifacts_root, provider)
+    task_id, calls = await _pause_demo(
+        client,
+        postgres_database_url,
+        artifacts_root,
+        provider,
+        workspace_root=workspace_root,
+    )
     approval_id = client.get(f"/api/v1/tasks/{task_id}/approvals").json()["items"][0]["id"]
 
     engine, factory = open_session_factory(postgres_database_url)
@@ -177,6 +231,7 @@ async def test_reject_is_terminal_and_a_second_decision_does_not_resume(
                     graph,
                     repository_root=DEMO_ROOT.resolve(),
                     artifacts_root=artifacts_root,
+                    workspace_root=workspace_root,
                 )
                 is True
             )
@@ -187,6 +242,7 @@ async def test_reject_is_terminal_and_a_second_decision_does_not_resume(
                     graph,
                     repository_root=DEMO_ROOT.resolve(),
                     artifacts_root=artifacts_root,
+                    workspace_root=workspace_root,
                 )
                 is False
             )
@@ -196,6 +252,9 @@ async def test_reject_is_terminal_and_a_second_decision_does_not_resume(
     assert len(provider.calls) == calls
     body = client.get(f"/api/v1/tasks/{task_id}").json()
     assert body["status"] == "rejected"
+    assert "workspace" not in body["result_json"]
+    assert list(workspace_root.iterdir()) == []
+    assert _workspace_row(postgres_database_url, task_id) is None
     assert body["result_summary"] == REJECT_REASON
     assert body["result_json"]["approval"]["decision"] == "reject"
     assert "error" not in body["result_json"]
@@ -213,6 +272,7 @@ async def test_a_declined_plan_does_not_ask_for_approval(
     client: TestClient,
     postgres_database_url: str,
     artifacts_root: Path,
+    workspace_root: Path,
 ):
     before = _snapshot(DEMO_CHECKOUT)
     engine, factory = open_session_factory(postgres_database_url)
@@ -241,6 +301,7 @@ async def test_a_declined_plan_does_not_ask_for_approval(
                     graph,
                     repository_root=DEMO_ROOT.resolve(),
                     artifacts_root=artifacts_root,
+                    workspace_root=workspace_root,
                 )
                 is True
             )
@@ -250,6 +311,8 @@ async def test_a_declined_plan_does_not_ask_for_approval(
     body = client.get(f"/api/v1/tasks/{task_id}").json()
     assert body["status"] == "completed"
     assert body["result_json"]["plan"]["can_proceed"] is False
+    assert "workspace" not in body["result_json"]
+    assert list(workspace_root.iterdir()) == []
     assert "approval" not in body["result_json"]
     listed = client.get(f"/api/v1/tasks/{task_id}/approvals")
     assert listed.status_code == 200
@@ -288,7 +351,11 @@ async def _pause_demo(
     database_url: str,
     artifacts_root: Path,
     provider: FakeProvider,
+    *,
+    repository_root: Path | None = None,
+    workspace_root: Path | None = None,
 ) -> tuple[str, int]:
+    checkout_root = DEMO_ROOT.resolve() if repository_root is None else repository_root
     engine, factory = open_session_factory(database_url)
     try:
         async with factory() as session:
@@ -313,8 +380,9 @@ async def _pause_demo(
                     factory,
                     provider,
                     graph,
-                    repository_root=DEMO_ROOT.resolve(),
+                    repository_root=checkout_root,
                     artifacts_root=artifacts_root,
+                    workspace_root=workspace_root,
                 )
                 is True
             )
@@ -358,6 +426,49 @@ def _approval_count(database_url: str, task_id: str) -> int:
         ).fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _rev_parse(checkout: Path) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _workspace_row(database_url: str, task_id: str) -> tuple[str, str, str] | None:
+    with psycopg.connect(database_url, autocommit=True) as connection:
+        row = connection.execute(
+            """
+            SELECT clone_path, worktree_path, status::text
+            FROM workspaces
+            WHERE task_id = %s
+            """,
+            (task_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return (str(row[0]), str(row[1]), str(row[2]))
+
+
+async def _retire(database_url: str, task_id: str, workspace_root: Path) -> None:
+    from patchpilot.db.models import WorkspaceStatus
+    from patchpilot.repositories.workspaces import WorkspaceRepository
+
+    engine, factory = open_session_factory(database_url)
+    try:
+        async with factory() as session:
+            row = await WorkspaceRepository(session).retire(UUID(task_id), workspace_root)
+            assert row is not None
+            assert row.status == WorkspaceStatus.REMOVED
+        async with factory() as session:
+            again = await WorkspaceRepository(session).retire(UUID(task_id), workspace_root)
+            assert again is not None
+            assert again.status == WorkspaceStatus.REMOVED
+    finally:
+        await engine.dispose()
 
 
 def _snapshot(root: Path) -> dict[str, bytes]:

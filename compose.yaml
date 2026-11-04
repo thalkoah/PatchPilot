@@ -61,9 +61,12 @@ services:
       # Checkouts registered under this directory. The host path is
       # REPOSITORY_ROOT_HOST. The worker sees only /repositories, read-only.
       REPOSITORY_ROOT: /repositories
+      # Private clones. Git writes only here, never into /repositories.
+      WORKSPACE_ROOT: /workspaces
     volumes:
       - ${REPOSITORY_ROOT_HOST:-./examples}:/repositories:ro
       - artifacts:/artifacts
+      - workspaces:/workspaces
     depends_on:
       db:
         condition: service_healthy
@@ -71,3 +74,4 @@ services:
 volumes:
   pgdata:
   artifacts:
+  workspaces:

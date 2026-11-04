@@ -37,6 +37,9 @@ ARTIFACT_TYPE_MAX_LENGTH = 32
 ARTIFACT_PATH_MAX_LENGTH = 200
 ARTIFACT_CHECKSUM_LENGTH = 64
 APPROVAL_REASON_MAX_LENGTH = 300
+WORKSPACE_SHA_LENGTH = 40
+WORKSPACE_BRANCH_MAX_LENGTH = 64
+WORKSPACE_PATH_MAX_LENGTH = 80
 
 
 class TaskStatus(enum.StrEnum):
@@ -371,3 +374,73 @@ class Approval(Base):
 
     def __repr__(self) -> str:
         return f"Approval(id={self.id!s}, status={self.status})"
+
+
+class WorkspaceStatus(enum.StrEnum):
+    """Whether the private worktree is still on the workspace volume."""
+
+    ACTIVE = "active"
+    REMOVED = "removed"
+
+
+workspace_status_type = ENUM(
+    WorkspaceStatus,
+    name="workspace_status",
+    values_callable=_enum_values,
+    create_type=False,
+)
+
+
+class Workspace(Base):
+    """One task's private clone. Paths are relative and fixed by the task id."""
+
+    __tablename__ = "workspaces"
+    __table_args__ = (
+        UniqueConstraint("task_id", name="uq_workspaces_task_id"),
+        CheckConstraint("base_sha ~ '^[0-9a-f]{40}$'", name="ck_workspaces_base_sha"),
+        CheckConstraint(
+            "branch = 'patchpilot/' || task_id::text",
+            name="ck_workspaces_branch",
+        ),
+        CheckConstraint(
+            "clone_path = task_id::text || '/clone'",
+            name="ck_workspaces_clone_path",
+        ),
+        CheckConstraint(
+            "worktree_path = task_id::text || '/worktree'",
+            name="ck_workspaces_worktree_path",
+        ),
+        CheckConstraint(
+            "(status = 'active'::workspace_status AND removed_at IS NULL) "
+            "OR (status = 'removed'::workspace_status AND removed_at IS NOT NULL)",
+            name="ck_workspaces_status",
+        ),
+        Index("ix_workspaces_repo_id", "repo_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("tasks.id", name="fk_workspaces_task_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    repo_id: Mapped[UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("repositories.id", name="fk_workspaces_repo_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    base_sha: Mapped[str] = mapped_column(String(WORKSPACE_SHA_LENGTH), nullable=False)
+    branch: Mapped[str] = mapped_column(String(WORKSPACE_BRANCH_MAX_LENGTH), nullable=False)
+    clone_path: Mapped[str] = mapped_column(String(WORKSPACE_PATH_MAX_LENGTH), nullable=False)
+    worktree_path: Mapped[str] = mapped_column(String(WORKSPACE_PATH_MAX_LENGTH), nullable=False)
+    status: Mapped[WorkspaceStatus] = mapped_column(workspace_status_type, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=func.now(),
+    )
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def __repr__(self) -> str:
+        return f"Workspace(task_id={self.task_id!s}, status={self.status})"

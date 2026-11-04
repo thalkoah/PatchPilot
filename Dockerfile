@@ -13,6 +13,10 @@ RUN uv sync --frozen --no-dev --no-editable
 
 FROM docker.io/library/python:3.12-slim-bookworm
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin app
 WORKDIR /app
 COPY --from=build --chown=app:app /app/.venv /app/.venv

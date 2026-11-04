@@ -6,7 +6,9 @@ commits. The planner does not write that checkout. A plan that names a code
 change pauses on a LangGraph interrupt: the worker stores a pending approval,
 sets `waiting_approval`, and releases the lease. A decision queues the same
 task again. The next claim resumes that thread with `Command(resume=...)`.
-A declined plan is stored as a versioned artifact and completes without asking.
+Approval clones the checkout into `WORKSPACE_ROOT` and records that association.
+Rejection and a declined plan do not. A declined plan is stored as a versioned
+artifact and completes without asking.
 
 The process owns the LangGraph checkpointer connection: it opens one after
 checkpoint setup and closes it when the loop stops. A claim stores a lease on
@@ -49,6 +51,8 @@ from patchpilot.workflow.graph import (
     REPOSITORY_UNAVAILABLE,
     STAGE_PLAN,
     STAGE_TRIAGE,
+    STAGE_WORKSPACE,
+    WORKSPACE_FAILURE,
     CompiledStateGraph,
     LeaseLost,
     TriageOutcome,
@@ -56,6 +60,8 @@ from patchpilot.workflow.graph import (
     failure_outcome,
     run_claimed_triage,
 )
+from patchpilot.workspace.errors import WorkspaceError, WorkspaceStoreError
+from patchpilot.workspace.git import remove_isolated_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +80,7 @@ async def process_one(
     database_url: str | None = None,
     repository_root: Path | None = None,
     artifacts_root: Path | None = None,
+    workspace_root: Path | None = None,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
 ) -> bool:
     """Claim and finish one task. Return False when there is nothing to do.
@@ -110,6 +117,7 @@ async def process_one(
         database_url=database_url,
         repository_root=repository_root,
         artifacts_root=artifacts_root,
+        workspace_root=workspace_root,
         max_tool_calls=max_tool_calls,
     )
     return True
@@ -126,6 +134,7 @@ async def process_task(
     database_url: str | None = None,
     repository_root: Path | None = None,
     artifacts_root: Path | None = None,
+    workspace_root: Path | None = None,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
 ) -> bool:
     """Triage one task when it is still queued. Return False if another worker owns it."""
@@ -149,6 +158,7 @@ async def process_task(
         database_url=database_url,
         repository_root=repository_root,
         artifacts_root=artifacts_root,
+        workspace_root=workspace_root,
         max_tool_calls=max_tool_calls,
     )
     return True
@@ -169,6 +179,7 @@ async def serve(
     database_url = None if session_factory is not None else settings.database_url
     repository_root = Path(settings.repository_root) if settings.repository_root else None
     artifacts_root = Path(settings.artifacts_root) if settings.artifacts_root else None
+    workspace_root = Path(settings.workspace_root) if settings.workspace_root else None
     if factory is None:
         engine = create_engine(settings)
         factory = create_session_factory(engine)
@@ -186,6 +197,7 @@ async def serve(
                     database_url=database_url,
                     repository_root=repository_root,
                     artifacts_root=artifacts_root,
+                    workspace_root=workspace_root,
                 )
         else:
             await _poll(
@@ -197,6 +209,7 @@ async def serve(
                 database_url=None,
                 repository_root=repository_root,
                 artifacts_root=artifacts_root,
+                workspace_root=workspace_root,
             )
     finally:
         if owns_provider:
@@ -238,6 +251,7 @@ async def _poll(
     database_url: str | None,
     repository_root: Path | None,
     artifacts_root: Path | None,
+    workspace_root: Path | None,
 ) -> None:
     worker_id = new_worker_id()
     logger.info(
@@ -259,6 +273,7 @@ async def _poll(
                 database_url=database_url,
                 repository_root=repository_root,
                 artifacts_root=artifacts_root,
+                workspace_root=workspace_root,
                 max_tool_calls=settings.investigator_max_tool_calls,
             )
         except Exception as exc:
@@ -279,6 +294,7 @@ async def _finish(
     database_url: str | None,
     repository_root: Path | None,
     artifacts_root: Path | None,
+    workspace_root: Path | None,
     max_tool_calls: int,
 ) -> None:
     logger.info("claimed task=%s", claimed.id)
@@ -304,6 +320,7 @@ async def _finish(
                 lease_lost=None if keeper is None else keeper.lost,
                 repo_id=claimed.repo_id,
                 repository_tools=tools,
+                workspace_root=workspace_root,
                 max_tool_calls=max_tool_calls,
                 repository_error=repository_error,
                 resume_decision=resume_decision,
@@ -330,6 +347,7 @@ async def _finish(
         )
         return
     plan = outcome.plan if outcome.status in {TaskStatus.COMPLETED, TaskStatus.REJECTED} else None
+    workspace = outcome.workspace if outcome.status == TaskStatus.COMPLETED else None
     try:
         async with session_factory() as session:
             saved = await JobRepository(session).finish_run(
@@ -339,11 +357,25 @@ async def _finish(
                 result_summary=outcome.result_summary,
                 result_json=outcome.result_json,
                 plan=plan,
+                workspace=workspace,
                 artifacts_root=artifacts_root,
             )
     except ArtifactStoreError:
         logger.error("plan artifact failed task=%s", claimed.id)
+        _discard_workspace(workspace_root, claimed.id)
         outcome = failure_outcome(ARTIFACT_FAILURE, stage=STAGE_PLAN)
+        async with session_factory() as session:
+            saved = await JobRepository(session).finish_run(
+                claimed,
+                status=outcome.status,
+                stage=outcome.stage,
+                result_summary=outcome.result_summary,
+                result_json=outcome.result_json,
+            )
+    except WorkspaceStoreError:
+        logger.error("workspace row failed task=%s", claimed.id)
+        _discard_workspace(workspace_root, claimed.id)
+        outcome = failure_outcome(WORKSPACE_FAILURE, stage=STAGE_WORKSPACE)
         async with session_factory() as session:
             saved = await JobRepository(session).finish_run(
                 claimed,
@@ -417,6 +449,16 @@ async def _load_resume_decision(
 ) -> dict[str, object] | None:
     async with session_factory() as session:
         return await ApprovalRepository(session).resume_value(task_id)
+
+
+def _discard_workspace(workspace_root: Path | None, task_id: UUID) -> None:
+    """Remove a clone when the task will not keep the association."""
+    if workspace_root is None:
+        return
+    try:
+        remove_isolated_workspace(workspace_root, task_id)
+    except WorkspaceError:
+        logger.error("workspace cleanup failed task=%s", task_id)
 
 
 async def _open_tools(

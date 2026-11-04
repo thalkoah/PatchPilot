@@ -70,6 +70,7 @@ class Settings(LLMSettings):
     )
     repository_root: str | None = None
     artifacts_root: str | None = None
+    workspace_root: str | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     @field_validator("database_url")
@@ -80,7 +81,7 @@ class Settings(LLMSettings):
             raise ValueError("database_url must use a postgresql:// or postgres:// URL")
         return value
 
-    @field_validator("repository_root", "artifacts_root", mode="before")
+    @field_validator("repository_root", "artifacts_root", "workspace_root", mode="before")
     @classmethod
     def optional_path_is_absolute(cls, value: object) -> object:
         if value is None:

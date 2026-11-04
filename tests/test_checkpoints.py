@@ -167,7 +167,7 @@ def test_checkpoint_command_is_idempotent(
         version = connection.execute("SELECT version_num FROM alembic_version").fetchone()
         migrations = connection.execute("SELECT v FROM checkpoint_migrations ORDER BY v").fetchall()
     assert version is not None
-    assert version[0] == "0005_approvals"
+    assert version[0] == "0006_workspaces"
     assert migrations
     assert all(isinstance(row[0], int) for row in migrations)
 
@@ -372,10 +372,10 @@ def _assert_checkpoint_is_not_the_task_row(
         ).fetchone()
     names = {row[0] for row in tables}
     assert set(CHECKPOINT_TABLES) <= names
-    assert {"tasks", "task_runs", "events", "approvals"} <= names
+    assert {"tasks", "task_runs", "events", "approvals", "workspaces"} <= names
     assert {row[0] for row in columns} == TASK_COLUMNS
     assert version is not None
-    assert version[0] == "0005_approvals"
+    assert version[0] == "0006_workspaces"
     assert checkpoint is not None
     assert checkpoint[0] == str(task_id)
     assert checkpoint[1] != result_json

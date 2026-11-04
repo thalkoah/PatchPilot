@@ -103,6 +103,24 @@ def test_plan_artifacts_are_shared_by_the_api_and_the_worker():
     assert "ARTIFACTS_ROOT" in example
 
 
+def test_worker_keeps_a_private_workspace_volume():
+    text = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    api, worker = text.split("\n  worker:\n", 1)
+
+    assert "WORKSPACE_ROOT: /workspaces" in worker
+    assert "WORKSPACE_ROOT" not in api
+    assert "workspaces:/workspaces" in worker
+    assert "workspaces:/workspaces" not in api
+    assert "workspaces:" in text
+    assert "apt-get install -y --no-install-recommends git" in dockerfile
+    assert "WORKSPACE_ROOT" in readme
+    assert "WORKSPACE_ROOT" in example
+    assert "/repositories:ro" in worker
+
+
 def test_env_example_is_present_and_env_is_ignored():
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
