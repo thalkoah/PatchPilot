@@ -7,8 +7,9 @@ change pauses on a LangGraph interrupt: the worker stores a pending approval,
 sets `waiting_approval`, and releases the lease. A decision queues the same
 task again. The next claim resumes that thread with `Command(resume=...)`.
 Approval clones the checkout into `WORKSPACE_ROOT` and records that association.
-Rejection and a declined plan do not. A declined plan is stored as a versioned
-artifact and completes without asking.
+The developer then applies a patch in that private worktree. Rejection and a
+declined plan do not. A declined plan is stored as a versioned artifact and
+completes without asking.
 
 The process owns the LangGraph checkpointer connection: it opens one after
 checkpoint setup and closes it when the loop stops. A claim stores a lease on
@@ -47,8 +48,10 @@ from patchpilot.source.tools import RepositoryTools, open_repository_tools
 from patchpilot.workflow.graph import (
     ARTIFACT_FAILURE,
     GENERIC_FAILURE,
+    PATCH_FAILURE,
     PLAN_FAILURE,
     REPOSITORY_UNAVAILABLE,
+    STAGE_DEVELOP,
     STAGE_PLAN,
     STAGE_TRIAGE,
     STAGE_WORKSPACE,
@@ -348,6 +351,7 @@ async def _finish(
         return
     plan = outcome.plan if outcome.status in {TaskStatus.COMPLETED, TaskStatus.REJECTED} else None
     workspace = outcome.workspace if outcome.status == TaskStatus.COMPLETED else None
+    patch = outcome.patch if outcome.status == TaskStatus.COMPLETED else None
     try:
         async with session_factory() as session:
             saved = await JobRepository(session).finish_run(
@@ -358,12 +362,16 @@ async def _finish(
                 result_json=outcome.result_json,
                 plan=plan,
                 workspace=workspace,
+                patch=patch,
                 artifacts_root=artifacts_root,
             )
     except ArtifactStoreError:
-        logger.error("plan artifact failed task=%s", claimed.id)
+        logger.error("artifact store failed task=%s", claimed.id)
         _discard_workspace(workspace_root, claimed.id)
-        outcome = failure_outcome(ARTIFACT_FAILURE, stage=STAGE_PLAN)
+        if patch is not None:
+            outcome = failure_outcome(PATCH_FAILURE, stage=STAGE_DEVELOP)
+        else:
+            outcome = failure_outcome(ARTIFACT_FAILURE, stage=STAGE_PLAN)
         async with session_factory() as session:
             saved = await JobRepository(session).finish_run(
                 claimed,
@@ -387,6 +395,8 @@ async def _finish(
     if not saved:
         logger.warning("discarded result task=%s run=%s", claimed.id, claimed.run_id)
         return
+    if outcome.status == TaskStatus.FAILED:
+        _discard_workspace(workspace_root, claimed.id)
     logger.info(
         "finished task=%s status=%s stage=%s",
         claimed.id,

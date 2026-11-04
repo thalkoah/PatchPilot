@@ -32,6 +32,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from patchpilot.agents.developer import DevelopOutcome
 from patchpilot.artifacts import ArtifactStoreError
 from patchpilot.audit import (
     APPROVAL_REQUESTED,
@@ -59,7 +60,7 @@ from patchpilot.audit import (
 from patchpilot.db.models import Task, TaskEvent, TaskRun, TaskStatus
 from patchpilot.llm.plan import ChangePlan
 from patchpilot.repositories.approvals import insert_pending_approval
-from patchpilot.repositories.artifacts import persist_plan
+from patchpilot.repositories.artifacts import persist_patch, persist_plan
 from patchpilot.repositories.events import append_event
 from patchpilot.repositories.workspaces import insert_workspace
 from patchpilot.workspace.errors import WorkspaceStoreError
@@ -72,6 +73,7 @@ _STAGE_INVESTIGATE = "investigate"
 _STAGE_PLAN = "plan"
 _STAGE_APPROVAL = "request_plan_approval"
 _STAGE_WORKSPACE = "prepare_workspace"
+_STAGE_DEVELOP = "develop"
 _STAGE_FINALIZE = "finalize"
 
 
@@ -311,6 +313,7 @@ class JobRepository:
         result_json: dict[str, Any],
         plan: ChangePlan | None = None,
         workspace: IsolatedWorkspace | None = None,
+        patch: DevelopOutcome | None = None,
         artifacts_root: Path | None = None,
     ) -> bool:
         """Store a terminal outcome when this worker still holds the lease.
@@ -335,6 +338,15 @@ class JobRepository:
                 claimed.id,
                 stored,
                 plan,
+                artifacts_root,
+            )
+        if patch is not None:
+            if status != TaskStatus.COMPLETED or workspace is None:
+                raise ArtifactStoreError
+            stored = await self._with_patch_version(
+                claimed.id,
+                stored,
+                patch,
                 artifacts_root,
             )
         if workspace is not None:
@@ -542,6 +554,28 @@ class JobRepository:
         stored["plan"] = plan_meta
         return stored
 
+    async def _with_patch_version(
+        self,
+        task_id: UUID,
+        stored: dict[str, Any],
+        patch: DevelopOutcome,
+        artifacts_root: Path | None,
+    ) -> dict[str, Any]:
+        if artifacts_root is None:
+            raise ArtifactStoreError
+        version = await persist_patch(
+            self._session,
+            artifacts_root,
+            task_id,
+            patch.proposal,
+            patch.applied.diff,
+        )
+        meta = stored.get("patch")
+        patch_meta = dict(meta) if isinstance(meta, dict) else {}
+        patch_meta["version"] = version
+        stored["patch"] = patch_meta
+        return stored
+
     async def _record_model_error(
         self,
         task_id: UUID,
@@ -717,6 +751,32 @@ class JobRepository:
                 ),
                 run_id=claimed.run_id,
             )
+        patch = _patch_payload(result_json, claimed.attempt)
+        if patch is not None and not await self._stage_completed(task_id, _STAGE_DEVELOP):
+            await emit(
+                stage=_STAGE_DEVELOP,
+                event_type=STAGE_STARTED,
+                payload=attempt,
+                key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_STARTED,
+                    stage=_STAGE_DEVELOP,
+                ),
+                run_id=claimed.run_id,
+            )
+            await emit(
+                stage=_STAGE_DEVELOP,
+                event_type=STAGE_COMPLETED,
+                payload=patch,
+                key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_COMPLETED,
+                    stage=_STAGE_DEVELOP,
+                ),
+                run_id=claimed.run_id,
+            )
         await emit(
             stage=_STAGE_FINALIZE,
             event_type=STAGE_STARTED,
@@ -812,6 +872,24 @@ def _plan_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any] |
         "version": plan.get("version"),
         "rejected_paths": plan.get("rejected_paths"),
         "paths": paths,
+    }
+
+
+def _patch_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any] | None:
+    """Checksums and paths only. The diff and the proposal body stay in artifact files."""
+    patch = result_json.get("patch")
+    if not isinstance(patch, dict):
+        return None
+    raw_paths = patch.get("paths")
+    paths = (
+        [item for item in raw_paths if isinstance(item, str)] if isinstance(raw_paths, list) else []
+    )
+    return {
+        "attempt": attempt,
+        "paths": paths,
+        "checksum": patch.get("checksum"),
+        "proposal_checksum": patch.get("proposal_checksum"),
+        "version": patch.get("version"),
     }
 
 

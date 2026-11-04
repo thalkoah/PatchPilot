@@ -4,13 +4,14 @@ A task with no repository follows `START -> triage -> finalize -> END`. A task
 with a repo_id follows `START -> triage -> investigate -> plan`, then either
 `finalize` or `request_plan_approval`. Approval runs only when the plan names a
 code change. It calls `interrupt()` and does no I/O before that call, because
-resume runs the node from the top. An approval continues to `prepare_workspace`
-and then `finalize`. A rejection goes straight to `finalize`.
+resume runs the node from the top. An approval continues to `prepare_workspace`,
+then `develop`, then `finalize`. A rejection goes straight to `finalize`.
 
 The investigate node reads the registered checkout. The plan node proposes
 paths and does not write them. `prepare_workspace` clones that checkout into
-the workspace volume. It does not read a path from the plan. Nothing in this
-graph writes the registered checkout.
+the workspace volume. It does not read a path from the plan. `develop` applies
+a patch only inside that private worktree. Nothing in this graph writes the
+registered checkout.
 
 The worker compiles this graph with an AsyncPostgresSaver. The task UUID is the
 LangGraph thread id. Checkpoint rows are not the business task record: the
@@ -34,20 +35,30 @@ from langgraph.runtime import Runtime
 from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
+from patchpilot.agents.developer import DeveloperAgent, DevelopOutcome
 from patchpilot.agents.errors import StopForLease
 from patchpilot.agents.investigator import InvestigatorAgent
 from patchpilot.agents.limits import DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS
 from patchpilot.agents.planner import PlannerAgent
+from patchpilot.artifacts import checksum, proposal_document
 from patchpilot.db.models import APPROVAL_REASON_MAX_LENGTH, TaskStatus
 from patchpilot.llm.errors import LLMError
 from patchpilot.llm.investigation import InvestigationReport
+from patchpilot.llm.patch import PatchProposal
 from patchpilot.llm.plan import ChangePlan
 from patchpilot.llm.provider import LLMProvider
 from patchpilot.llm.triage import TriageResult
+from patchpilot.patching.apply import MAX_DIFF_BYTES, AppliedPatch
+from patchpilot.patching.errors import PatchError
 from patchpilot.source.tools import RepositoryTools
 from patchpilot.workspace.errors import WorkspaceError
 from patchpilot.workspace.git import prepare_isolated_workspace
-from patchpilot.workspace.layout import IsolatedWorkspace, workspace_from_state
+from patchpilot.workspace.layout import (
+    IsolatedWorkspace,
+    require_workspace_root,
+    workspace_from_state,
+    worktree_relative,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +67,27 @@ STAGE_INVESTIGATE = "investigate"
 STAGE_PLAN = "plan"
 STAGE_APPROVAL = "request_plan_approval"
 STAGE_WORKSPACE = "prepare_workspace"
+STAGE_DEVELOP = "develop"
 STAGE_FINALIZE = "finalize"
 GENERIC_FAILURE = "Triage failed before a valid result was produced."
 INVESTIGATION_FAILURE = "Investigation failed before a valid report was produced."
 PLAN_FAILURE = "Planning failed before a valid change plan was produced."
 APPROVAL_FAILURE = "Approval resume did not continue the workflow."
 WORKSPACE_FAILURE = "The isolated workspace could not be created."
+PATCH_FAILURE = "The patch was rejected before it was applied."
 ARTIFACT_FAILURE = "The plan artifact could not be stored."
 REPOSITORY_UNAVAILABLE = "The registered repository could not be opened."
 REJECTED_SUMMARY = "The plan was rejected."
 MAX_FAILURE_CHARS = 500
 _FAILURE_STAGES = frozenset(
-    {STAGE_TRIAGE, STAGE_INVESTIGATE, STAGE_PLAN, STAGE_APPROVAL, STAGE_WORKSPACE}
+    {
+        STAGE_TRIAGE,
+        STAGE_INVESTIGATE,
+        STAGE_PLAN,
+        STAGE_APPROVAL,
+        STAGE_WORKSPACE,
+        STAGE_DEVELOP,
+    }
 )
 _INTERRUPT = "__interrupt__"
 # Persist the checkpoint before the next node. "async" can still be in flight
@@ -89,6 +109,7 @@ class TriageState(TypedDict):
     plan: dict[str, Any] | None
     approval: dict[str, Any] | None
     workspace: dict[str, Any] | None
+    patch: dict[str, Any] | None
     result_summary: str | None
     error: str | None
     failed_stage: str | None
@@ -121,6 +142,7 @@ class TriageOutcome:
     result_json: dict[str, Any]
     plan: ChangePlan | None = None
     workspace: IsolatedWorkspace | None = None
+    patch: DevelopOutcome | None = None
 
 
 def triage_prompt(*, title: str, description: str) -> str:
@@ -150,6 +172,7 @@ def initial_triage_state(
         "plan": None,
         "approval": None,
         "workspace": None,
+        "patch": None,
         "result_summary": None,
         "error": None,
         "failed_stage": None,
@@ -177,6 +200,7 @@ def compile_triage_graph(
     builder.add_node("plan", plan_node)
     builder.add_node("request_plan_approval", request_plan_approval)
     builder.add_node("prepare_workspace", prepare_workspace_node)
+    builder.add_node("develop", develop_node)
     builder.add_node("finalize", finalize_node)
     builder.add_edge(START, "triage")
     builder.add_conditional_edges(
@@ -199,7 +223,12 @@ def compile_triage_graph(
         route_after_approval,
         {"prepare_workspace": "prepare_workspace", "finalize": "finalize"},
     )
-    builder.add_edge("prepare_workspace", "finalize")
+    builder.add_conditional_edges(
+        "prepare_workspace",
+        route_after_workspace,
+        {"develop": "develop", "finalize": "finalize"},
+    )
+    builder.add_edge("develop", "finalize")
     builder.add_edge("finalize", END)
     options: dict[str, Any] = {}
     if interrupt_after:
@@ -428,6 +457,13 @@ def route_after_approval(state: TriageState) -> str:
     return "finalize"
 
 
+def route_after_workspace(state: TriageState) -> str:
+    """Develop only when the private worktree was created."""
+    if state.get("status") == "failed" or state.get("error") or not state.get("workspace"):
+        return "finalize"
+    return "develop"
+
+
 def request_plan_approval(state: TriageState) -> dict[str, Any]:
     """Pause until a person decides. Resume runs this function from the top.
 
@@ -483,6 +519,75 @@ def prepare_workspace_node(state: TriageState, runtime: Runtime[WorkflowContext]
         raise LeaseLost()
     return {
         "workspace": created.as_state(),
+        "error": None,
+        "failed_stage": None,
+        "status": "completed",
+    }
+
+
+def develop_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:
+    """Propose a patch and apply it in the private worktree. The source stays read-only."""
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    context = runtime.context
+    if context.repository_error or context.workspace_root is None:
+        logger.error("patch rejected: unavailable")
+        return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
+    try:
+        plan_state = _checked_plan(state.get("plan"))
+        investigation = _checked_investigation(state.get("investigation"))
+        approval = _checked_approval(state.get("approval"))
+        task_id = UUID(str(state.get("task_id")))
+        workspace = workspace_from_state(state.get("workspace"), task_id=task_id)
+        plan = None if plan_state is None else ChangePlan.model_validate(plan_state["plan"])
+        report = None
+        if investigation is not None:
+            report = InvestigationReport.model_validate(investigation["report"])
+    except (TypeError, ValidationError, ValueError):
+        logger.error("patch rejected the stored plan")
+        return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
+    if (
+        plan is None
+        or report is None
+        or workspace is None
+        or approval is None
+        or approval["decision"] != "approve"
+        or not plan.can_proceed
+    ):
+        return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
+    try:
+        worktree = require_workspace_root(context.workspace_root) / worktree_relative(task_id)
+    except Exception:
+        logger.error("patch rejected: unavailable")
+        return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
+    if worktree.is_symlink() or not worktree.is_dir():
+        logger.error("patch rejected: unavailable")
+        return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
+    try:
+        outcome = DeveloperAgent(
+            context.provider,
+            worktree,
+            lease_lost=context.lease_lost,
+        ).run(
+            title=state["title"],
+            description=state["description"],
+            plan=plan,
+            report=report,
+        )
+    except StopForLease:
+        raise LeaseLost() from None
+    except PatchError as exc:
+        logger.error("patch rejected: %s", exc.code)
+        return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
+    except LLMError as exc:
+        return _failed_update(failure_text(exc), stage=STAGE_DEVELOP)
+    except Exception as exc:
+        logger.error("develop node failed: %s", type(exc).__name__)
+        return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    return {
+        "patch": outcome.as_state(),
         "error": None,
         "failed_stage": None,
         "status": "completed",
@@ -621,9 +726,16 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
     except ValueError:
         logger.error("finalize rejected the workspace payload")
         return _failed_update(WORKSPACE_FAILURE, stage=STAGE_WORKSPACE)
+    try:
+        patch = _accepted_patch(state, plan, workspace)
+    except ValueError:
+        logger.error("finalize rejected the patch payload")
+        return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
     summary = checked.summary
     if plan is not None:
         summary = str(plan["plan"]["problem_statement"])
+    if patch is not None:
+        summary = patch["summary"]
     return {
         "status": "completed",
         "error": None,
@@ -678,6 +790,10 @@ def outcome_from_state(state: TriageState) -> TriageOutcome:
         workspace = _accepted_workspace(state, plan)
     except ValueError:
         return failure_outcome(WORKSPACE_FAILURE, stage=STAGE_WORKSPACE)
+    try:
+        patch = _accepted_patch(state, plan, workspace)
+    except ValueError:
+        return failure_outcome(PATCH_FAILURE, stage=STAGE_DEVELOP)
     if plan is None or investigation is None:
         return TriageOutcome(
             status=TaskStatus.COMPLETED,
@@ -686,13 +802,18 @@ def outcome_from_state(state: TriageState) -> TriageOutcome:
             result_json=checked.model_dump(mode="json"),
         )
     body, accepted = _planned_body(checked, investigation, plan, approval, workspace)
+    stored = _store_patch(body, patch)
+    summary = accepted.problem_statement
+    if patch is not None:
+        summary = patch["summary"]
     return TriageOutcome(
         status=TaskStatus.COMPLETED,
         stage=STAGE_FINALIZE,
-        result_summary=accepted.problem_statement,
+        result_summary=summary,
         result_json=body,
         plan=accepted,
         workspace=workspace,
+        patch=stored,
     )
 
 
@@ -759,6 +880,77 @@ def _rejected_update(state: TriageState) -> dict[str, Any]:
         "approval": _checked_approval(state.get("approval")),
         "workspace": None,
     }
+
+
+def _accepted_patch(
+    state: dict[str, Any],
+    plan: dict[str, Any] | None,
+    workspace: IsolatedWorkspace | None,
+) -> dict[str, Any] | None:
+    """Return the applied patch, or None when this task did not develop."""
+    checked = _checked_patch(state.get("patch"))
+    if workspace is None:
+        if checked is not None:
+            raise ValueError("patch without a workspace")
+        return None
+    if checked is None or plan is None:
+        raise ValueError("approved plan has no patch")
+    accepted = ChangePlan.model_validate(plan["plan"])
+    planned = {item.relative_path for item in accepted.modifications}
+    paths = checked["paths"]
+    if not paths or any(path not in planned for path in paths):
+        raise ValueError("patch path is outside the plan")
+    return checked
+
+
+def _checked_patch(value: object) -> dict[str, Any] | None:
+    """Re-validate a stored patch. None means this task did not develop."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("patch payload is not an object")
+    try:
+        proposal = PatchProposal.model_validate(value.get("proposal"))
+    except ValidationError:
+        raise ValueError("patch proposal is not valid") from None
+    diff = value.get("diff")
+    paths = value.get("paths")
+    if not isinstance(diff, str) or not diff.startswith("diff --git ") or "\x00" in diff:
+        raise ValueError("patch diff is missing")
+    if len(diff.encode()) > MAX_DIFF_BYTES:
+        raise ValueError("patch diff is too large")
+    if (
+        not isinstance(paths, list)
+        or not paths
+        or not all(isinstance(item, str) and item for item in paths)
+    ):
+        raise ValueError("patch paths are missing")
+    if value.get("summary") != proposal.summary:
+        raise ValueError("patch summary does not match the proposal")
+    return {
+        "summary": proposal.summary,
+        "paths": list(paths),
+        "diff": diff,
+        "proposal": proposal,
+    }
+
+
+def _store_patch(body: dict[str, Any], patch: dict[str, Any] | None) -> DevelopOutcome | None:
+    """Record checksums on the task. The diff body stays out of result_json."""
+    if patch is None:
+        return None
+    diff = patch["diff"].encode()
+    proposal = patch["proposal"]
+    body["patch"] = {
+        "summary": patch["summary"],
+        "paths": list(patch["paths"]),
+        "checksum": checksum(diff),
+        "proposal_checksum": checksum(proposal_document(proposal)),
+    }
+    return DevelopOutcome(
+        proposal=proposal,
+        applied=AppliedPatch(summary=patch["summary"], paths=tuple(patch["paths"]), diff=diff),
+    )
 
 
 def _accepted_workspace(

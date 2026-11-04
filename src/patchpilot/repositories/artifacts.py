@@ -1,4 +1,4 @@
-"""Versioned artifact rows. Plan bytes live on the artifact volume."""
+"""Versioned artifact rows. File bytes live on the artifact volume."""
 
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -7,16 +7,24 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from patchpilot.artifacts import (
+    DIFF_ARTIFACT_TYPE,
     MAX_PLAN_VERSION,
     PLAN_ARTIFACT_TYPE,
+    PROPOSAL_ARTIFACT_TYPE,
     ArtifactStoreError,
     checksum,
+    diff_relative_path,
     plan_document,
     plan_relative_path,
     prepare_artifact_root,
+    proposal_document,
+    proposal_relative_path,
+    write_diff_file,
     write_plan_file,
+    write_proposal_file,
 )
 from patchpilot.db.models import Artifact
+from patchpilot.llm.patch import PatchProposal
 from patchpilot.llm.plan import ChangePlan
 
 
@@ -31,6 +39,25 @@ class ArtifactRepository:
         statement = select(Artifact).where(
             Artifact.task_id == task_id,
             Artifact.artifact_type == PLAN_ARTIFACT_TYPE,
+        )
+        if version is None:
+            statement = statement.order_by(Artifact.version.desc()).limit(1)
+        else:
+            statement = statement.where(Artifact.version == version)
+        return await self._session.scalar(statement)
+
+    async def get_diff(self, task_id: UUID, version: int | None = None) -> Artifact | None:
+        """Return one applied diff, or the newest when `version` is omitted."""
+        return await self._get(task_id, DIFF_ARTIFACT_TYPE, version)
+
+    async def get_proposal(self, task_id: UUID, version: int | None = None) -> Artifact | None:
+        """Return one model proposal, or the newest when `version` is omitted."""
+        return await self._get(task_id, PROPOSAL_ARTIFACT_TYPE, version)
+
+    async def _get(self, task_id: UUID, artifact_type: str, version: int | None) -> Artifact | None:
+        statement = select(Artifact).where(
+            Artifact.task_id == task_id,
+            Artifact.artifact_type == artifact_type,
         )
         if version is None:
             statement = statement.order_by(Artifact.version.desc()).limit(1)
@@ -83,6 +110,72 @@ async def persist_plan(
             relative_path=relative,
             checksum=digest,
             size=len(payload),
+        )
+    )
+    await session.flush()
+    return version
+
+
+async def persist_patch(
+    session: AsyncSession,
+    root: Path,
+    task_id: UUID,
+    proposal: PatchProposal,
+    diff: bytes,
+) -> int:
+    """Store the model proposal and the applied diff under one version.
+
+    The same diff bytes reuse the existing version. The proposal file is a
+    different document, so its checksum is not the diff checksum. The caller
+    commits. This function does not write the registered checkout.
+    """
+    if not isinstance(root, Path) or not isinstance(diff, bytes) or not diff:
+        raise ArtifactStoreError
+    proposal_payload = proposal_document(proposal)
+    diff_digest = checksum(diff)
+    existing = await session.scalar(
+        select(Artifact).where(
+            Artifact.task_id == task_id,
+            Artifact.artifact_type == DIFF_ARTIFACT_TYPE,
+            Artifact.checksum == diff_digest,
+        )
+    )
+    if existing is not None:
+        return existing.version
+    current = await session.scalar(
+        select(func.max(Artifact.version)).where(
+            Artifact.task_id == task_id,
+            Artifact.artifact_type == DIFF_ARTIFACT_TYPE,
+        )
+    )
+    version = int(current or 0) + 1
+    if version > MAX_PLAN_VERSION:
+        raise ArtifactStoreError
+    base = prepare_artifact_root(root)
+    diff_path = diff_relative_path(task_id, version)
+    proposal_path = proposal_relative_path(task_id, version)
+    write_diff_file(base, diff_path, diff)
+    write_proposal_file(base, proposal_path, proposal_payload)
+    session.add(
+        Artifact(
+            id=uuid4(),
+            task_id=task_id,
+            artifact_type=DIFF_ARTIFACT_TYPE,
+            version=version,
+            relative_path=diff_path,
+            checksum=diff_digest,
+            size=len(diff),
+        )
+    )
+    session.add(
+        Artifact(
+            id=uuid4(),
+            task_id=task_id,
+            artifact_type=PROPOSAL_ARTIFACT_TYPE,
+            version=version,
+            relative_path=proposal_path,
+            checksum=checksum(proposal_payload),
+            size=len(proposal_payload),
         )
     )
     await session.flush()

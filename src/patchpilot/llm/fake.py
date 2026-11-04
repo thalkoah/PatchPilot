@@ -17,6 +17,7 @@ from patchpilot.llm.investigation import (
     ToolRequest,
 )
 from patchpilot.llm.parsing import coerce_model, require_prompt, require_schema, resolve_options
+from patchpilot.llm.patch import FileEdit, PatchProposal
 from patchpilot.llm.plan import ChangePlan, ModificationKind, ProposedModification
 from patchpilot.llm.provider import GenerateOptions, ModelT
 from patchpilot.llm.triage import Classification, Severity, TriageResult
@@ -240,6 +241,155 @@ def builtin_investigator_step(prompt: str) -> InvestigatorStep:
     return InvestigatorStep(tool=_next_tool(prompt), report=None)
 
 
+_FILE_SHA = re.compile(r"^FILE (\S+) sha256=([0-9a-f]{64}|new)$", re.M)
+
+DEMO_PATCH_SUMMARY = (
+    "Reject an unknown customer tier with HTTP 422 and cover it with a regression test."
+)
+
+_DISCOUNTS_AFTER = """\"\"\"Discount rules for the demo service.
+
+Known tiers return a percent. An unknown tier raises UnknownTierError.
+\"\"\"
+
+KNOWN_TIERS: dict[str, int] = {
+    "standard": 0,
+    "silver": 10,
+    "gold": 20,
+}
+
+
+class UnknownTierError(ValueError):
+    \"\"\"The customer tier is not one of the known tiers.\"\"\"
+
+
+def discount_percent(customer_tier: str) -> int:
+    try:
+        return KNOWN_TIERS[customer_tier]
+    except KeyError as exc:
+        raise UnknownTierError(customer_tier) from exc
+"""
+
+_APP_AFTER = """\"\"\"HTTP wrapper around the discount rules. An unknown tier is HTTP 422.\"\"\"
+
+from fastapi import FastAPI, HTTPException
+
+from demo_service.discounts import UnknownTierError, discount_percent
+
+app = FastAPI(title="Demo service", version="0.1.0")
+
+
+@app.get("/discount")
+def get_discount(customer_tier: str) -> dict[str, object]:
+    try:
+        percent = discount_percent(customer_tier)
+    except UnknownTierError as exc:
+        raise HTTPException(status_code=422, detail=f"Unknown customer tier: {exc}") from exc
+    return {"customer_tier": customer_tier, "percent": percent}
+"""
+
+_TEST_AFTER = """\"\"\"Regression for an unrecognized customer tier.\"\"\"
+
+from fastapi.testclient import TestClient
+
+from demo_service.app import app
+
+
+def test_unknown_tier_returns_validation_error():
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.get("/discount", params={"customer_tier": "platinum"})
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Unknown customer tier: platinum"
+"""
+
+_DEMO_FILES = (
+    ("src/demo_service/discounts.py", _DISCOUNTS_AFTER),
+    ("src/demo_service/app.py", _APP_AFTER),
+    ("tests/test_unknown_tier_added.py", _TEST_AFTER),
+)
+
+
+def builtin_patch_proposal(prompt: str) -> PatchProposal:
+    """A demo edit, or a proposal the apply tool must refuse."""
+    folded = prompt.casefold()
+    if "patch schema failure" in folded:
+        raise LLMResponseError("PatchProposal rejected model output (1 validation error)")
+    if "patch traversal" in folded:
+        return PatchProposal(
+            summary="Escape the worktree.",
+            unified_diff=(
+                "diff --git a/../etc/passwd b/../etc/passwd\n"
+                "--- a/../etc/passwd\n"
+                "+++ b/../etc/passwd\n"
+                "@@ -1 +1 @@\n"
+                "-root\n"
+                "+owned\n"
+            ),
+        )
+    if "patch binary" in folded:
+        path, digest = _first_existing_file(prompt)
+        return PatchProposal(
+            summary="Write a binary.",
+            edits=[FileEdit(relative_path=path, expected_sha256=digest, content="payload\n\x00")],
+        )
+    if "patch oversized" in folded:
+        path, digest = _first_existing_file(prompt)
+        return PatchProposal(
+            summary="Write far too much.",
+            edits=[
+                FileEdit(
+                    relative_path=path,
+                    expected_sha256=digest,
+                    content="payload\n" + ("x" * 17_000),
+                )
+            ],
+        )
+    if "patch outside plan" in folded:
+        return PatchProposal(
+            summary="Edit a file the plan did not name.",
+            edits=[
+                FileEdit(
+                    relative_path="src/demo_service/__init__.py",
+                    expected_sha256="0" * 64,
+                    content="SENTINEL = 1\n",
+                )
+            ],
+        )
+    if "patch malformed" in folded:
+        return PatchProposal(
+            summary="The diff is not unified.",
+            unified_diff="this is not a unified diff\n",
+        )
+    edits: list[FileEdit] = []
+    for path, content in _DEMO_FILES:
+        digest = _file_sha(prompt, path)
+        if digest is None:
+            continue
+        edits.append(FileEdit(relative_path=path, expected_sha256=digest, content=content))
+    if not edits:
+        raise LLMResponseError("PatchProposal rejected model output (1 validation error)")
+    return PatchProposal(summary=DEMO_PATCH_SUMMARY, edits=edits)
+
+
+def _file_sha(prompt: str, path: str) -> str | None:
+    for match in _FILE_SHA.finditer(prompt):
+        if match.group(1) != path:
+            continue
+        value = match.group(2)
+        return "" if value == "new" else value
+    return None
+
+
+def _first_existing_file(prompt: str) -> tuple[str, str]:
+    for match in _FILE_SHA.finditer(prompt):
+        if match.group(2) == "new":
+            continue
+        return match.group(1), match.group(2)
+    raise LLMResponseError("PatchProposal rejected model output (1 validation error)")
+
+
 def builtin_change_plan(prompt: str) -> ChangePlan:
     """A reviewable proposal, a decline, an unsafe draft, or a schema failure."""
     folded = prompt.casefold()
@@ -434,6 +584,8 @@ class FakeProvider:
             return coerce_model(checked_schema, builtin_investigation_report(checked_prompt))
         if checked_schema is ChangePlan:
             return coerce_model(checked_schema, builtin_change_plan(checked_prompt))
+        if checked_schema is PatchProposal:
+            return coerce_model(checked_schema, builtin_patch_proposal(checked_prompt))
         raise LLMResponseError(f"FakeProvider has no fixture for {checked_schema.__name__}")
 
     def close(self) -> None:

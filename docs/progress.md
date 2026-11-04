@@ -534,3 +534,53 @@ The running Compose stack was left as it was. It does not include this migration
 ### Next task
 
 Task 12 — Developer agent produces a validated patch.
+
+## Task 12 — Developer agent produces a validated patch
+
+Status: complete (2026-11-04).
+
+An approved plan follows `prepare_workspace -> develop -> finalize`. Rejection and a declined plan still skip the worktree. `develop` makes one `generate_structured` call for a `PatchProposal`: full-file edits with an expected sha256, or one unified diff. `apply_patch` then checks that proposal against the approved plan and the private worktree. A path is writable only when the plan named it and it is still an existing `.py` file or a new `tests/test_*.py` file. Symlinks, secrets, `.git`, CI workflows, Docker files, dependency manifests, traversal, binary bytes, a stale base, and a diff over 16384 bytes are refused. `git apply --check` runs before `git apply`. The command list is fixed. There is no shell and no test run.
+
+The model proposal and the applied diff are different artifacts, `proposal` and `diff`, with different sha256 values. `GET /api/v1/tasks/{id}/patch` returns both. `result_json.patch` stores the summary, the paths, and the two checksums. It does not store the diff text. A failed patch deletes that task's workspace directory. The registered checkout is not modified. Alembic head is still `0006_workspaces`.
+
+### Evidence
+
+`uv run pytest` — 210 passed in 15.46s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 111 files already formatted.
+
+The approve test copies `examples/demo_service`, commits it, and resumes after approval. The task completes at `finalize`. The worktree `discounts.py` defines `UnknownTierError`, and `tests/test_unknown_tier_added.py` exists there. Neither change is in the source checkout. The source snapshot, including `.git`, matches the snapshot taken before the run. `GET /api/v1/tasks/{id}/patch` returns a unified diff whose checksum is not the proposal checksum. The task JSON and the develop events do not contain `diff --git`. The develop events are one `stage_started` and one `stage_completed`, and they carry both checksums. One extra model call is a `PatchProposal`. Rejection still makes no model call and leaves the workspace directory empty.
+
+The patch tool tests refuse `../outside.txt`, a NUL byte, a diff over the byte cap, `src/other.py` when the plan did not name it, a non-diff, a wrong sha256, and a symlink. The outside file and the source snapshot stay unchanged. The worktree file that would have been edited stays at its baseline bytes.
+
+The running Compose stack was left as it was. It does not include the develop node until the next image rebuild recreates the worker.
+
+### Changed files
+
+- `src/patchpilot/llm/patch.py` — `PatchProposal` and file edits
+- `src/patchpilot/patching/` — path policy, `git apply --check`, and `apply_patch`
+- `src/patchpilot/agents/developer.py` — one model call, then the tool
+- `src/patchpilot/llm/fake.py` — demo patch and refusal fixtures
+- `src/patchpilot/artifacts.py`, `repositories/artifacts.py`, `schemas/patches.py`, `routes/tasks.py` — proposal and diff artifacts, `GET /api/v1/tasks/{id}/patch`
+- `src/patchpilot/workflow/graph.py`, `worker.py`, `repositories/jobs.py` — `develop` after the worktree
+- `tests/test_patch.py`, `tests/test_approvals.py`, `tests/test_workflow.py`
+- `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` was not executed. The Compose containers were left running and do not include the develop node yet.
+- Host Ollama was not asked to write a patch. The apply tool and the approval resume were exercised with `FakeProvider`.
+- The new regression file is written in the worktree. Nothing runs it. Test execution is the next task.
+- The checkpoint holds the patch text so the worker can store the artifact. `result_json` and the events do not. The API reads the artifact files.
+- A develop attempt that applies the patch and then loses the lease can fail the retry: the expected sha256 is the original file, and the worktree already has the edit. The failed task then deletes that workspace directory.
+- `git apply --check` failure is reported as a malformed patch. The worktree is left unchanged because the check runs first.
+- A symlink anywhere in the worktree makes the snapshot refuse the patch. The demo checkout has none.
+- The applied artifact is the diff Git recorded after the edit, not the model's JSON. A unified diff the model sent is checked and applied, then replaced in the artifact by that recording.
+- A failed patch deletes the task directory, so the dirty worktree is not kept for inspection. The source checkout is unchanged either way.
+- The diff cap is 16384 bytes. The artifact table still allows 32768. A larger valid edit is refused before Git applies it.
+
+### Next task
+
+Task 13 — Restricted test runner and test artifacts.

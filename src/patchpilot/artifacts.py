@@ -1,7 +1,9 @@
-"""Plan files on the artifact volume. The database stores the checksum, not the body.
+"""Artifact files. The database stores the checksum, not the body.
 
 The relative path is chosen here from the task id and version. Model output never
 selects it. A plan file is JSON with `schema_version` 1 and a `ChangePlan`.
+A proposal file is the model `PatchProposal`. A diff file is the unified diff
+Git applied, which is a different byte string from the proposal.
 """
 
 import hashlib
@@ -10,17 +12,23 @@ import re
 from pathlib import Path
 from uuid import UUID, uuid4
 
+from patchpilot.llm.patch import PatchProposal
 from patchpilot.llm.plan import ChangePlan
 from patchpilot.source.paths import is_inside
 
 PLAN_ARTIFACT_TYPE = "plan"
+DIFF_ARTIFACT_TYPE = "diff"
+PROPOSAL_ARTIFACT_TYPE = "proposal"
 PLAN_SCHEMA_VERSION = 1
+PATCH_SCHEMA_VERSION = 1
 MAX_PLAN_BYTES = 32_768
+MAX_DIFF_BYTES = 16_384
 MAX_PLAN_VERSION = 1000
 
-_PLAN_FILE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/plan/v([1-9][0-9]{0,3})\.json$"
-)
+_TASK = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_PLAN_FILE = re.compile(rf"^{_TASK}/plan/v([1-9][0-9]{{0,3}})\.json$")
+_DIFF_FILE = re.compile(rf"^{_TASK}/diff/v([1-9][0-9]{{0,3}})\.patch$")
+_PROPOSAL_FILE = re.compile(rf"^{_TASK}/proposal/v([1-9][0-9]{{0,3}})\.json$")
 
 
 class ArtifactStoreError(Exception):
@@ -52,14 +60,62 @@ def parse_plan_document(payload: bytes) -> ChangePlan:
         raise ArtifactStoreError from None
 
 
+def proposal_document(proposal: PatchProposal) -> bytes:
+    """Canonical JSON for the model proposal. This is not the applied diff."""
+    body = {
+        "proposal": proposal.model_dump(mode="json"),
+        "schema_version": PATCH_SCHEMA_VERSION,
+    }
+    payload = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    if len(payload) > MAX_PLAN_BYTES:
+        raise ArtifactStoreError
+    return payload
+
+
+def parse_proposal_document(payload: bytes) -> PatchProposal:
+    """Validate a proposal file. The error does not include the file body."""
+    if not isinstance(payload, bytes) or len(payload) > MAX_PLAN_BYTES:
+        raise ArtifactStoreError
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        raise ArtifactStoreError from None
+    if not isinstance(data, dict) or data.get("schema_version") != PATCH_SCHEMA_VERSION:
+        raise ArtifactStoreError
+    try:
+        return PatchProposal.model_validate(data.get("proposal"))
+    except ValueError:
+        raise ArtifactStoreError from None
+
+
 def plan_relative_path(task_id: UUID, version: int) -> str:
     """Internal path for one plan revision. It is not taken from the model."""
+    return _versioned_path(task_id, version, "plan", "json", _PLAN_FILE)
+
+
+def diff_relative_path(task_id: UUID, version: int) -> str:
+    """Internal path for the applied diff. It is not taken from the model."""
+    return _versioned_path(task_id, version, "diff", "patch", _DIFF_FILE)
+
+
+def proposal_relative_path(task_id: UUID, version: int) -> str:
+    """Internal path for the model proposal. It is not taken from the model."""
+    return _versioned_path(task_id, version, "proposal", "json", _PROPOSAL_FILE)
+
+
+def _versioned_path(
+    task_id: UUID,
+    version: int,
+    kind: str,
+    suffix: str,
+    pattern: re.Pattern[str],
+) -> str:
     if isinstance(version, bool) or not isinstance(version, int):
         raise ArtifactStoreError
     if not 1 <= version <= MAX_PLAN_VERSION:
         raise ArtifactStoreError
-    relative = f"{task_id}/plan/v{version}.json"
-    if _PLAN_FILE.fullmatch(relative) is None:
+    relative = f"{task_id}/{kind}/v{version}.{suffix}"
+    if pattern.fullmatch(relative) is None:
         raise ArtifactStoreError
     return relative
 
@@ -90,9 +146,29 @@ def prepare_artifact_root(root: Path, *, create: bool = True) -> Path:
 
 def write_plan_file(root: Path, relative_path: str, payload: bytes) -> None:
     """Write a plan file once. The same bytes may already be there. Different bytes are refused."""
-    if len(payload) > MAX_PLAN_BYTES:
+    _write_file(root, relative_path, payload, _PLAN_FILE, MAX_PLAN_BYTES)
+
+
+def write_diff_file(root: Path, relative_path: str, payload: bytes) -> None:
+    """Write the applied diff once. The same bytes may already be there."""
+    _write_file(root, relative_path, payload, _DIFF_FILE, MAX_DIFF_BYTES)
+
+
+def write_proposal_file(root: Path, relative_path: str, payload: bytes) -> None:
+    """Write the model proposal once. The same bytes may already be there."""
+    _write_file(root, relative_path, payload, _PROPOSAL_FILE, MAX_PLAN_BYTES)
+
+
+def _write_file(
+    root: Path,
+    relative_path: str,
+    payload: bytes,
+    pattern: re.Pattern[str],
+    limit: int,
+) -> None:
+    if len(payload) > limit or not payload:
         raise ArtifactStoreError
-    path = _destination(root, relative_path, create=True)
+    path = _destination(root, relative_path, pattern, create=True)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.is_symlink():
@@ -129,7 +205,7 @@ def load_plan_file(
         or len(expected_checksum) != 64
     ):
         raise ArtifactStoreError
-    path = _destination(root, relative_path, create=False)
+    path = _destination(root, relative_path, _PLAN_FILE, create=False)
     try:
         if path.is_symlink() or not path.is_file():
             raise ArtifactStoreError
@@ -143,8 +219,85 @@ def load_plan_file(
     return parse_plan_document(payload)
 
 
-def _destination(root: Path, relative_path: str, *, create: bool) -> Path:
-    if _PLAN_FILE.fullmatch(relative_path) is None:
+def load_diff_file(
+    root: Path,
+    *,
+    relative_path: str,
+    expected_checksum: str,
+    size: int,
+) -> bytes:
+    """Read an applied diff only when its size and checksum match the artifact row."""
+    payload = _read_file(
+        root,
+        relative_path=relative_path,
+        pattern=_DIFF_FILE,
+        expected_checksum=expected_checksum,
+        size=size,
+        limit=MAX_DIFF_BYTES,
+    )
+    if not payload.startswith(b"diff --git "):
+        raise ArtifactStoreError
+    return payload
+
+
+def load_proposal_file(
+    root: Path,
+    *,
+    relative_path: str,
+    expected_checksum: str,
+    size: int,
+) -> PatchProposal:
+    """Read a model proposal only when its size and checksum match the artifact row."""
+    payload = _read_file(
+        root,
+        relative_path=relative_path,
+        pattern=_PROPOSAL_FILE,
+        expected_checksum=expected_checksum,
+        size=size,
+        limit=MAX_PLAN_BYTES,
+    )
+    return parse_proposal_document(payload)
+
+
+def _read_file(
+    root: Path,
+    *,
+    relative_path: str,
+    pattern: re.Pattern[str],
+    expected_checksum: str,
+    size: int,
+    limit: int,
+) -> bytes:
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, int)
+        or not isinstance(expected_checksum, str)
+        or len(expected_checksum) != 64
+        or size > limit
+    ):
+        raise ArtifactStoreError
+    path = _destination(root, relative_path, pattern, create=False)
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ArtifactStoreError
+        payload = path.read_bytes()
+    except ArtifactStoreError:
+        raise
+    except OSError:
+        raise ArtifactStoreError from None
+    if len(payload) != size or checksum(payload) != expected_checksum:
+        raise ArtifactStoreError
+    return payload
+
+
+def _destination(
+    root: Path,
+    relative_path: str,
+    pattern: re.Pattern[str],
+    *,
+    create: bool,
+) -> Path:
+    if pattern.fullmatch(relative_path) is None:
         raise ArtifactStoreError
     base = prepare_artifact_root(root, create=create)
     candidate = base.joinpath(*relative_path.split("/"))

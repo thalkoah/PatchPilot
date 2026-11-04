@@ -153,7 +153,8 @@ async def test_approve_survives_restart_and_a_repeated_decision(
     finally:
         await engine.dispose()
 
-    assert len(provider.calls) == calls
+    assert len(provider.calls) == calls + 1
+    assert provider.calls[-1].schema_name == "PatchProposal"
     done = client.get(f"/api/v1/tasks/{task_id}")
     body = done.json()
     assert body["status"] == "completed"
@@ -169,8 +170,21 @@ async def test_approve_survives_restart_and_a_repeated_decision(
     assert not (checkout / ".git" / "worktrees").exists()
     worktree = workspace_root / task_id / "worktree"
     assert (worktree / "src/demo_service/discounts.py").is_file()
-    assert not (worktree / "tests/test_unknown_tier_added.py").exists()
+    assert "UnknownTierError" in (worktree / "src/demo_service/discounts.py").read_text()
+    assert "UnknownTierError" not in (checkout / "src/demo_service/discounts.py").read_text()
+    assert (worktree / "tests/test_unknown_tier_added.py").is_file()
     assert not (checkout / "tests/test_unknown_tier_added.py").exists()
+    patch_meta = body["result_json"]["patch"]
+    assert patch_meta["checksum"] != patch_meta["proposal_checksum"]
+    assert "diff --git" not in done.text
+    listed = client.get(f"/api/v1/tasks/{task_id}/patch")
+    assert listed.status_code == 200
+    patch_body = listed.json()
+    assert patch_body["checksum"] == patch_meta["checksum"]
+    assert patch_body["proposal_checksum"] == patch_meta["proposal_checksum"]
+    assert "diff --git a/src/demo_service/discounts.py" in patch_body["diff"]
+    assert patch_body["proposal"]["edits"]
+    assert patch_body["diff"] not in json.dumps(patch_body["proposal"])
     events = client.get(f"/api/v1/tasks/{task_id}/events").json()["items"]
     kinds = [item["event_type"] for item in events]
     assert kinds.count("approval_requested") == 1
@@ -182,6 +196,11 @@ async def test_approve_survives_restart_and_a_repeated_decision(
     assert decided["payload"]["reason"] == APPROVE_REASON
     prepared = [item for item in events if item["stage"] == "prepare_workspace"]
     assert [item["event_type"] for item in prepared] == ["stage_started", "stage_completed"]
+    developed = [item for item in events if item["stage"] == "develop"]
+    assert [item["event_type"] for item in developed] == ["stage_started", "stage_completed"]
+    assert developed[1]["payload"]["checksum"] == patch_meta["checksum"]
+    assert developed[1]["payload"]["proposal_checksum"] == patch_meta["proposal_checksum"]
+    assert "diff --git" not in json.dumps(developed)
     assert prepared[1]["payload"]["base_sha"] == body["result_json"]["workspace"]["base_sha"]
     assert prepared[1]["payload"]["branch"] == f"patchpilot/{task_id}"
     assert str(workspace_root) not in json.dumps(prepared)
