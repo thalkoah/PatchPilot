@@ -17,7 +17,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin app
+RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin app \
+    && mkdir -p /runner \
+    && chown app:app /runner
 WORKDIR /app
 COPY --from=build --chown=app:app /app/.venv /app/.venv
 COPY --chown=app:app alembic.ini /app/alembic.ini

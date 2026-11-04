@@ -121,6 +121,45 @@ def test_worker_keeps_a_private_workspace_volume():
     assert "/repositories:ro" in worker
 
 
+def test_runner_container_has_no_network_and_no_secrets():
+    text = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    _api, rest = text.split("\n  worker:\n", 1)
+    _worker, runner = rest.split("\n  runner:\n", 1)
+
+    assert 'command: ["python", "-m", "patchpilot.runner"]' in runner
+    assert 'user: "1000:1000"' in runner
+    assert 'network_mode: "none"' in runner
+    assert "read_only: true" in runner
+    assert "cap_drop:" in runner
+    assert "- ALL" in runner
+    assert "no-new-privileges:true" in runner
+    assert "pids_limit: 64" in runner
+    assert "mem_limit: 512m" in runner
+    assert 'cpus: "0.50"' in runner
+    assert "tmpfs:" in runner
+    assert "RUNNER_ROOT: /runner" in runner
+    assert "runner:/runner" in runner
+    for forbidden in (
+        "DATABASE_URL",
+        "POSTGRES_PASSWORD",
+        "LLM_PROVIDER",
+        "OLLAMA_BASE_URL",
+        "docker.sock",
+        "privileged",
+    ):
+        assert forbidden not in runner
+    assert "docker.sock" not in text
+    assert "network_mode: none" in readme or 'network_mode: "none"' in text
+    assert "weaker" in readme
+    assert "RUNNER_ROOT" in example
+    assert "RUNNER_WAIT_SECONDS=45" in example
+    assert "mkdir -p /runner" in dockerfile
+    assert "chown app:app /runner" in dockerfile
+
+
 def test_env_example_is_present_and_env_is_ignored():
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")

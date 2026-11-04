@@ -9,9 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from patchpilot.artifacts import (
     PLAN_SCHEMA_VERSION,
     ArtifactStoreError,
+    TestReportStoreError,
     load_diff_file,
     load_plan_file,
     load_proposal_file,
+    load_test_report_file,
 )
 from patchpilot.config import get_settings
 from patchpilot.dependencies import (
@@ -41,6 +43,7 @@ from patchpilot.schemas.tasks import (
     TaskResponse,
     TaskStatus,
 )
+from patchpilot.schemas.test_reports import TestReportResponse
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 RepositoryDep = Annotated[TaskRepository, Depends(get_task_repository)]
@@ -185,6 +188,49 @@ async def get_task_patch(
         paths=paths,
         diff=text,
         proposal=proposal,
+    )
+
+
+@router.get("/{task_id}/tests", response_model=TestReportResponse)
+async def get_task_tests(
+    task_id: UUID,
+    repository: RepositoryDep,
+    artifacts: ArtifactRepositoryDep,
+    version: Annotated[int | None, Query(ge=1, le=1000)] = None,
+) -> TestReportResponse:
+    """Return one stored pytest report. The handler does not run the tests."""
+    task = await repository.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    row = await artifacts.get_test_report(task_id, version)
+    root = get_settings().artifacts_root
+    if row is None or root is None:
+        raise HTTPException(status_code=404, detail="Test report not found")
+    try:
+        report = load_test_report_file(
+            Path(root),
+            relative_path=row.relative_path,
+            expected_checksum=row.checksum,
+            size=row.size,
+        )
+    except TestReportStoreError:
+        raise HTTPException(status_code=404, detail="Test report not found") from None
+    if report.status.value == "invalid_request":
+        raise HTTPException(status_code=404, detail="Test report not found")
+    return TestReportResponse(
+        task_id=task_id,
+        version=row.version,
+        checksum=row.checksum,
+        size=row.size,
+        created_at=row.created_at,
+        status=report.status.value,
+        passed=report.status.value == "passed",
+        exit_code=report.exit_code,
+        timed_out=report.timed_out,
+        duration_ms=report.duration_ms,
+        stdout=report.stdout,
+        stderr=report.stderr,
+        output_truncated=report.output_truncated,
     )
 
 

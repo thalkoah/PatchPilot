@@ -584,3 +584,54 @@ The running Compose stack was left as it was. It does not include the develop no
 ### Next task
 
 Task 13 — Restricted test runner and test artifacts.
+
+## Task 13 — Restricted test runner and test artifacts
+
+Status: complete (2026-11-04).
+
+An approved patch follows `develop -> test -> finalize`. The worker copies the private worktree into `RUNNER_ROOT` and writes a request whose only fields are `schema_version` and the task id. A separate process, `python -m patchpilot.runner`, runs one fixed `pytest` command in that job directory. The worker waits for the result file. It does not start pytest. A request that names a command is stored as `invalid_request` and is not executed.
+
+Compose runs that process as uid 1000 with `network_mode: none`, a read-only root, a writable `/runner` volume and `/tmp`, every capability dropped, `no-new-privileges`, and CPU, memory, and PID limits. The runner environment has no database password and no model settings. The runner refuses to start when those variables are present. Pytest's own environment is an allowlist, so a proxy or an extra variable on the runner is not visible to the suite. The shared volume is one tree for every job, which is weaker than a fresh mount per task. Worker concurrency stays 1.
+
+A passing, failing, or timed-out suite is a `test-report` artifact. `GET /api/v1/tasks/{id}/tests` returns the exit code and bounded stdout and stderr. `result_json` and the `test` events keep the status and the checksum, not the output. If no result file appears, the task fails at stage `test`. The registered checkout is not modified. Alembic head is still `0006_workspaces`. Pytest is a runtime dependency so the runner image can execute it.
+
+### Evidence
+
+`uv run pytest` — 224 passed in 20.41s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 124 files already formatted.
+
+The runner tests start `python -m patchpilot.runner` as its own process. A passing suite returns exit code 0 and the printed marker. A failing assertion returns exit code 1. A test that sleeps is killed after one second and stored as `timed_out` with no exit code. A client wait with no runner process raises before any process is started, and the request file has no command. A request that names `curl` and a shell `touch` is `invalid_request`, and the sentinel file is not created. A runner started with `DATABASE_URL` exits 2, and the password is not on stderr. `HTTP_PROXY` and an extra sentinel set on the runner are absent from the pytest output. A symlink in the worktree is refused and the outside file is unchanged. Ten thousand bytes of output are stored truncated at 2000 characters.
+
+The approve test copies `examples/demo_service`, resumes after approval, and the runner executes the patched demo suite. The task completes at `finalize`. `result_json.tests.passed` is true and the exit code is 0. `GET /api/v1/tasks/{id}/tests` returns that report. The stdout does not contain the workspace, checkout, or runner path. The source snapshot, including `.git`, matches the snapshot taken before the run. The worktree has the patch. The source checkout does not. One `test` stage records `stage_started` and `stage_completed` with the checksum and without stdout.
+
+The running Compose stack was left as it was. It does not include the runner service until the next image rebuild recreates the worker.
+
+### Changed files
+
+- `src/patchpilot/runner/` — protocol, staging, client, pytest execution, and the runner process
+- `src/patchpilot/workflow/graph.py`, `worker.py`, `repositories/jobs.py` — `test` after `develop`
+- `src/patchpilot/artifacts.py`, `repositories/artifacts.py`, `schemas/test_reports.py`, `routes/tasks.py` — `test-report` artifact and `GET /api/v1/tasks/{id}/tests`
+- `src/patchpilot/config.py` — `RUNNER_ROOT`, timeout, and wait
+- `tests/test_runner.py`, `tests/runner_support.py`, `tests/test_approvals.py` — pass, fail, timeout, unavailable, and the demo suite
+- `tests/test_compose_contract.py`, `tests/test_config.py`, `tests/test_workflow.py`
+- `compose.yaml`, `Dockerfile`, `pyproject.toml`, `uv.lock`, `.env.example`, `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` was not executed. The Compose containers were left running and do not include the runner service yet. `network_mode: none` is checked in the Compose file. The host tests run the runner as a process, so they do not themselves create a network namespace.
+- A failing or timed-out suite is still a completed task. The report says `passed` is false. Blocking success on a failed suite is the next task.
+- The shared runner volume holds one job tree at a time. A second task is not isolated by a fresh container mount. Concurrency stays 1.
+- The worker deletes the copied project after it reads the result. The result file stays so a resumed node does not ask for a second run. A crash before that read leaves the copy in the volume.
+- If the worker stops waiting before the runner writes, the task fails at `test` and a late result is unused. `RUNNER_WAIT_SECONDS` must stay greater than `RUNNER_TIMEOUT_SECONDS`.
+- Output is kept up to 2000 characters. A process that writes more than 256 KiB is cut off.
+- A symlink anywhere in the copied tree refuses the job. The demo checkout has none.
+- Host Ollama was not asked to write a patch. The suite result was produced with `FakeProvider` and the real demo tests.
+- Pytest is installed in the API image as well as the runner image, because they share one image. The API does not invoke it.
+- A checkpoint that already finished `develop` on the previous graph and is waiting to enter `finalize` does not pass through `test`. A task parked on approval resumes into `prepare_workspace`, then `develop`, then `test`.
+
+### Next task
+
+Task 14 — Independent reviewer and bounded repair cycle.

@@ -33,7 +33,12 @@ from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from patchpilot.agents.developer import DevelopOutcome
-from patchpilot.artifacts import ArtifactStoreError
+from patchpilot.artifacts import (
+    ArtifactStoreError,
+    TestReportStoreError,
+    checksum,
+    test_report_document,
+)
 from patchpilot.audit import (
     APPROVAL_REQUESTED,
     ERROR_LEASE_EXPIRED,
@@ -60,9 +65,10 @@ from patchpilot.audit import (
 from patchpilot.db.models import Task, TaskEvent, TaskRun, TaskStatus
 from patchpilot.llm.plan import ChangePlan
 from patchpilot.repositories.approvals import insert_pending_approval
-from patchpilot.repositories.artifacts import persist_patch, persist_plan
+from patchpilot.repositories.artifacts import persist_patch, persist_plan, persist_test_report
 from patchpilot.repositories.events import append_event
 from patchpilot.repositories.workspaces import insert_workspace
+from patchpilot.runner.protocol import TestReport
 from patchpilot.workspace.errors import WorkspaceStoreError
 from patchpilot.workspace.layout import IsolatedWorkspace
 
@@ -74,6 +80,7 @@ _STAGE_PLAN = "plan"
 _STAGE_APPROVAL = "request_plan_approval"
 _STAGE_WORKSPACE = "prepare_workspace"
 _STAGE_DEVELOP = "develop"
+_STAGE_TEST = "test"
 _STAGE_FINALIZE = "finalize"
 
 
@@ -314,6 +321,7 @@ class JobRepository:
         plan: ChangePlan | None = None,
         workspace: IsolatedWorkspace | None = None,
         patch: DevelopOutcome | None = None,
+        tests: TestReport | None = None,
         artifacts_root: Path | None = None,
     ) -> bool:
         """Store a terminal outcome when this worker still holds the lease.
@@ -349,6 +357,17 @@ class JobRepository:
                 patch,
                 artifacts_root,
             )
+        if tests is not None:
+            if status != TaskStatus.COMPLETED or patch is None:
+                raise TestReportStoreError
+            stored = await self._with_test_version(
+                claimed.id,
+                stored,
+                tests,
+                artifacts_root,
+            )
+        elif patch is not None:
+            raise TestReportStoreError
         if workspace is not None:
             if status != TaskStatus.COMPLETED or claimed.repo_id is None:
                 raise WorkspaceStoreError
@@ -576,6 +595,23 @@ class JobRepository:
         stored["patch"] = patch_meta
         return stored
 
+    async def _with_test_version(
+        self,
+        task_id: UUID,
+        stored: dict[str, Any],
+        report: TestReport,
+        artifacts_root: Path | None,
+    ) -> dict[str, Any]:
+        if artifacts_root is None:
+            raise TestReportStoreError
+        version = await persist_test_report(self._session, artifacts_root, task_id, report)
+        meta = stored.get("tests")
+        tests_meta = dict(meta) if isinstance(meta, dict) else {}
+        tests_meta["version"] = version
+        tests_meta["checksum"] = checksum(test_report_document(report))
+        stored["tests"] = tests_meta
+        return stored
+
     async def _record_model_error(
         self,
         task_id: UUID,
@@ -777,6 +813,32 @@ class JobRepository:
                 ),
                 run_id=claimed.run_id,
             )
+        tests = _tests_payload(result_json, claimed.attempt)
+        if tests is not None and not await self._stage_completed(task_id, _STAGE_TEST):
+            await emit(
+                stage=_STAGE_TEST,
+                event_type=STAGE_STARTED,
+                payload=attempt,
+                key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_STARTED,
+                    stage=_STAGE_TEST,
+                ),
+                run_id=claimed.run_id,
+            )
+            await emit(
+                stage=_STAGE_TEST,
+                event_type=STAGE_COMPLETED,
+                payload=tests,
+                key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_COMPLETED,
+                    stage=_STAGE_TEST,
+                ),
+                run_id=claimed.run_id,
+            )
         await emit(
             stage=_STAGE_FINALIZE,
             event_type=STAGE_STARTED,
@@ -872,6 +934,22 @@ def _plan_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any] |
         "version": plan.get("version"),
         "rejected_paths": plan.get("rejected_paths"),
         "paths": paths,
+    }
+
+
+def _tests_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any] | None:
+    """The exit code and checksum only. Captured output stays in the artifact file."""
+    tests = result_json.get("tests")
+    if not isinstance(tests, dict):
+        return None
+    return {
+        "attempt": attempt,
+        "passed": tests.get("passed") is True,
+        "status": tests.get("status"),
+        "exit_code": tests.get("exit_code"),
+        "timed_out": tests.get("timed_out") is True,
+        "version": tests.get("version"),
+        "checksum": tests.get("checksum"),
     }
 
 

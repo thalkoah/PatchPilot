@@ -63,15 +63,54 @@ services:
       REPOSITORY_ROOT: /repositories
       # Private clones. Git writes only here, never into /repositories.
       WORKSPACE_ROOT: /workspaces
+      # Job directory shared with the runner service. This process only writes
+      # a job id and reads the result. It does not receive a command to run.
+      RUNNER_ROOT: /runner
+      RUNNER_TIMEOUT_SECONDS: ${RUNNER_TIMEOUT_SECONDS:-30}
+      RUNNER_WAIT_SECONDS: ${RUNNER_WAIT_SECONDS:-45}
     volumes:
       - ${REPOSITORY_ROOT_HOST:-./examples}:/repositories:ro
       - artifacts:/artifacts
       - workspaces:/workspaces
+      # Job files only. The runner, not this process, executes pytest.
+      - runner:/runner
     depends_on:
       db:
         condition: service_healthy
+
+  # Pytest runs here, never in the API or the worker. The request file is a job
+  # id. This service does not receive the database password or model settings.
+  # network_mode none is the no-network policy. The shared runner volume is one
+  # tree for every job, which is weaker than a fresh mount per task, so the
+  # worker concurrency stays 1.
+  runner:
+    build: .
+    image: patchpilot:local
+    command: ["python", "-m", "patchpilot.runner"]
+    user: "1000:1000"
+    network_mode: "none"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: "0.50"
+    environment:
+      RUNNER_ROOT: /runner
+      RUNNER_TIMEOUT_SECONDS: ${RUNNER_TIMEOUT_SECONDS:-30}
+      RUNNER_POLL_SECONDS: ${RUNNER_POLL_SECONDS:-0.2}
+      HOME: /tmp
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - runner:/runner
 
 volumes:
   pgdata:
   artifacts:
   workspaces:
+  runner:

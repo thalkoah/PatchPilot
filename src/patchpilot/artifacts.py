@@ -14,13 +14,17 @@ from uuid import UUID, uuid4
 
 from patchpilot.llm.patch import PatchProposal
 from patchpilot.llm.plan import ChangePlan
+from patchpilot.runner.limits import MAX_REPORT_BYTES
+from patchpilot.runner.protocol import TestReport, report_bytes
 from patchpilot.source.paths import is_inside
 
 PLAN_ARTIFACT_TYPE = "plan"
 DIFF_ARTIFACT_TYPE = "diff"
 PROPOSAL_ARTIFACT_TYPE = "proposal"
+TEST_REPORT_ARTIFACT_TYPE = "test-report"
 PLAN_SCHEMA_VERSION = 1
 PATCH_SCHEMA_VERSION = 1
+TEST_REPORT_SCHEMA_VERSION = 1
 MAX_PLAN_BYTES = 32_768
 MAX_DIFF_BYTES = 16_384
 MAX_PLAN_VERSION = 1000
@@ -29,10 +33,15 @@ _TASK = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _PLAN_FILE = re.compile(rf"^{_TASK}/plan/v([1-9][0-9]{{0,3}})\.json$")
 _DIFF_FILE = re.compile(rf"^{_TASK}/diff/v([1-9][0-9]{{0,3}})\.patch$")
 _PROPOSAL_FILE = re.compile(rf"^{_TASK}/proposal/v([1-9][0-9]{{0,3}})\.json$")
+_REPORT_FILE = re.compile(rf"^{_TASK}/test-report/v([1-9][0-9]{{0,3}})\.json$")
 
 
 class ArtifactStoreError(Exception):
     """The plan file could not be written or did not match its stored checksum."""
+
+
+class TestReportStoreError(ArtifactStoreError):
+    """The test report file could not be written or did not match its checksum."""
 
 
 def plan_document(plan: ChangePlan) -> bytes:
@@ -103,6 +112,33 @@ def proposal_relative_path(task_id: UUID, version: int) -> str:
     return _versioned_path(task_id, version, "proposal", "json", _PROPOSAL_FILE)
 
 
+def test_report_relative_path(task_id: UUID, version: int) -> str:
+    """Internal path for one test report. It is not taken from the model."""
+    return _versioned_path(task_id, version, "test-report", "json", _REPORT_FILE)
+
+
+def test_report_document(report: TestReport) -> bytes:
+    """Canonical JSON for one runner report. The checksum is the digest of these bytes."""
+    payload = report_bytes(report)
+    if len(payload) > MAX_REPORT_BYTES:
+        raise TestReportStoreError
+    return payload
+
+
+def parse_test_report_document(payload: bytes) -> TestReport:
+    """Validate a test report file. The error does not include the file body."""
+    if not isinstance(payload, bytes) or len(payload) > MAX_REPORT_BYTES:
+        raise TestReportStoreError
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        raise TestReportStoreError from None
+    try:
+        return TestReport.model_validate(data)
+    except ValueError:
+        raise TestReportStoreError from None
+
+
 def _versioned_path(
     task_id: UUID,
     version: int,
@@ -157,6 +193,14 @@ def write_diff_file(root: Path, relative_path: str, payload: bytes) -> None:
 def write_proposal_file(root: Path, relative_path: str, payload: bytes) -> None:
     """Write the model proposal once. The same bytes may already be there."""
     _write_file(root, relative_path, payload, _PROPOSAL_FILE, MAX_PLAN_BYTES)
+
+
+def write_test_report_file(root: Path, relative_path: str, payload: bytes) -> None:
+    """Write a test report once. The same bytes may already be there."""
+    try:
+        _write_file(root, relative_path, payload, _REPORT_FILE, MAX_REPORT_BYTES)
+    except ArtifactStoreError as exc:
+        raise TestReportStoreError from exc
 
 
 def _write_file(
@@ -238,6 +282,28 @@ def load_diff_file(
     if not payload.startswith(b"diff --git "):
         raise ArtifactStoreError
     return payload
+
+
+def load_test_report_file(
+    root: Path,
+    *,
+    relative_path: str,
+    expected_checksum: str,
+    size: int,
+) -> TestReport:
+    """Read a test report only when its size and checksum match the artifact row."""
+    try:
+        payload = _read_file(
+            root,
+            relative_path=relative_path,
+            pattern=_REPORT_FILE,
+            expected_checksum=expected_checksum,
+            size=size,
+            limit=MAX_REPORT_BYTES,
+        )
+    except ArtifactStoreError as exc:
+        raise TestReportStoreError from exc
+    return parse_test_report_document(payload)
 
 
 def load_proposal_file(

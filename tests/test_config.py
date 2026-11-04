@@ -187,6 +187,38 @@ def test_workspace_root_is_optional_and_must_be_absolute():
         )
 
 
+def test_runner_wait_must_exceed_the_timeout():
+    settings = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        _env_file=None,
+    )
+
+    assert settings.runner_timeout_seconds == 30
+    assert settings.runner_wait_seconds == 45
+    assert settings.runner_root is None
+
+    rooted = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        runner_root="/var/patchpilot/runner",
+        _env_file=None,
+    )
+    assert rooted.runner_root == "/var/patchpilot/runner"
+
+    with pytest.raises(ValidationError):
+        Settings(
+            database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+            runner_root="runner",
+            _env_file=None,
+        )
+    with pytest.raises(ValidationError):
+        Settings(
+            database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+            runner_timeout_seconds=30,
+            runner_wait_seconds=30,
+            _env_file=None,
+        )
+
+
 def test_investigator_budget_defaults_to_six_and_stays_bounded():
     settings = Settings(
         database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",

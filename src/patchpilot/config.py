@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from patchpilot.agents.limits import (
@@ -16,6 +16,12 @@ from patchpilot.llm.limits import (
     MAX_LLM_TIMEOUT_SECONDS,
     normalize_model_name,
     normalize_ollama_base_url,
+)
+from patchpilot.runner.limits import (
+    DEFAULT_RUNNER_TIMEOUT_SECONDS,
+    DEFAULT_RUNNER_WAIT_SECONDS,
+    MAX_RUNNER_TIMEOUT_SECONDS,
+    MAX_RUNNER_WAIT_SECONDS,
 )
 
 DEFAULT_WORKER_LEASE_SECONDS = 30.0
@@ -71,6 +77,17 @@ class Settings(LLMSettings):
     repository_root: str | None = None
     artifacts_root: str | None = None
     workspace_root: str | None = None
+    runner_root: str | None = None
+    runner_timeout_seconds: float = Field(
+        default=DEFAULT_RUNNER_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_RUNNER_TIMEOUT_SECONDS,
+    )
+    runner_wait_seconds: float = Field(
+        default=DEFAULT_RUNNER_WAIT_SECONDS,
+        gt=0,
+        le=MAX_RUNNER_WAIT_SECONDS,
+    )
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     @field_validator("database_url")
@@ -81,7 +98,15 @@ class Settings(LLMSettings):
             raise ValueError("database_url must use a postgresql:// or postgres:// URL")
         return value
 
-    @field_validator("repository_root", "artifacts_root", "workspace_root", mode="before")
+    @model_validator(mode="after")
+    def runner_wait_exceeds_timeout(self) -> "Settings":
+        if self.runner_wait_seconds <= self.runner_timeout_seconds:
+            raise ValueError("runner_wait_seconds must be greater than runner_timeout_seconds")
+        return self
+
+    @field_validator(
+        "repository_root", "artifacts_root", "workspace_root", "runner_root", mode="before"
+    )
     @classmethod
     def optional_path_is_absolute(cls, value: object) -> object:
         if value is None:

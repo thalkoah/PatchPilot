@@ -9,6 +9,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from tests.database import open_session_factory
+from tests.runner_support import start_runner, stop_runner
 from tests.workflow_support import compiled_worker_graph
 
 from patchpilot.api import create_app
@@ -97,7 +98,10 @@ async def test_approve_survives_restart_and_a_repeated_decision(
     assert not (DEMO_CHECKOUT / "tests/test_unknown_tier_added.py").exists()
 
     engine, factory = open_session_factory(postgres_database_url)
+    runner_dir = tmp_path / "runner"
+    runner = None
     try:
+        runner = start_runner(runner_dir, timeout=20, poll=0.05)
         async with compiled_worker_graph(postgres_database_url) as graph:
             assert (
                 await process_one(
@@ -133,6 +137,9 @@ async def test_approve_survives_restart_and_a_repeated_decision(
                     repository_root=repo_root,
                     artifacts_root=artifacts_root,
                     workspace_root=workspace_root,
+                    runner_root=runner_dir,
+                    runner_wait_seconds=35,
+                    database_url=postgres_database_url,
                 )
                 is True
             )
@@ -152,6 +159,8 @@ async def test_approve_survives_restart_and_a_repeated_decision(
             assert replay["reason"] == APPROVE_REASON
     finally:
         await engine.dispose()
+        if runner is not None:
+            stop_runner(runner)
 
     assert len(provider.calls) == calls + 1
     assert provider.calls[-1].schema_name == "PatchProposal"
@@ -185,6 +194,21 @@ async def test_approve_survives_restart_and_a_repeated_decision(
     assert "diff --git a/src/demo_service/discounts.py" in patch_body["diff"]
     assert patch_body["proposal"]["edits"]
     assert patch_body["diff"] not in json.dumps(patch_body["proposal"])
+    tests_meta = body["result_json"]["tests"]
+    assert tests_meta["passed"] is True
+    assert tests_meta["exit_code"] == 0
+    assert tests_meta["timed_out"] is False
+    assert "stdout" not in tests_meta
+    report = client.get(f"/api/v1/tasks/{task_id}/tests")
+    assert report.status_code == 200
+    report_body = report.json()
+    assert report_body["status"] == "passed"
+    assert report_body["passed"] is True
+    assert report_body["checksum"] == tests_meta["checksum"]
+    assert "passed" in report_body["stdout"]
+    assert str(workspace_root) not in report.text
+    assert str(checkout) not in report.text
+    assert str(runner_dir) not in report.text
     events = client.get(f"/api/v1/tasks/{task_id}/events").json()["items"]
     kinds = [item["event_type"] for item in events]
     assert kinds.count("approval_requested") == 1
@@ -201,6 +225,11 @@ async def test_approve_survives_restart_and_a_repeated_decision(
     assert developed[1]["payload"]["checksum"] == patch_meta["checksum"]
     assert developed[1]["payload"]["proposal_checksum"] == patch_meta["proposal_checksum"]
     assert "diff --git" not in json.dumps(developed)
+    tested = [item for item in events if item["stage"] == "test"]
+    assert [item["event_type"] for item in tested] == ["stage_started", "stage_completed"]
+    assert tested[1]["payload"]["passed"] is True
+    assert tested[1]["payload"]["checksum"] == tests_meta["checksum"]
+    assert "stdout" not in tested[1]["payload"]
     assert prepared[1]["payload"]["base_sha"] == body["result_json"]["workspace"]["base_sha"]
     assert prepared[1]["payload"]["branch"] == f"patchpilot/{task_id}"
     assert str(workspace_root) not in json.dumps(prepared)

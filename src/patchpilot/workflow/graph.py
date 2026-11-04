@@ -5,13 +5,15 @@ with a repo_id follows `START -> triage -> investigate -> plan`, then either
 `finalize` or `request_plan_approval`. Approval runs only when the plan names a
 code change. It calls `interrupt()` and does no I/O before that call, because
 resume runs the node from the top. An approval continues to `prepare_workspace`,
-then `develop`, then `finalize`. A rejection goes straight to `finalize`.
+then `develop`, then `test`, then `finalize`. A rejection goes straight to
+`finalize`.
 
 The investigate node reads the registered checkout. The plan node proposes
 paths and does not write them. `prepare_workspace` clones that checkout into
 the workspace volume. It does not read a path from the plan. `develop` applies
-a patch only inside that private worktree. Nothing in this graph writes the
-registered checkout.
+a patch only inside that private worktree. `test` copies that worktree to the
+runner volume and waits for a result file. It does not start a test process.
+Nothing in this graph writes the registered checkout.
 
 The worker compiles this graph with an AsyncPostgresSaver. The task UUID is the
 LangGraph thread id. Checkpoint rows are not the business task record: the
@@ -50,6 +52,10 @@ from patchpilot.llm.provider import LLMProvider
 from patchpilot.llm.triage import TriageResult
 from patchpilot.patching.apply import MAX_DIFF_BYTES, AppliedPatch
 from patchpilot.patching.errors import PatchError
+from patchpilot.runner.client import collect_test_report
+from patchpilot.runner.errors import RunnerRejected, RunnerUnavailable
+from patchpilot.runner.limits import DEFAULT_RUNNER_WAIT_SECONDS
+from patchpilot.runner.protocol import TestReport, TestStatus
 from patchpilot.source.tools import RepositoryTools
 from patchpilot.workspace.errors import WorkspaceError
 from patchpilot.workspace.git import prepare_isolated_workspace
@@ -68,6 +74,7 @@ STAGE_PLAN = "plan"
 STAGE_APPROVAL = "request_plan_approval"
 STAGE_WORKSPACE = "prepare_workspace"
 STAGE_DEVELOP = "develop"
+STAGE_TEST = "test"
 STAGE_FINALIZE = "finalize"
 GENERIC_FAILURE = "Triage failed before a valid result was produced."
 INVESTIGATION_FAILURE = "Investigation failed before a valid report was produced."
@@ -75,6 +82,9 @@ PLAN_FAILURE = "Planning failed before a valid change plan was produced."
 APPROVAL_FAILURE = "Approval resume did not continue the workflow."
 WORKSPACE_FAILURE = "The isolated workspace could not be created."
 PATCH_FAILURE = "The patch was rejected before it was applied."
+TEST_FAILURE = "The test result could not be read."
+RUNNER_UNAVAILABLE = "The test runner did not return a result."
+RUNNER_REJECTED = "The test runner rejected the workspace."
 ARTIFACT_FAILURE = "The plan artifact could not be stored."
 REPOSITORY_UNAVAILABLE = "The registered repository could not be opened."
 REJECTED_SUMMARY = "The plan was rejected."
@@ -87,6 +97,7 @@ _FAILURE_STAGES = frozenset(
         STAGE_APPROVAL,
         STAGE_WORKSPACE,
         STAGE_DEVELOP,
+        STAGE_TEST,
     }
 )
 _INTERRUPT = "__interrupt__"
@@ -110,6 +121,7 @@ class TriageState(TypedDict):
     approval: dict[str, Any] | None
     workspace: dict[str, Any] | None
     patch: dict[str, Any] | None
+    tests: dict[str, Any] | None
     result_summary: str | None
     error: str | None
     failed_stage: str | None
@@ -128,6 +140,8 @@ class WorkflowContext:
     lease_lost: Callable[[], bool] | None = None
     repository_tools: RepositoryTools | None = None
     workspace_root: Path | None = None
+    runner_root: Path | None = None
+    runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS
     repository_error: str | None = None
 
@@ -143,6 +157,7 @@ class TriageOutcome:
     plan: ChangePlan | None = None
     workspace: IsolatedWorkspace | None = None
     patch: DevelopOutcome | None = None
+    tests: TestReport | None = None
 
 
 def triage_prompt(*, title: str, description: str) -> str:
@@ -173,6 +188,7 @@ def initial_triage_state(
         "approval": None,
         "workspace": None,
         "patch": None,
+        "tests": None,
         "result_summary": None,
         "error": None,
         "failed_stage": None,
@@ -201,6 +217,7 @@ def compile_triage_graph(
     builder.add_node("request_plan_approval", request_plan_approval)
     builder.add_node("prepare_workspace", prepare_workspace_node)
     builder.add_node("develop", develop_node)
+    builder.add_node("test", test_node)
     builder.add_node("finalize", finalize_node)
     builder.add_edge(START, "triage")
     builder.add_conditional_edges(
@@ -228,7 +245,12 @@ def compile_triage_graph(
         route_after_workspace,
         {"develop": "develop", "finalize": "finalize"},
     )
-    builder.add_edge("develop", "finalize")
+    builder.add_conditional_edges(
+        "develop",
+        route_after_develop,
+        {"test": "test", "finalize": "finalize"},
+    )
+    builder.add_edge("test", "finalize")
     builder.add_edge("finalize", END)
     options: dict[str, Any] = {}
     if interrupt_after:
@@ -247,6 +269,8 @@ async def run_triage(
     repo_id: UUID | None = None,
     repository_tools: RepositoryTools | None = None,
     workspace_root: Path | None = None,
+    runner_root: Path | None = None,
+    runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     repository_error: str | None = None,
 ) -> TriageOutcome:
@@ -266,6 +290,8 @@ async def run_triage(
             lease_lost=lease_lost,
             repository_tools=repository_tools,
             workspace_root=workspace_root,
+            runner_root=runner_root,
+            runner_wait_seconds=runner_wait_seconds,
             max_tool_calls=max_tool_calls,
             repository_error=repository_error,
         )
@@ -288,6 +314,8 @@ async def run_claimed_triage(
     repo_id: UUID | None = None,
     repository_tools: RepositoryTools | None = None,
     workspace_root: Path | None = None,
+    runner_root: Path | None = None,
+    runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     repository_error: str | None = None,
     resume_decision: dict[str, Any] | None = None,
@@ -314,6 +342,8 @@ async def run_claimed_triage(
                     lease_lost=lease_lost,
                     repository_tools=repository_tools,
                     workspace_root=workspace_root,
+                    runner_root=runner_root,
+                    runner_wait_seconds=runner_wait_seconds,
                     max_tool_calls=max_tool_calls,
                     repository_error=repository_error,
                 )
@@ -338,6 +368,8 @@ async def run_claimed_triage(
                     lease_lost=lease_lost,
                     repository_tools=repository_tools,
                     workspace_root=workspace_root,
+                    runner_root=runner_root,
+                    runner_wait_seconds=runner_wait_seconds,
                     max_tool_calls=max_tool_calls,
                     repository_error=repository_error,
                 )
@@ -357,6 +389,8 @@ async def run_claimed_triage(
         repo_id=repo_id,
         repository_tools=repository_tools,
         workspace_root=workspace_root,
+        runner_root=runner_root,
+        runner_wait_seconds=runner_wait_seconds,
         max_tool_calls=max_tool_calls,
         repository_error=repository_error,
     )
@@ -373,6 +407,8 @@ async def invoke_triage(
     lease_lost: Callable[[], bool] | None = None,
     repository_tools: RepositoryTools | None = None,
     workspace_root: Path | None = None,
+    runner_root: Path | None = None,
+    runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     repository_error: str | None = None,
 ) -> dict[str, Any]:
@@ -398,6 +434,8 @@ async def invoke_triage(
             lease_lost=lease_lost,
             repository_tools=repository_tools,
             workspace_root=workspace_root,
+            runner_root=runner_root,
+            runner_wait_seconds=runner_wait_seconds,
             max_tool_calls=max_tool_calls,
             repository_error=repository_error,
         ),
@@ -462,6 +500,13 @@ def route_after_workspace(state: TriageState) -> str:
     if state.get("status") == "failed" or state.get("error") or not state.get("workspace"):
         return "finalize"
     return "develop"
+
+
+def route_after_develop(state: TriageState) -> str:
+    """Ask the runner for pytest only after a patch was applied."""
+    if state.get("status") == "failed" or state.get("error") or not state.get("patch"):
+        return "finalize"
+    return "test"
 
 
 def request_plan_approval(state: TriageState) -> dict[str, Any]:
@@ -588,6 +633,65 @@ def develop_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[
         raise LeaseLost()
     return {
         "patch": outcome.as_state(),
+        "error": None,
+        "failed_stage": None,
+        "status": "completed",
+    }
+
+
+def test_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:
+    """Wait for the runner. This process does not start pytest."""
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    context = runtime.context
+    if context.runner_root is None or context.workspace_root is None:
+        logger.error("tests rejected: unavailable")
+        return _failed_update(RUNNER_UNAVAILABLE, stage=STAGE_TEST)
+    try:
+        task_id = UUID(str(state.get("task_id")))
+        workspace = workspace_from_state(state.get("workspace"), task_id=task_id)
+    except (TypeError, ValueError):
+        logger.error("tests rejected the workspace")
+        return _failed_update(RUNNER_REJECTED, stage=STAGE_TEST)
+    try:
+        patch_ready = _checked_patch(state.get("patch")) is not None
+    except ValueError:
+        return _failed_update(TEST_FAILURE, stage=STAGE_TEST)
+    if workspace is None or not patch_ready:
+        return _failed_update(TEST_FAILURE, stage=STAGE_TEST)
+    try:
+        worktree = require_workspace_root(context.workspace_root) / worktree_relative(task_id)
+    except Exception:
+        logger.error("tests rejected: unavailable")
+        return _failed_update(RUNNER_REJECTED, stage=STAGE_TEST)
+    if worktree.is_symlink() or not worktree.is_dir():
+        logger.error("tests rejected: unavailable")
+        return _failed_update(RUNNER_REJECTED, stage=STAGE_TEST)
+    try:
+        report = collect_test_report(
+            worktree=worktree,
+            runner_root=context.runner_root,
+            job_id=task_id,
+            wait_seconds=context.runner_wait_seconds,
+            lease_lost=context.lease_lost,
+        )
+    except StopForLease:
+        raise LeaseLost() from None
+    except RunnerUnavailable:
+        logger.error("tests rejected: unavailable")
+        return _failed_update(RUNNER_UNAVAILABLE, stage=STAGE_TEST)
+    except RunnerRejected:
+        logger.error("tests rejected: refused")
+        return _failed_update(RUNNER_REJECTED, stage=STAGE_TEST)
+    except Exception as exc:
+        logger.error("test node failed: %s", type(exc).__name__)
+        return _failed_update(TEST_FAILURE, stage=STAGE_TEST)
+    if report.job_id != task_id or report.status == TestStatus.INVALID_REQUEST:
+        return _failed_update(RUNNER_REJECTED, stage=STAGE_TEST)
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    return {
+        "tests": report.model_dump(mode="json"),
         "error": None,
         "failed_stage": None,
         "status": "completed",
@@ -731,6 +835,11 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
     except ValueError:
         logger.error("finalize rejected the patch payload")
         return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
+    try:
+        _accepted_tests(state, patch)
+    except ValueError:
+        logger.error("finalize rejected the test report")
+        return _failed_update(TEST_FAILURE, stage=STAGE_TEST)
     summary = checked.summary
     if plan is not None:
         summary = str(plan["plan"]["problem_statement"])
@@ -794,6 +903,10 @@ def outcome_from_state(state: TriageState) -> TriageOutcome:
         patch = _accepted_patch(state, plan, workspace)
     except ValueError:
         return failure_outcome(PATCH_FAILURE, stage=STAGE_DEVELOP)
+    try:
+        tests = _accepted_tests(state, patch)
+    except ValueError:
+        return failure_outcome(TEST_FAILURE, stage=STAGE_TEST)
     if plan is None or investigation is None:
         return TriageOutcome(
             status=TaskStatus.COMPLETED,
@@ -803,6 +916,7 @@ def outcome_from_state(state: TriageState) -> TriageOutcome:
         )
     body, accepted = _planned_body(checked, investigation, plan, approval, workspace)
     stored = _store_patch(body, patch)
+    stored_tests = _store_tests(body, tests)
     summary = accepted.problem_statement
     if patch is not None:
         summary = patch["summary"]
@@ -814,6 +928,7 @@ def outcome_from_state(state: TriageState) -> TriageOutcome:
         plan=accepted,
         workspace=workspace,
         patch=stored,
+        tests=stored_tests,
     )
 
 
@@ -933,6 +1048,50 @@ def _checked_patch(value: object) -> dict[str, Any] | None:
         "diff": diff,
         "proposal": proposal,
     }
+
+
+def _accepted_tests(state: dict[str, Any], patch: dict[str, Any] | None) -> TestReport | None:
+    """Return the runner report, or None when this task did not develop."""
+    report = _checked_tests(state.get("tests"))
+    if patch is None:
+        if report is not None:
+            raise ValueError("tests without a patch")
+        return None
+    if report is None:
+        raise ValueError("patch has no test report")
+    task_raw = state.get("task_id")
+    if not isinstance(task_raw, str) or str(report.job_id) != task_raw:
+        raise ValueError("test job does not match the task")
+    if report.status == TestStatus.INVALID_REQUEST:
+        raise ValueError("test runner rejected the job")
+    return report
+
+
+def _checked_tests(value: object) -> TestReport | None:
+    """Re-validate a stored report. None means this task did not ask the runner."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("test report is not an object")
+    try:
+        return TestReport.model_validate(value)
+    except ValidationError:
+        raise ValueError("test report is not valid") from None
+
+
+def _store_tests(body: dict[str, Any], report: TestReport | None) -> TestReport | None:
+    """Record the outcome on the task. Captured output stays in the artifact."""
+    if report is None:
+        return None
+    body["tests"] = {
+        "passed": report.status == TestStatus.PASSED,
+        "status": report.status.value,
+        "exit_code": report.exit_code,
+        "timed_out": report.timed_out,
+        "duration_ms": report.duration_ms,
+        "output_truncated": report.output_truncated,
+    }
+    return report
 
 
 def _store_patch(body: dict[str, Any], patch: dict[str, Any] | None) -> DevelopOutcome | None:
