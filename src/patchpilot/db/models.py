@@ -36,6 +36,7 @@ CANONICAL_PATH_MAX_LENGTH = 512
 ARTIFACT_TYPE_MAX_LENGTH = 32
 ARTIFACT_PATH_MAX_LENGTH = 200
 ARTIFACT_CHECKSUM_LENGTH = 64
+APPROVAL_REASON_MAX_LENGTH = 300
 
 
 class TaskStatus(enum.StrEnum):
@@ -301,3 +302,72 @@ class Artifact(Base):
 
     def __repr__(self) -> str:
         return f"Artifact(id={self.id!s}, type={self.artifact_type}, version={self.version})"
+
+
+class ApprovalStatus(enum.StrEnum):
+    """One human decision on a plan. Pending rows are the only open requests."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+approval_status_type = ENUM(
+    ApprovalStatus,
+    name="approval_status",
+    values_callable=_enum_values,
+    create_type=False,
+)
+
+
+class Approval(Base):
+    """A request to apply a stored plan. The graph pauses until this row is decided."""
+
+    __tablename__ = "approvals"
+    __table_args__ = (
+        CheckConstraint(
+            "plan_version >= 1 AND plan_version <= 1000",
+            name="ck_approvals_plan_version",
+        ),
+        CheckConstraint(
+            "reason IS NULL OR "
+            f"(char_length(reason) <= {APPROVAL_REASON_MAX_LENGTH} "
+            "AND length(btrim(reason)) > 0)",
+            name="ck_approvals_reason",
+        ),
+        CheckConstraint(
+            "(status = 'pending'::approval_status AND decided_at IS NULL AND reason IS NULL) "
+            "OR (status <> 'pending'::approval_status AND decided_at IS NOT NULL)",
+            name="ck_approvals_decision_state",
+        ),
+        Index("ix_approvals_task_id", "task_id"),
+        Index(
+            "uq_approvals_one_pending",
+            "task_id",
+            unique=True,
+            postgresql_where=text("status = 'pending'::approval_status"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("tasks.id", name="fk_approvals_task_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[ApprovalStatus] = mapped_column(approval_status_type, nullable=False)
+    plan_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str | None] = mapped_column(
+        String(APPROVAL_REASON_MAX_LENGTH),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=func.now(),
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def __repr__(self) -> str:
+        return f"Approval(id={self.id!s}, status={self.status})"

@@ -16,8 +16,11 @@ attempt resumes the LangGraph thread when a checkpoint exists, and otherwise
 replays triage. When the open attempt is already the last allowed attempt, the
 task is stored as ``failed`` with ``recovery_exhausted`` and is not claimed again.
 
-Events are append-only. Repeating a write with the same idempotency key does
-not change the stored payload.
+A plan that names a code change does not finish the run. The worker stores a
+pending approval, sets ``waiting_approval``, and ends the lease. A later claim
+resumes only after the decision row is stored. Events are append-only.
+Repeating a write with the same idempotency key does not change the stored
+payload.
 """
 
 from dataclasses import dataclass
@@ -31,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from patchpilot.artifacts import ArtifactStoreError
 from patchpilot.audit import (
+    APPROVAL_REQUESTED,
     ERROR_LEASE_EXPIRED,
     ERROR_MODEL,
     ERROR_RECOVERY_EXHAUSTED,
@@ -42,15 +46,19 @@ from patchpilot.audit import (
     STAGE_COMPLETED,
     STAGE_STARTED,
     TASK_COMPLETED,
+    TASK_REJECTED,
+    approval_requested_key,
     event_key,
     require_attempts,
     require_lease,
     require_stage,
     require_worker_id,
     task_completed_key,
+    task_rejected_key,
 )
-from patchpilot.db.models import Task, TaskRun, TaskStatus
+from patchpilot.db.models import Task, TaskEvent, TaskRun, TaskStatus
 from patchpilot.llm.plan import ChangePlan
+from patchpilot.repositories.approvals import insert_pending_approval
 from patchpilot.repositories.artifacts import persist_plan
 from patchpilot.repositories.events import append_event
 
@@ -59,6 +67,7 @@ from patchpilot.repositories.events import append_event
 _STAGE_TRIAGE = "triage"
 _STAGE_INVESTIGATE = "investigate"
 _STAGE_PLAN = "plan"
+_STAGE_APPROVAL = "request_plan_approval"
 _STAGE_FINALIZE = "finalize"
 
 
@@ -302,41 +311,27 @@ class JobRepository:
         """Store a terminal outcome when this worker still holds the lease.
 
         Return False when another worker has taken the run. The caller must not
-        treat that as a failure of the task. A completed plan is written to the
-        artifact volume before this commit. `ArtifactStoreError` means nothing
-        was committed.
+        treat that as a failure of the task. A completed or rejected plan is
+        written to the artifact volume before this commit. `ArtifactStoreError`
+        means nothing was committed.
         """
-        if status not in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
-            raise ValueError("triage persistence only accepts completed or failed")
+        if status not in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.REJECTED}:
+            raise ValueError("a finished run must be completed, rejected, or failed")
         checked_stage = require_stage(stage)
         if not result_summary.strip():
             raise ValueError("result_summary must not be blank")
-        task = await self._session.scalar(
-            select(Task).where(Task.id == claimed.id).with_for_update()
-        )
-        if task is None or task.status != TaskStatus.RUNNING:
-            await self._session.rollback()
-            return False
-        owned = await self._session.scalar(
-            select(TaskRun.id).where(
-                TaskRun.id == claimed.run_id,
-                TaskRun.worker_id == claimed.worker_id,
-                TaskRun.ended_at.is_(None),
-                TaskRun.lease_until > func.now(),
-            )
-        )
-        if owned is None:
+        task = await self._owned_running_task(claimed)
+        if task is None:
             await self._session.rollback()
             return False
         stored = dict(result_json)
-        if plan is not None and status == TaskStatus.COMPLETED:
-            if artifacts_root is None:
-                raise ArtifactStoreError
-            version = await persist_plan(self._session, artifacts_root, claimed.id, plan)
-            meta = stored.get("plan")
-            plan_meta = dict(meta) if isinstance(meta, dict) else {}
-            plan_meta["version"] = version
-            stored["plan"] = plan_meta
+        if plan is not None and status in {TaskStatus.COMPLETED, TaskStatus.REJECTED}:
+            stored = await self._with_plan_version(
+                claimed.id,
+                stored,
+                plan,
+                artifacts_root,
+            )
         task.status = status
         task.stage = checked_stage
         task.result_summary = result_summary
@@ -346,31 +341,78 @@ class JobRepository:
             .where(TaskRun.id == claimed.run_id)
             .values(
                 ended_at=func.now(),
-                error_code=None if status == TaskStatus.COMPLETED else ERROR_MODEL,
+                error_code=ERROR_MODEL if status == TaskStatus.FAILED else None,
             )
         )
         if status == TaskStatus.FAILED:
-            await append_event(
-                self._session,
-                task_id=task.id,
-                run_id=claimed.run_id,
+            await self._record_model_error(
+                task.id,
+                claimed,
                 stage=checked_stage,
-                event_type=MODEL_ERROR,
-                payload={
-                    "attempt": claimed.attempt,
-                    "error_code": ERROR_MODEL,
-                    "message": result_summary,
-                },
-                idempotency_key=event_key(
-                    task_id=task.id,
-                    run_id=claimed.run_id,
-                    event_type=MODEL_ERROR,
-                    stage=checked_stage,
-                ),
-                ordinal=0,
+                result_summary=result_summary,
             )
         else:
-            await self._record_success(task.id, claimed, stored)
+            await self._record_success(
+                task.id,
+                claimed,
+                stored,
+                terminal=status,
+            )
+        await self._session.commit()
+        return True
+
+    async def pause_for_approval(
+        self,
+        claimed: ClaimedTask,
+        *,
+        stage: str,
+        result_summary: str,
+        result_json: dict[str, Any],
+        plan: ChangePlan,
+        artifacts_root: Path | None,
+    ) -> bool:
+        """Store the plan, open one approval, and release the lease.
+
+        Return False when this worker no longer holds the run. The checkout is
+        not written. A second pause for the same task reuses the pending row.
+        """
+        checked_stage = require_stage(stage)
+        if not result_summary.strip():
+            raise ValueError("result_summary must not be blank")
+        task = await self._owned_running_task(claimed)
+        if task is None:
+            await self._session.rollback()
+            return False
+        stored = await self._with_plan_version(
+            claimed.id,
+            dict(result_json),
+            plan,
+            artifacts_root,
+        )
+        version = stored.get("plan", {}).get("version")
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ArtifactStoreError
+        approval = await insert_pending_approval(
+            self._session,
+            task_id=task.id,
+            plan_version=version,
+        )
+        task.status = TaskStatus.WAITING_APPROVAL
+        task.stage = checked_stage
+        task.result_summary = result_summary
+        task.result_json = stored
+        await self._session.execute(
+            update(TaskRun)
+            .where(TaskRun.id == claimed.run_id)
+            .values(ended_at=func.now(), error_code=None)
+        )
+        await self._record_success(
+            task.id,
+            claimed,
+            stored,
+            waiting=True,
+            approval_id=approval.id,
+        )
         await self._session.commit()
         return True
 
@@ -451,140 +493,236 @@ class JobRepository:
             ordinal=0,
         )
 
+    async def _owned_running_task(self, claimed: ClaimedTask) -> Task | None:
+        task = await self._session.scalar(
+            select(Task).where(Task.id == claimed.id).with_for_update()
+        )
+        if task is None or task.status != TaskStatus.RUNNING:
+            return None
+        owned = await self._session.scalar(
+            select(TaskRun.id).where(
+                TaskRun.id == claimed.run_id,
+                TaskRun.worker_id == claimed.worker_id,
+                TaskRun.ended_at.is_(None),
+                TaskRun.lease_until > func.now(),
+            )
+        )
+        if owned is None:
+            return None
+        return task
+
+    async def _with_plan_version(
+        self,
+        task_id: UUID,
+        stored: dict[str, Any],
+        plan: ChangePlan,
+        artifacts_root: Path | None,
+    ) -> dict[str, Any]:
+        if artifacts_root is None:
+            raise ArtifactStoreError
+        version = await persist_plan(self._session, artifacts_root, task_id, plan)
+        meta = stored.get("plan")
+        plan_meta = dict(meta) if isinstance(meta, dict) else {}
+        plan_meta["version"] = version
+        stored["plan"] = plan_meta
+        return stored
+
+    async def _record_model_error(
+        self,
+        task_id: UUID,
+        claimed: ClaimedTask,
+        *,
+        stage: str,
+        result_summary: str,
+    ) -> None:
+        await append_event(
+            self._session,
+            task_id=task_id,
+            run_id=claimed.run_id,
+            stage=stage,
+            event_type=MODEL_ERROR,
+            payload={
+                "attempt": claimed.attempt,
+                "error_code": ERROR_MODEL,
+                "message": result_summary,
+            },
+            idempotency_key=event_key(
+                task_id=task_id,
+                run_id=claimed.run_id,
+                event_type=MODEL_ERROR,
+                stage=stage,
+            ),
+            ordinal=0,
+        )
+
     async def _record_success(
         self,
         task_id: UUID,
         claimed: ClaimedTask,
         result_json: dict[str, Any],
+        *,
+        waiting: bool = False,
+        approval_id: UUID | None = None,
+        terminal: TaskStatus = TaskStatus.COMPLETED,
     ) -> None:
         attempt = {"attempt": claimed.attempt}
         ordinal = 0
-        await append_event(
-            self._session,
-            task_id=task_id,
-            run_id=claimed.run_id,
-            stage=_STAGE_TRIAGE,
-            event_type=STAGE_COMPLETED,
-            payload=attempt,
-            idempotency_key=event_key(
-                task_id=task_id,
-                run_id=claimed.run_id,
-                event_type=STAGE_COMPLETED,
-                stage=_STAGE_TRIAGE,
-            ),
-            ordinal=ordinal,
-        )
-        ordinal += 1
-        investigation = _investigation_payload(result_json, claimed.attempt)
-        if investigation is not None:
+
+        async def emit(
+            *,
+            stage: str,
+            event_type: str,
+            payload: dict[str, Any],
+            key: str,
+            run_id: UUID | None,
+        ) -> None:
+            nonlocal ordinal
             await append_event(
                 self._session,
                 task_id=task_id,
+                run_id=run_id,
+                stage=stage,
+                event_type=event_type,
+                payload=payload,
+                idempotency_key=key,
+                ordinal=ordinal,
+            )
+            ordinal += 1
+
+        if not await self._stage_completed(task_id, _STAGE_TRIAGE):
+            await emit(
+                stage=_STAGE_TRIAGE,
+                event_type=STAGE_COMPLETED,
+                payload=attempt,
+                key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_COMPLETED,
+                    stage=_STAGE_TRIAGE,
+                ),
                 run_id=claimed.run_id,
+            )
+        investigation = _investigation_payload(result_json, claimed.attempt)
+        if investigation is not None and not await self._stage_completed(
+            task_id, _STAGE_INVESTIGATE
+        ):
+            await emit(
                 stage=_STAGE_INVESTIGATE,
                 event_type=STAGE_STARTED,
                 payload=attempt,
-                idempotency_key=event_key(
+                key=event_key(
                     task_id=task_id,
                     run_id=claimed.run_id,
                     event_type=STAGE_STARTED,
                     stage=_STAGE_INVESTIGATE,
                 ),
-                ordinal=ordinal,
-            )
-            ordinal += 1
-            await append_event(
-                self._session,
-                task_id=task_id,
                 run_id=claimed.run_id,
+            )
+            await emit(
                 stage=_STAGE_INVESTIGATE,
                 event_type=STAGE_COMPLETED,
                 payload=investigation,
-                idempotency_key=event_key(
+                key=event_key(
                     task_id=task_id,
                     run_id=claimed.run_id,
                     event_type=STAGE_COMPLETED,
                     stage=_STAGE_INVESTIGATE,
                 ),
-                ordinal=ordinal,
-            )
-            ordinal += 1
-        plan = _plan_payload(result_json, claimed.attempt)
-        if plan is not None:
-            await append_event(
-                self._session,
-                task_id=task_id,
                 run_id=claimed.run_id,
+            )
+        plan = _plan_payload(result_json, claimed.attempt)
+        if plan is not None and not await self._stage_completed(task_id, _STAGE_PLAN):
+            await emit(
                 stage=_STAGE_PLAN,
                 event_type=STAGE_STARTED,
                 payload=attempt,
-                idempotency_key=event_key(
+                key=event_key(
                     task_id=task_id,
                     run_id=claimed.run_id,
                     event_type=STAGE_STARTED,
                     stage=_STAGE_PLAN,
                 ),
-                ordinal=ordinal,
-            )
-            ordinal += 1
-            await append_event(
-                self._session,
-                task_id=task_id,
                 run_id=claimed.run_id,
+            )
+            await emit(
                 stage=_STAGE_PLAN,
                 event_type=STAGE_COMPLETED,
                 payload=plan,
-                idempotency_key=event_key(
+                key=event_key(
                     task_id=task_id,
                     run_id=claimed.run_id,
                     event_type=STAGE_COMPLETED,
                     stage=_STAGE_PLAN,
                 ),
-                ordinal=ordinal,
+                run_id=claimed.run_id,
             )
-            ordinal += 1
-        await append_event(
-            self._session,
-            task_id=task_id,
-            run_id=claimed.run_id,
+        if waiting:
+            paths = plan.get("paths") if isinstance(plan, dict) else []
+            await emit(
+                stage=_STAGE_APPROVAL,
+                event_type=APPROVAL_REQUESTED,
+                payload={
+                    "attempt": claimed.attempt,
+                    "plan_version": None if plan is None else plan.get("version"),
+                    "approval_id": None if approval_id is None else str(approval_id),
+                    "paths": paths if isinstance(paths, list) else [],
+                },
+                key=approval_requested_key(task_id),
+                run_id=claimed.run_id,
+            )
+            return
+        await emit(
             stage=_STAGE_FINALIZE,
             event_type=STAGE_STARTED,
             payload=attempt,
-            idempotency_key=event_key(
+            key=event_key(
                 task_id=task_id,
                 run_id=claimed.run_id,
                 event_type=STAGE_STARTED,
                 stage=_STAGE_FINALIZE,
             ),
-            ordinal=ordinal,
-        )
-        ordinal += 1
-        await append_event(
-            self._session,
-            task_id=task_id,
             run_id=claimed.run_id,
+        )
+        await emit(
             stage=_STAGE_FINALIZE,
             event_type=STAGE_COMPLETED,
             payload=attempt,
-            idempotency_key=event_key(
+            key=event_key(
                 task_id=task_id,
                 run_id=claimed.run_id,
                 event_type=STAGE_COMPLETED,
                 stage=_STAGE_FINALIZE,
             ),
-            ordinal=ordinal,
+            run_id=claimed.run_id,
         )
-        ordinal += 1
-        await append_event(
-            self._session,
-            task_id=task_id,
-            run_id=None,
+        if terminal == TaskStatus.REJECTED:
+            await emit(
+                stage=_STAGE_FINALIZE,
+                event_type=TASK_REJECTED,
+                payload={**attempt, "status": TaskStatus.REJECTED.value},
+                key=task_rejected_key(task_id),
+                run_id=None,
+            )
+            return
+        await emit(
             stage=_STAGE_FINALIZE,
             event_type=TASK_COMPLETED,
             payload={**attempt, "status": TaskStatus.COMPLETED.value},
-            idempotency_key=task_completed_key(task_id),
-            ordinal=ordinal,
+            key=task_completed_key(task_id),
+            run_id=None,
         )
+
+    async def _stage_completed(self, task_id: UUID, stage: str) -> bool:
+        found = await self._session.scalar(
+            select(TaskEvent.id)
+            .where(
+                TaskEvent.task_id == task_id,
+                TaskEvent.stage == stage,
+                TaskEvent.event_type == STAGE_COMPLETED,
+            )
+            .limit(1)
+        )
+        return found is not None
 
     async def _insert_run(
         self,

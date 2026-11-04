@@ -2,8 +2,11 @@
 
 A task that names a registered repository is investigated after triage, then
 planned. The tools open only that checkout, and only after the claim transaction
-commits. The planner does not write that checkout. A completed plan is stored
-as a versioned artifact.
+commits. The planner does not write that checkout. A plan that names a code
+change pauses on a LangGraph interrupt: the worker stores a pending approval,
+sets `waiting_approval`, and releases the lease. A decision queues the same
+task again. The next claim resumes that thread with `Command(resume=...)`.
+A declined plan is stored as a versioned artifact and completes without asking.
 
 The process owns the LangGraph checkpointer connection: it opens one after
 checkpoint setup and closes it when the loop stops. A claim stores a lease on
@@ -34,6 +37,7 @@ from patchpilot.db.session import create_engine, create_session_factory
 from patchpilot.leases import LeaseKeeper
 from patchpilot.llm.factory import create_provider
 from patchpilot.llm.provider import LLMProvider
+from patchpilot.repositories.approvals import ApprovalRepository
 from patchpilot.repositories.jobs import ClaimedTask, JobRepository
 from patchpilot.repositories.repos import RepoRepository
 from patchpilot.source.errors import SourceError
@@ -41,11 +45,13 @@ from patchpilot.source.tools import RepositoryTools, open_repository_tools
 from patchpilot.workflow.graph import (
     ARTIFACT_FAILURE,
     GENERIC_FAILURE,
+    PLAN_FAILURE,
     REPOSITORY_UNAVAILABLE,
     STAGE_PLAN,
     STAGE_TRIAGE,
     CompiledStateGraph,
     LeaseLost,
+    TriageOutcome,
     compile_triage_graph,
     failure_outcome,
     run_claimed_triage,
@@ -277,6 +283,7 @@ async def _finish(
 ) -> None:
     logger.info("claimed task=%s", claimed.id)
     tools, repository_error = await _open_tools(session_factory, claimed, repository_root)
+    resume_decision = await _load_resume_decision(session_factory, claimed.id)
     keeper = None
     if database_url is not None:
         keeper = LeaseKeeper(
@@ -299,6 +306,7 @@ async def _finish(
                 repository_tools=tools,
                 max_tool_calls=max_tool_calls,
                 repository_error=repository_error,
+                resume_decision=resume_decision,
             )
         except LeaseLost:
             logger.warning("lease lost task=%s", claimed.id)
@@ -313,7 +321,15 @@ async def _finish(
     if lost:
         logger.warning("lease lost task=%s", claimed.id)
         return
-    plan = outcome.plan if outcome.status == TaskStatus.COMPLETED else None
+    if outcome.status == TaskStatus.WAITING_APPROVAL:
+        await _pause(
+            session_factory,
+            claimed,
+            outcome,
+            artifacts_root=artifacts_root,
+        )
+        return
+    plan = outcome.plan if outcome.status in {TaskStatus.COMPLETED, TaskStatus.REJECTED} else None
     try:
         async with session_factory() as session:
             saved = await JobRepository(session).finish_run(
@@ -345,6 +361,62 @@ async def _finish(
         outcome.status.value,
         outcome.stage,
     )
+
+
+async def _pause(
+    session_factory: async_sessionmaker[AsyncSession],
+    claimed: ClaimedTask,
+    outcome: TriageOutcome,
+    *,
+    artifacts_root: Path | None,
+) -> None:
+    """Persist the plan and release the lease. A lost lease leaves the task running."""
+    if outcome.plan is None:
+        outcome = failure_outcome(PLAN_FAILURE, stage=STAGE_PLAN)
+        async with session_factory() as session:
+            saved = await JobRepository(session).finish_run(
+                claimed,
+                status=outcome.status,
+                stage=outcome.stage,
+                result_summary=outcome.result_summary,
+                result_json=outcome.result_json,
+            )
+        if not saved:
+            logger.warning("discarded result task=%s run=%s", claimed.id, claimed.run_id)
+        return
+    try:
+        async with session_factory() as session:
+            saved = await JobRepository(session).pause_for_approval(
+                claimed,
+                stage=outcome.stage,
+                result_summary=outcome.result_summary,
+                result_json=outcome.result_json,
+                plan=outcome.plan,
+                artifacts_root=artifacts_root,
+            )
+    except ArtifactStoreError:
+        logger.error("plan artifact failed task=%s", claimed.id)
+        failed = failure_outcome(ARTIFACT_FAILURE, stage=STAGE_PLAN)
+        async with session_factory() as session:
+            saved = await JobRepository(session).finish_run(
+                claimed,
+                status=failed.status,
+                stage=failed.stage,
+                result_summary=failed.result_summary,
+                result_json=failed.result_json,
+            )
+    if not saved:
+        logger.warning("discarded result task=%s run=%s", claimed.id, claimed.run_id)
+        return
+    logger.info("waiting for approval task=%s", claimed.id)
+
+
+async def _load_resume_decision(
+    session_factory: async_sessionmaker[AsyncSession],
+    task_id: UUID,
+) -> dict[str, object] | None:
+    async with session_factory() as session:
+        return await ApprovalRepository(session).resume_value(task_id)
 
 
 async def _open_tools(

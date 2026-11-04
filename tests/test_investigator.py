@@ -306,8 +306,8 @@ async def test_worker_investigates_the_registered_demo_bug(
     fetched = client.get(f"/api/v1/tasks/{task_id}")
     assert fetched.status_code == 200
     body = fetched.json()
-    assert body["status"] == "completed"
-    assert body["stage"] == "finalize"
+    assert body["status"] == "waiting_approval"
+    assert body["stage"] == "request_plan_approval"
     stored = json.dumps(body["result_json"])
     assert DOCSTRING not in stored
     assert str(DEMO_ROOT) not in stored
@@ -333,9 +333,7 @@ async def test_worker_investigates_the_registered_demo_bug(
         "investigate",
         "plan",
         "plan",
-        "finalize",
-        "finalize",
-        "finalize",
+        "request_plan_approval",
     ]
     completed = items[3]
     assert completed["event_type"] == "stage_completed"

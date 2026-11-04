@@ -21,6 +21,9 @@ STAGE_STARTED = "stage_started"
 STAGE_COMPLETED = "stage_completed"
 MODEL_ERROR = "model_error"
 TASK_COMPLETED = "task_completed"
+TASK_REJECTED = "task_rejected"
+APPROVAL_REQUESTED = "approval_requested"
+APPROVAL_DECIDED = "approval_decided"
 RETRY = "retry"
 RECOVERY = "recovery"
 
@@ -30,6 +33,9 @@ EVENT_TYPES = frozenset(
         STAGE_COMPLETED,
         MODEL_ERROR,
         TASK_COMPLETED,
+        TASK_REJECTED,
+        APPROVAL_REQUESTED,
+        APPROVAL_DECIDED,
         RETRY,
         RECOVERY,
     }
@@ -118,7 +124,26 @@ def event_key(*, task_id: UUID, run_id: UUID | None, event_type: str, stage: str
 
 def task_completed_key(task_id: UUID) -> str:
     """One completion row per task, including a replay of the same finish."""
-    key = f"{task_id}:task_completed"
+    return _task_key(task_id, "task_completed")
+
+
+def task_rejected_key(task_id: UUID) -> str:
+    """One rejection row per task, including a replay of the same finish."""
+    return _task_key(task_id, "task_rejected")
+
+
+def approval_requested_key(task_id: UUID) -> str:
+    """One pause row per task. Parking again after a crash does not insert another."""
+    return _task_key(task_id, "approval_requested")
+
+
+def approval_decided_key(task_id: UUID) -> str:
+    """One decision row per task. A repeated submit does not insert another."""
+    return _task_key(task_id, "approval_decided")
+
+
+def _task_key(task_id: UUID, name: str) -> str:
+    key = f"{task_id}:{name}"
     if len(key) > IDEMPOTENCY_KEY_MAX_LENGTH:
         raise ValueError("idempotency key is too long")
     return key

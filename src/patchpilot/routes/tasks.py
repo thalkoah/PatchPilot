@@ -9,13 +9,20 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from patchpilot.artifacts import PLAN_SCHEMA_VERSION, ArtifactStoreError, load_plan_file
 from patchpilot.config import get_settings
 from patchpilot.dependencies import (
+    get_approval_repository,
     get_artifact_repository,
     get_event_repository,
     get_task_repository,
 )
+from patchpilot.repositories.approvals import (
+    ApprovalConflict,
+    ApprovalNotFound,
+    ApprovalRepository,
+)
 from patchpilot.repositories.artifacts import ArtifactRepository
 from patchpilot.repositories.events import EventRepository
 from patchpilot.repositories.tasks import TaskRepository, UnregisteredRepositoryError
+from patchpilot.schemas.approvals import ApprovalList, ApprovalResponse, DecisionCreate
 from patchpilot.schemas.events import EventList, EventResponse
 from patchpilot.schemas.plans import PlanResponse
 from patchpilot.schemas.tasks import (
@@ -32,6 +39,7 @@ router = APIRouter(prefix="/tasks", tags=["tasks"])
 RepositoryDep = Annotated[TaskRepository, Depends(get_task_repository)]
 EventRepositoryDep = Annotated[EventRepository, Depends(get_event_repository)]
 ArtifactRepositoryDep = Annotated[ArtifactRepository, Depends(get_artifact_repository)]
+ApprovalRepositoryDep = Annotated[ApprovalRepository, Depends(get_approval_repository)]
 
 
 @router.post("", status_code=201, response_model=TaskResponse)
@@ -120,3 +128,49 @@ async def get_task_plan(
         created_at=row.created_at,
         plan=plan,
     )
+
+
+@router.get("/{task_id}/approvals", response_model=ApprovalList)
+async def list_task_approvals(
+    task_id: UUID,
+    repository: RepositoryDep,
+    approvals: ApprovalRepositoryDep,
+) -> ApprovalList:
+    """Return approval requests for one task. Pending rows are still undecided."""
+    task = await repository.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    rows = await approvals.list_for_task(task_id)
+    return ApprovalList(items=[ApprovalResponse.model_validate(row) for row in rows])
+
+
+@router.post("/{task_id}/decisions", response_model=ApprovalResponse)
+async def decide_task(
+    task_id: UUID,
+    body: DecisionCreate,
+    repository: RepositoryDep,
+    approvals: ApprovalRepositoryDep,
+) -> ApprovalResponse:
+    """Record one approval decision and queue the same thread to resume.
+
+    The handler does not call a model and does not write a repository checkout.
+    Repeating the stored decision returns that row and does not queue another run.
+    """
+    task = await repository.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    try:
+        view = await approvals.decide(
+            task_id,
+            body.approval_id,
+            body.decision,
+            body.reason,
+        )
+    except ApprovalNotFound:
+        raise HTTPException(status_code=404, detail="Approval not found") from None
+    except ApprovalConflict:
+        raise HTTPException(
+            status_code=409,
+            detail="Approval already has a different decision",
+        ) from None
+    return ApprovalResponse.model_validate(view)

@@ -430,3 +430,56 @@ The running Compose stack was left as it was. It does not include this migration
 ### Next task
 
 Task 10 — Human approval with LangGraph interrupt/resume.
+
+## Task 10 — Human approval with LangGraph interrupt/resume
+
+Status: complete (2026-11-04).
+
+A plan that names a code change follows `plan -> request_plan_approval -> finalize`. `request_plan_approval` calls LangGraph `interrupt()` and does not write the database or the checkout before that call, because resume runs the node from the top. The worker then stores the plan artifact, inserts one pending `approvals` row, sets the task to `waiting_approval`, writes `approval_requested`, and ends the lease.
+
+`GET /api/v1/tasks/{id}/approvals` lists the rows. `POST /api/v1/tasks/{id}/decisions` takes `approval_id`, `decision` (`approve` or `reject`), and an optional reason. The same decision again returns the stored row and does not queue another run. A different decision is HTTP 409. A new decision sets the task back to `queued` and writes `approval_decided`. The next claim resumes the same thread id with `Command(resume=...)`.
+
+Approval completes the task and does not apply a patch. Rejection is terminal `rejected`, with the reason as the summary, and writes `task_rejected`. A declined plan never opens an approval. Alembic head is `0005_approvals`.
+
+### Evidence
+
+`uv run pytest` — 190 passed in 18.84s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 95 files already formatted.
+
+The approve test closes the checkpointer after the pause, opens a new one, and sees the task still `waiting_approval` with a checkpoint row for that thread id. A second worker poll claims nothing. Approving twice keeps the first reason. A later reject is HTTP 409. The resumed worker finishes `completed` without another model call. `examples/demo_service` is byte-for-byte unchanged, including the absence of `tests/test_unknown_tier_added.py`. The event list has one `approval_requested`, one `approval_decided`, and one `task_completed`. The `approvals` table has one row.
+
+The reject test records the reason, ignores a second reject, refuses an approve with HTTP 409, and ends `rejected`. There is no `task_completed` event. The checkout snapshot matches the one taken before the run.
+
+An ambiguous report still completes with `can_proceed` false and `GET /approvals` returns `{"items": []}`. An unknown approval id is HTTP 404. `decision: "ship"` is HTTP 422 and leaves the task `queued`.
+
+The running Compose stack was left as it was. It does not include this migration or the approval node until the next image rebuild recreates the API and worker.
+
+### Changed files
+
+- `alembic/versions/20261104_0005_approvals.py` — `approvals`
+- `src/patchpilot/db/models.py` — `Approval`
+- `src/patchpilot/repositories/approvals.py`, `schemas/approvals.py`, `routes/tasks.py` — list and decide
+- `src/patchpilot/workflow/graph.py` — `request_plan_approval` and `Command(resume=...)`
+- `src/patchpilot/repositories/jobs.py`, `worker.py` — pause, release the lease, resume
+- `src/patchpilot/audit.py` — `approval_requested`, `approval_decided`, `task_rejected`
+- `tests/test_approvals.py`, plus planner, investigator, workflow, and checkpoint updates
+- `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` was not executed. The Compose containers were left running and do not include this migration or the approval node yet.
+- Restart was a new checkpointer connection and a new worker poll against the same database. The API and worker containers were not recreated.
+- Host Ollama was not asked to plan. Approve, reject, and the repeated decision were exercised with `FakeProvider`.
+- An approved plan is a completed task. This milestone does not create a worktree or apply a patch. The checkout is unchanged after approval and after rejection.
+- `GET /approvals` returns pending and decided rows. An unknown task is HTTP 404. A task with no request returns an empty list.
+- One task has at most one pending approval. A second pause reuses that row.
+- The optional reason is at most 300 characters. A repeated decision keeps the first reason.
+- A decision is accepted only while the task is `waiting_approval`. The same decision after the task has moved on returns the stored row and does not queue another run.
+- If resume still reports an interrupt, the task is stored as `failed` instead of being parked again.
+
+### Next task
+
+Task 11 — Isolated Git workspace and immutable baseline.

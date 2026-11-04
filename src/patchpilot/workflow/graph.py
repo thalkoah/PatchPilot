@@ -1,10 +1,15 @@
 """Triage workflow.
 
 A task with no repository follows `START -> triage -> finalize -> END`. A task
-with a repo_id follows `START -> triage -> investigate -> plan -> finalize -> END`.
+with a repo_id follows `START -> triage -> investigate -> plan`, then either
+`finalize` or `request_plan_approval -> finalize`. The approval node runs only
+when the plan names a code change. It calls `interrupt()` and does no I/O
+before that call, because resume runs the node from the top.
+
 The investigate node is the only place that reads a checkout. The plan node
 proposes paths and does not write them. Neither node runs when triage failed,
-and plan does not run when investigation failed.
+and plan does not run when investigation failed. Nothing in this graph writes
+the registered checkout.
 
 The worker compiles this graph with an AsyncPostgresSaver. The task UUID is the
 LangGraph thread id. Checkpoint rows are not the business task record: the
@@ -24,13 +29,14 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
+from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
 from patchpilot.agents.errors import StopForLease
 from patchpilot.agents.investigator import InvestigatorAgent
 from patchpilot.agents.limits import DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS
 from patchpilot.agents.planner import PlannerAgent
-from patchpilot.db.models import TaskStatus
+from patchpilot.db.models import APPROVAL_REASON_MAX_LENGTH, TaskStatus
 from patchpilot.llm.errors import LLMError
 from patchpilot.llm.investigation import InvestigationReport
 from patchpilot.llm.plan import ChangePlan
@@ -43,19 +49,23 @@ logger = logging.getLogger(__name__)
 STAGE_TRIAGE = "triage"
 STAGE_INVESTIGATE = "investigate"
 STAGE_PLAN = "plan"
+STAGE_APPROVAL = "request_plan_approval"
 STAGE_FINALIZE = "finalize"
 GENERIC_FAILURE = "Triage failed before a valid result was produced."
 INVESTIGATION_FAILURE = "Investigation failed before a valid report was produced."
 PLAN_FAILURE = "Planning failed before a valid change plan was produced."
+APPROVAL_FAILURE = "Approval resume did not continue the workflow."
 ARTIFACT_FAILURE = "The plan artifact could not be stored."
 REPOSITORY_UNAVAILABLE = "The registered repository could not be opened."
+REJECTED_SUMMARY = "The plan was rejected."
 MAX_FAILURE_CHARS = 500
-_FAILURE_STAGES = frozenset({STAGE_TRIAGE, STAGE_INVESTIGATE, STAGE_PLAN})
+_FAILURE_STAGES = frozenset({STAGE_TRIAGE, STAGE_INVESTIGATE, STAGE_PLAN, STAGE_APPROVAL})
+_INTERRUPT = "__interrupt__"
 # Persist the checkpoint before the next node. "async" can still be in flight
 # when a node, or the process, ends.
 CHECKPOINT_DURABILITY = "sync"
 
-WorkflowStatus = Literal["running", "completed", "failed"]
+WorkflowStatus = Literal["running", "completed", "failed", "rejected"]
 
 
 class TriageState(TypedDict):
@@ -68,6 +78,7 @@ class TriageState(TypedDict):
     triage: dict[str, Any] | None
     investigation: dict[str, Any] | None
     plan: dict[str, Any] | None
+    approval: dict[str, Any] | None
     result_summary: str | None
     error: str | None
     failed_stage: str | None
@@ -125,6 +136,7 @@ def initial_triage_state(
         "triage": None,
         "investigation": None,
         "plan": None,
+        "approval": None,
         "result_summary": None,
         "error": None,
         "failed_stage": None,
@@ -150,6 +162,7 @@ def compile_triage_graph(
     builder.add_node("triage", triage_node)
     builder.add_node("investigate", investigate_node)
     builder.add_node("plan", plan_node)
+    builder.add_node("request_plan_approval", request_plan_approval)
     builder.add_node("finalize", finalize_node)
     builder.add_edge(START, "triage")
     builder.add_conditional_edges(
@@ -162,7 +175,12 @@ def compile_triage_graph(
         route_after_investigate,
         {"plan": "plan", "finalize": "finalize"},
     )
-    builder.add_edge("plan", "finalize")
+    builder.add_conditional_edges(
+        "plan",
+        route_after_plan,
+        {"request_plan_approval": "request_plan_approval", "finalize": "finalize"},
+    )
+    builder.add_edge("request_plan_approval", "finalize")
     builder.add_edge("finalize", END)
     options: dict[str, Any] = {}
     if interrupt_after:
@@ -221,14 +239,43 @@ async def run_claimed_triage(
     repository_tools: RepositoryTools | None = None,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     repository_error: str | None = None,
+    resume_decision: dict[str, Any] | None = None,
 ) -> TriageOutcome:
     """Resume a checkpointed thread, or start one when no checkpoint exists.
 
-    A finished thread returns its stored outcome and does not call the model again.
+    A thread paused on `interrupt()` stays paused until `resume_decision` is
+    passed to `Command(resume=...)`. A finished thread returns its stored
+    outcome and does not call the model again.
     """
     if graph.checkpointer:
-        existing = await read_thread_state(graph, task_id)
-        if existing:
+        snapshot = await graph.aget_state(thread_config(task_id))
+        if snapshot.interrupts:
+            if resume_decision is None:
+                values = snapshot.values if isinstance(snapshot.values, dict) else {}
+                return _pause_or_fail(dict(values))
+            try:
+                final = await invoke_triage(
+                    graph,
+                    None,
+                    task_id=task_id,
+                    provider=provider,
+                    resume_decision=resume_decision,
+                    lease_lost=lease_lost,
+                    repository_tools=repository_tools,
+                    max_tool_calls=max_tool_calls,
+                    repository_error=repository_error,
+                )
+            except LeaseLost:
+                raise
+            except Exception as exc:
+                logger.error("approval resume failed: %s", type(exc).__name__)
+                return failure_outcome(GENERIC_FAILURE)
+            outcome = outcome_from_state(final)
+            if outcome.status == TaskStatus.WAITING_APPROVAL:
+                logger.error("approval resume paused again task=%s", task_id)
+                return failure_outcome(APPROVAL_FAILURE, stage=STAGE_APPROVAL)
+            return outcome
+        if isinstance(snapshot.values, dict) and snapshot.values:
             try:
                 final = await invoke_triage(
                     graph,
@@ -268,17 +315,28 @@ async def invoke_triage(
     task_id: UUID,
     provider: LLMProvider,
     resume: bool = False,
+    resume_decision: dict[str, Any] | None = None,
     lease_lost: Callable[[], bool] | None = None,
     repository_tools: RepositoryTools | None = None,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     repository_error: str | None = None,
 ) -> dict[str, Any]:
-    """Run or resume one thread. `resume=True` passes no new input."""
+    """Run or resume one thread.
+
+    `resume=True` passes no new input. `resume_decision` answers an `interrupt()`
+    with `Command(resume=...)` on the same thread id.
+    """
     options: dict[str, Any] = {}
     if graph.checkpointer:
         options["durability"] = CHECKPOINT_DURABILITY
+    if resume_decision is not None:
+        graph_input: Any = Command(resume=resume_decision)
+    elif resume:
+        graph_input = None
+    else:
+        graph_input = state
     result = await graph.ainvoke(
-        None if resume else state,
+        graph_input,
         thread_config(task_id),
         context=WorkflowContext(
             provider=provider,
@@ -291,6 +349,13 @@ async def invoke_triage(
     )
     if not isinstance(result, dict):
         raise TypeError(type(result).__name__)
+    if _INTERRUPT in result:
+        return result
+    if graph.checkpointer:
+        snapshot = await graph.aget_state(thread_config(task_id))
+        if snapshot.interrupts:
+            values = dict(snapshot.values) if isinstance(snapshot.values, dict) else {}
+            return {**values, _INTERRUPT: snapshot.interrupts}
     return result
 
 
@@ -315,6 +380,37 @@ def route_after_investigate(state: TriageState) -> str:
     if state.get("status") == "failed" or state.get("error") or not state.get("investigation"):
         return "finalize"
     return "plan"
+
+
+def route_after_plan(state: TriageState) -> str:
+    """Ask for approval only when the plan names a code change."""
+    if state.get("status") == "failed" or state.get("error"):
+        return "finalize"
+    if not _plan_requests_changes(state.get("plan")):
+        return "finalize"
+    return "request_plan_approval"
+
+
+def request_plan_approval(state: TriageState) -> dict[str, Any]:
+    """Pause until a person decides. Resume runs this function from the top.
+
+    There is no database write, file write, or model call before `interrupt()`.
+    Those would run again when the worker resumes the same thread.
+    """
+    try:
+        prompt = _approval_prompt(state)
+    except (ValidationError, ValueError):
+        logger.error("approval rejected the stored plan")
+        return _failed_update(PLAN_FAILURE, stage=STAGE_PLAN)
+    parsed = _parse_resume(interrupt(prompt))
+    if parsed is None:
+        return _failed_update(APPROVAL_FAILURE, stage=STAGE_APPROVAL)
+    return {
+        "approval": parsed,
+        "error": None,
+        "failed_stage": None,
+        "status": "rejected" if parsed["decision"] == "reject" else "completed",
+    }
 
 
 def triage_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:
@@ -420,6 +516,12 @@ def plan_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
 
 def finalize_node(state: TriageState) -> dict[str, Any]:
     """Re-validate before the summary becomes user-facing state."""
+    if state.get("status") == "rejected":
+        try:
+            return _rejected_update(state)
+        except (ValidationError, ValueError):
+            logger.error("finalize rejected the approval payload")
+            return _failed_update(GENERIC_FAILURE)
     if state.get("status") == "failed" or state.get("error"):
         message = _message(state.get("error"))
         stage = state.get("failed_stage") or STAGE_TRIAGE
@@ -428,6 +530,7 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
         checked = TriageResult.model_validate(state.get("triage"))
         investigation = _checked_investigation(state.get("investigation"))
         plan = _checked_plan(state.get("plan"))
+        approval = _checked_approval(state.get("approval"))
     except (ValidationError, ValueError):
         logger.error("finalize rejected the stored payload")
         return _failed_update(GENERIC_FAILURE)
@@ -435,6 +538,8 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
         return _failed_update(PLAN_FAILURE, stage=STAGE_PLAN)
     if plan is not None and investigation is None:
         return _failed_update(GENERIC_FAILURE)
+    if _plan_requests_changes(plan) and (approval is None or approval["decision"] != "approve"):
+        return _failed_update(APPROVAL_FAILURE, stage=STAGE_APPROVAL)
     summary = checked.summary
     if plan is not None:
         summary = str(plan["plan"]["problem_statement"])
@@ -446,6 +551,7 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
         "triage": checked.model_dump(mode="json"),
         "investigation": investigation,
         "plan": plan,
+        "approval": approval,
     }
 
 
@@ -460,6 +566,13 @@ def failure_outcome(message: str, *, stage: str = STAGE_TRIAGE) -> TriageOutcome
 
 
 def outcome_from_state(state: TriageState) -> TriageOutcome:
+    if _INTERRUPT in state:
+        return _pause_or_fail(state)
+    if state.get("status") == "rejected":
+        try:
+            return _rejected_outcome(state)
+        except (ValidationError, ValueError):
+            return failure_outcome(GENERIC_FAILURE)
     if state.get("status") != "completed" or state.get("error"):
         stage = state.get("failed_stage")
         return failure_outcome(
@@ -470,41 +583,199 @@ def outcome_from_state(state: TriageState) -> TriageOutcome:
         checked = TriageResult.model_validate(state.get("triage"))
         investigation = _checked_investigation(state.get("investigation"))
         plan = _checked_plan(state.get("plan"))
+        approval = _checked_approval(state.get("approval"))
     except (ValidationError, ValueError):
         return failure_outcome(GENERIC_FAILURE)
     if investigation is not None and plan is None:
         return failure_outcome(PLAN_FAILURE, stage=STAGE_PLAN)
     if plan is not None and investigation is None:
         return failure_outcome(GENERIC_FAILURE)
-    triage_json = checked.model_dump(mode="json")
+    if _plan_requests_changes(plan) and (approval is None or approval["decision"] != "approve"):
+        return failure_outcome(APPROVAL_FAILURE, stage=STAGE_APPROVAL)
     if plan is None or investigation is None:
         return TriageOutcome(
             status=TaskStatus.COMPLETED,
             stage=STAGE_FINALIZE,
             result_summary=checked.summary,
-            result_json=triage_json,
+            result_json=checked.model_dump(mode="json"),
         )
-    accepted = ChangePlan.model_validate(plan["plan"])
+    body, accepted = _planned_body(checked, investigation, plan, approval)
     return TriageOutcome(
         status=TaskStatus.COMPLETED,
         stage=STAGE_FINALIZE,
         result_summary=accepted.problem_statement,
-        result_json={
-            "triage": triage_json,
-            "investigation": investigation,
-            "plan": {
-                "can_proceed": accepted.can_proceed,
-                "confidence": accepted.confidence,
-                "rejected_paths": plan["rejected_paths"],
-                "paths": [item.relative_path for item in accepted.modifications],
-            },
-        },
+        result_json=body,
         plan=accepted,
     )
 
 
 def failure_text(exc: LLMError) -> str:
     return _message(str(exc))
+
+
+def _pause_or_fail(state: dict[str, Any]) -> TriageOutcome:
+    try:
+        return _paused_outcome(state)
+    except (ValidationError, ValueError):
+        logger.error("approval pause rejected the stored plan")
+        return failure_outcome(PLAN_FAILURE, stage=STAGE_PLAN)
+
+
+def _paused_outcome(state: dict[str, Any]) -> TriageOutcome:
+    checked = TriageResult.model_validate(state.get("triage"))
+    investigation = _checked_investigation(state.get("investigation"))
+    plan = _checked_plan(state.get("plan"))
+    if investigation is None or plan is None or not _plan_requests_changes(plan):
+        raise ValueError("pause without a code change")
+    body, accepted = _planned_body(checked, investigation, plan, None)
+    return TriageOutcome(
+        status=TaskStatus.WAITING_APPROVAL,
+        stage=STAGE_APPROVAL,
+        result_summary=accepted.problem_statement,
+        result_json=body,
+        plan=accepted,
+    )
+
+
+def _rejected_outcome(state: dict[str, Any]) -> TriageOutcome:
+    checked = TriageResult.model_validate(state.get("triage"))
+    investigation = _checked_investigation(state.get("investigation"))
+    plan = _checked_plan(state.get("plan"))
+    approval = _checked_approval(state.get("approval"))
+    if (
+        investigation is None
+        or plan is None
+        or approval is None
+        or approval["decision"] != "reject"
+    ):
+        raise ValueError("rejection is missing its plan")
+    body, accepted = _planned_body(checked, investigation, plan, approval)
+    return TriageOutcome(
+        status=TaskStatus.REJECTED,
+        stage=STAGE_FINALIZE,
+        result_summary=_rejection_summary(approval.get("reason")),
+        result_json=body,
+        plan=accepted,
+    )
+
+
+def _rejected_update(state: TriageState) -> dict[str, Any]:
+    outcome = _rejected_outcome(state)
+    return {
+        "status": "rejected",
+        "error": None,
+        "failed_stage": None,
+        "result_summary": outcome.result_summary,
+        "triage": outcome.result_json["triage"],
+        "investigation": outcome.result_json["investigation"],
+        "plan": _checked_plan(state.get("plan")),
+        "approval": _checked_approval(state.get("approval")),
+    }
+
+
+def _planned_body(
+    triage: TriageResult,
+    investigation: dict[str, Any],
+    plan: dict[str, Any],
+    approval: dict[str, Any] | None,
+) -> tuple[dict[str, Any], ChangePlan]:
+    accepted = ChangePlan.model_validate(plan["plan"])
+    body: dict[str, Any] = {
+        "triage": triage.model_dump(mode="json"),
+        "investigation": investigation,
+        "plan": {
+            "can_proceed": accepted.can_proceed,
+            "confidence": accepted.confidence,
+            "rejected_paths": plan["rejected_paths"],
+            "paths": [item.relative_path for item in accepted.modifications],
+        },
+    }
+    if approval is not None:
+        recorded: dict[str, Any] = {
+            "decision": approval["decision"],
+            "approval_id": approval["approval_id"],
+        }
+        if approval.get("reason"):
+            recorded["reason"] = approval["reason"]
+        body["approval"] = recorded
+    return body, accepted
+
+
+def _plan_requests_changes(value: object) -> bool:
+    """True when a stored plan still asks for a later edit."""
+    try:
+        checked = value if _is_checked_plan(value) else _checked_plan(value)
+    except (ValidationError, ValueError):
+        return False
+    if not isinstance(checked, dict):
+        return False
+    try:
+        plan = ChangePlan.model_validate(checked.get("plan"))
+    except ValidationError:
+        return False
+    return plan.can_proceed and len(plan.modifications) > 0
+
+
+def _is_checked_plan(value: object) -> bool:
+    return isinstance(value, dict) and isinstance(value.get("plan"), dict)
+
+
+def _approval_prompt(state: TriageState) -> dict[str, Any]:
+    plan = _checked_plan(state.get("plan"))
+    if plan is None or not _plan_requests_changes(plan):
+        raise ValueError("plan does not request a change")
+    accepted = ChangePlan.model_validate(plan["plan"])
+    task_id = state.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        raise ValueError("task id missing")
+    return {
+        "task_id": task_id,
+        "paths": [item.relative_path for item in accepted.modifications],
+    }
+
+
+def _parse_resume(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    decision = value.get("decision")
+    if decision not in {"approve", "reject"}:
+        return None
+    raw_id = value.get("approval_id")
+    if not isinstance(raw_id, str):
+        return None
+    try:
+        approval_id = str(UUID(raw_id))
+    except ValueError:
+        return None
+    reason = value.get("reason")
+    if reason is not None:
+        if not isinstance(reason, str):
+            return None
+        reason = " ".join(reason.split())
+        if not reason:
+            reason = None
+        elif len(reason) > APPROVAL_REASON_MAX_LENGTH:
+            return None
+    return {"decision": decision, "approval_id": approval_id, "reason": reason}
+
+
+def _checked_approval(value: object) -> dict[str, Any] | None:
+    """Re-validate a stored decision. None means this task has no decision yet."""
+    if value is None:
+        return None
+    parsed = _parse_resume(value)
+    if parsed is None:
+        raise ValueError("approval decision is not valid")
+    return parsed
+
+
+def _rejection_summary(reason: object) -> str:
+    if not isinstance(reason, str):
+        return REJECTED_SUMMARY
+    text = " ".join(reason.split())
+    if not text:
+        return REJECTED_SUMMARY
+    return text[:MAX_FAILURE_CHARS]
 
 
 def _lease_is_lost(runtime: Runtime[WorkflowContext]) -> bool:

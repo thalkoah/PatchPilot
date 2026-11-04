@@ -216,7 +216,8 @@ async def test_valid_plan_names_existing_files_and_a_new_test():
         repository_tools=RepositoryTools(DEMO_CHECKOUT),
     )
 
-    assert outcome.status == TaskStatus.COMPLETED
+    assert outcome.status == TaskStatus.WAITING_APPROVAL
+    assert outcome.stage == "request_plan_approval"
     assert outcome.plan is not None
     assert outcome.plan.can_proceed is True
     assert outcome.plan == DEMO_CHANGE_PLAN
@@ -264,7 +265,7 @@ async def test_unsafe_paths_are_dropped_and_the_checkout_stays_unchanged():
         repository_tools=RepositoryTools(DEMO_CHECKOUT),
     )
 
-    assert outcome.status == TaskStatus.COMPLETED
+    assert outcome.status == TaskStatus.WAITING_APPROVAL
     assert outcome.plan is not None
     assert outcome.plan.can_proceed is True
     assert [item.relative_path for item in outcome.plan.modifications] == [
