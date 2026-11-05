@@ -635,3 +635,60 @@ The running Compose stack was left as it was. It does not include the runner ser
 ### Next task
 
 Task 14 — Independent reviewer and bounded repair cycle.
+
+## Task 14 — Independent reviewer and bounded repair cycle
+
+Status: complete (2026-11-05).
+
+An approved patch follows `develop -> test -> review`. The reviewer sees the approved plan, the applied diff, the investigation citations, and the sandbox report. It returns findings, a severity, evidence, and `accept`, `repair`, or `escalate`. It has no file tool. A path named in the evidence that is not in the diff, the test output, or a citation is omitted. Policy decides. Success requires a passing suite, a diff that stays on the approved paths, no critical finding, and an accept recommendation. A failing suite or a repair request returns to `develop` and `test` at most twice. Each repair writes a `repair` event with the reason. Escalation, a critical finding the reviewer did not ask to repair, a forbidden diff, and a third request end as `failed` at stage `review`, and the summary says a person needs to intervene. The proposal, the applied diff, and the review are different artifacts. `GET /api/v1/tasks/{id}/review` returns the verdict, not the diff. Alembic head is still `0006_workspaces`.
+
+### Evidence
+
+`uv run pytest` — 231 passed in 27.80s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 129 files already formatted.
+
+The approval test still completes the demo bug. `result_json.review` is `accept` / `accept` with `repair_count` 0. The review checksum is neither the diff checksum nor the proposal checksum. `GET /api/v1/tasks/{id}/review` returns that verdict and does not contain `diff --git`. The event list has one review `stage_started` and one `stage_completed`, and no `repair` event. The source checkout is unchanged.
+
+`review repair once` applies a comment that leaves the `KeyError`, the suite fails, and the reviewer asks for a repair. The second patch defines `UnknownTierError`, the suite passes, and policy accepts. One `repair` event starts with `Tests failed.` Patch version 1 does not contain `UnknownTierError`. Version 2 does. Each version's diff checksum differs from its proposal checksum. The source file is unchanged. The worktree has the fix.
+
+`review tests fail` keeps the lookup broken. The reviewer says `accept` on every pass. Policy does not accept the failing suite. The task ends `failed` at `review` after exactly two repairs and three `PatchProposal` calls. The summary says the repair limit is exhausted and a person needs to intervene. `result_json.tests.passed` is false and `result_json.review.action` is still `accept`.
+
+`review reject` keeps a critical finding and asks for a repair on every pass. The task ends `failed` after two repairs. The summary says a critical review finding blocks the patch. `result_json.review.critical` is true.
+
+`review forever` produces a passing suite and a non-critical repair request on every pass. The task ends `failed` after two repairs. The newest patch is version 3, and its checksum is not the proposal checksum or the review checksum. `GET /review` does not contain the diff.
+
+A unit test refuses a diff that names `Dockerfile`. A reviewer reply that cites `invented/not_read.py` does not keep that path. `require_repair_budget(3)` raises. The source snapshot matches after every one of these runs, and a failed review removes that task's workspace directory.
+
+The running Compose stack was left as it was. It does not include the review node until the next image rebuild recreates the worker.
+
+### Changed files
+
+- `src/patchpilot/llm/review.py` — `ReviewResult`, findings, severity, and action
+- `src/patchpilot/agents/reviewer.py`, `review_policy.py`, `limits.py` — one model call, grounded evidence, and the repair cap
+- `src/patchpilot/llm/fake.py`, `agents/developer.py` — repair fixtures and the reviewer note in the developer prompt
+- `src/patchpilot/workflow/graph.py`, `worker.py`, `repositories/jobs.py` — `review` after `test`, at most two repairs, and the events
+- `src/patchpilot/runner/client.py` — a new job id for each repair pass
+- `src/patchpilot/artifacts.py`, `repositories/artifacts.py`, `schemas/reviews.py`, `routes/tasks.py` — `review` artifact and `GET /api/v1/tasks/{id}/review`
+- `src/patchpilot/audit.py` — `repair` events
+- `tests/test_review.py`, `tests/test_approvals.py`, `tests/test_workflow.py`
+- `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` was not executed. The Compose containers were left running and do not include the review node yet.
+- Host Ollama was not asked to review. The verdicts, the repair cap, and the demo suite were exercised with `FakeProvider`.
+- The repair cap is two. `require_repair_budget` rejects a larger value. There is no environment setting that raises it.
+- A failing suite whose reviewer says `accept` is still repaired, up to twice, because the accept is advisory. A critical finding paired with `accept`, and an `escalate` action, stop without a repair.
+- A diff that leaves the approved paths fails at `review` before the reviewer is called. The apply tool already refuses that diff, so this is a second check.
+- A failed review stores the proposal, the diff, the test report, and the review, then deletes the task workspace. The registered checkout is unchanged either way.
+- The first test pass still uses the task id as the runner job id. Each repair uses a different id so the suite runs again. Resuming the same pass reuses that pass's result file.
+- The shared runner volume is still one tree. Concurrency stays 1.
+- A checkpoint that already finished `test` on the previous graph and is waiting to enter `finalize` fails closed, because a patch now needs a review.
+- The reviewer does not choose the repair count. Policy does, and the events record the reason for each repair that was taken.
+
+### Next task
+
+Task 15 — Supervisor routing and real multi-agent orchestration.

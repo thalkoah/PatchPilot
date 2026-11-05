@@ -26,6 +26,7 @@ APPROVAL_REQUESTED = "approval_requested"
 APPROVAL_DECIDED = "approval_decided"
 RETRY = "retry"
 RECOVERY = "recovery"
+REPAIR = "repair"
 
 EVENT_TYPES = frozenset(
     {
@@ -38,6 +39,7 @@ EVENT_TYPES = frozenset(
         APPROVAL_DECIDED,
         RETRY,
         RECOVERY,
+        REPAIR,
     }
 )
 
@@ -135,6 +137,15 @@ def task_rejected_key(task_id: UUID) -> str:
 def approval_requested_key(task_id: UUID) -> str:
     """One pause row per task. Parking again after a crash does not insert another."""
     return _task_key(task_id, "approval_requested")
+
+
+def repair_event_key(task_id: UUID, repair_index: int) -> str:
+    """One repair row per index. A second finish of the same repair does not insert another."""
+    if isinstance(repair_index, bool) or not isinstance(repair_index, int):
+        raise ValueError("repair index is out of range")
+    if not 1 <= repair_index <= 2:
+        raise ValueError("repair index is out of range")
+    return _task_key(task_id, f"repair:{repair_index}")
 
 
 def approval_decided_key(task_id: UUID) -> str:

@@ -5,15 +5,20 @@ with a repo_id follows `START -> triage -> investigate -> plan`, then either
 `finalize` or `request_plan_approval`. Approval runs only when the plan names a
 code change. It calls `interrupt()` and does no I/O before that call, because
 resume runs the node from the top. An approval continues to `prepare_workspace`,
-then `develop`, then `test`, then `finalize`. A rejection goes straight to
-`finalize`.
+then `develop`, then `test`, then `review`. The reviewer recommends
+`accept`, `repair`, or `escalate` and cannot edit the worktree. Policy decides.
+A failing suite, a repair request, or a critical finding can return to
+`develop` at most twice. Anything that still cannot be accepted ends at
+`finalize` as a visible failure. A rejection of the plan goes straight to
+`finalize` and does not review a patch.
 
 The investigate node reads the registered checkout. The plan node proposes
 paths and does not write them. `prepare_workspace` clones that checkout into
 the workspace volume. It does not read a path from the plan. `develop` applies
 a patch only inside that private worktree. `test` copies that worktree to the
 runner volume and waits for a result file. It does not start a test process.
-Nothing in this graph writes the registered checkout.
+A repair publishes a new runner job id so the suite runs again. Nothing in
+this graph writes the registered checkout.
 
 The worker compiles this graph with an AsyncPostgresSaver. The task UUID is the
 LangGraph thread id. Checkpoint rows are not the business task record: the
@@ -40,19 +45,26 @@ from pydantic import ValidationError
 from patchpilot.agents.developer import DeveloperAgent, DevelopOutcome
 from patchpilot.agents.errors import StopForLease
 from patchpilot.agents.investigator import InvestigatorAgent
-from patchpilot.agents.limits import DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS
+from patchpilot.agents.limits import DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS, DEFAULT_MAX_REPAIRS
 from patchpilot.agents.planner import PlannerAgent
-from patchpilot.artifacts import checksum, proposal_document
+from patchpilot.agents.review_policy import (
+    PolicyAction,
+    applied_diff_is_allowed,
+    decide_review,
+)
+from patchpilot.agents.reviewer import ReviewedCycle, ReviewerAgent
+from patchpilot.artifacts import checksum, proposal_document, review_document
 from patchpilot.db.models import APPROVAL_REASON_MAX_LENGTH, TaskStatus
 from patchpilot.llm.errors import LLMError
 from patchpilot.llm.investigation import InvestigationReport
 from patchpilot.llm.patch import PatchProposal
 from patchpilot.llm.plan import ChangePlan
 from patchpilot.llm.provider import LLMProvider
+from patchpilot.llm.review import FindingSeverity, ReviewResult
 from patchpilot.llm.triage import TriageResult
 from patchpilot.patching.apply import MAX_DIFF_BYTES, AppliedPatch
 from patchpilot.patching.errors import PatchError
-from patchpilot.runner.client import collect_test_report
+from patchpilot.runner.client import collect_test_report, test_job_id
 from patchpilot.runner.errors import RunnerRejected, RunnerUnavailable
 from patchpilot.runner.limits import DEFAULT_RUNNER_WAIT_SECONDS
 from patchpilot.runner.protocol import TestReport, TestStatus
@@ -75,6 +87,7 @@ STAGE_APPROVAL = "request_plan_approval"
 STAGE_WORKSPACE = "prepare_workspace"
 STAGE_DEVELOP = "develop"
 STAGE_TEST = "test"
+STAGE_REVIEW = "review"
 STAGE_FINALIZE = "finalize"
 GENERIC_FAILURE = "Triage failed before a valid result was produced."
 INVESTIGATION_FAILURE = "Investigation failed before a valid report was produced."
@@ -83,6 +96,7 @@ APPROVAL_FAILURE = "Approval resume did not continue the workflow."
 WORKSPACE_FAILURE = "The isolated workspace could not be created."
 PATCH_FAILURE = "The patch was rejected before it was applied."
 TEST_FAILURE = "The test result could not be read."
+REVIEW_FAILURE = "The review could not be completed."
 RUNNER_UNAVAILABLE = "The test runner did not return a result."
 RUNNER_REJECTED = "The test runner rejected the workspace."
 ARTIFACT_FAILURE = "The plan artifact could not be stored."
@@ -98,6 +112,7 @@ _FAILURE_STAGES = frozenset(
         STAGE_WORKSPACE,
         STAGE_DEVELOP,
         STAGE_TEST,
+        STAGE_REVIEW,
     }
 )
 _INTERRUPT = "__interrupt__"
@@ -122,6 +137,10 @@ class TriageState(TypedDict):
     workspace: dict[str, Any] | None
     patch: dict[str, Any] | None
     tests: dict[str, Any] | None
+    review: dict[str, Any] | None
+    repair_count: int
+    cycles: list[dict[str, Any]]
+    policy: str | None
     result_summary: str | None
     error: str | None
     failed_stage: str | None
@@ -143,6 +162,7 @@ class WorkflowContext:
     runner_root: Path | None = None
     runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS
+    max_repairs: int = DEFAULT_MAX_REPAIRS
     repository_error: str | None = None
 
 
@@ -158,6 +178,11 @@ class TriageOutcome:
     workspace: IsolatedWorkspace | None = None
     patch: DevelopOutcome | None = None
     tests: TestReport | None = None
+    review: ReviewResult | None = None
+    policy: str | None = None
+    repair_count: int = 0
+    repairs: tuple[dict[str, Any], ...] = ()
+    cycles: tuple[ReviewedCycle, ...] = ()
 
 
 def triage_prompt(*, title: str, description: str) -> str:
@@ -189,6 +214,10 @@ def initial_triage_state(
         "workspace": None,
         "patch": None,
         "tests": None,
+        "review": None,
+        "repair_count": 0,
+        "cycles": [],
+        "policy": None,
         "result_summary": None,
         "error": None,
         "failed_stage": None,
@@ -218,6 +247,7 @@ def compile_triage_graph(
     builder.add_node("prepare_workspace", prepare_workspace_node)
     builder.add_node("develop", develop_node)
     builder.add_node("test", test_node)
+    builder.add_node("review", review_node)
     builder.add_node("finalize", finalize_node)
     builder.add_edge(START, "triage")
     builder.add_conditional_edges(
@@ -250,7 +280,16 @@ def compile_triage_graph(
         route_after_develop,
         {"test": "test", "finalize": "finalize"},
     )
-    builder.add_edge("test", "finalize")
+    builder.add_conditional_edges(
+        "test",
+        route_after_test,
+        {"review": "review", "finalize": "finalize"},
+    )
+    builder.add_conditional_edges(
+        "review",
+        route_after_review,
+        {"develop": "develop", "finalize": "finalize"},
+    )
     builder.add_edge("finalize", END)
     options: dict[str, Any] = {}
     if interrupt_after:
@@ -509,6 +548,28 @@ def route_after_develop(state: TriageState) -> str:
     return "test"
 
 
+def route_after_test(state: TriageState) -> str:
+    """Review only after a stored test report. A missing report does not call the model."""
+    if state.get("status") == "failed" or state.get("error") or not state.get("tests"):
+        return "finalize"
+    return "review"
+
+
+def route_after_review(state: TriageState) -> str:
+    """Repair only when policy asked for one and the cap has not been passed."""
+    count = state.get("repair_count")
+    if (
+        state.get("policy") == PolicyAction.REPAIR.value
+        and state.get("status") == "running"
+        and not state.get("error")
+        and isinstance(count, int)
+        and not isinstance(count, bool)
+        and 0 < count <= DEFAULT_MAX_REPAIRS
+    ):
+        return "develop"
+    return "finalize"
+
+
 def request_plan_approval(state: TriageState) -> dict[str, Any]:
     """Pause until a person decides. Resume runs this function from the top.
 
@@ -609,6 +670,12 @@ def develop_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[
         logger.error("patch rejected: unavailable")
         return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
     try:
+        try:
+            repair_count = _repair_count(state)
+            prior_review = _stored_review(state.get("review"))
+        except ValueError:
+            logger.error("patch rejected the review state")
+            return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
         outcome = DeveloperAgent(
             context.provider,
             worktree,
@@ -618,6 +685,8 @@ def develop_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[
             description=state["description"],
             plan=plan,
             report=report,
+            review=prior_review,
+            repair_count=repair_count,
         )
     except StopForLease:
         raise LeaseLost() from None
@@ -650,7 +719,9 @@ def test_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
     try:
         task_id = UUID(str(state.get("task_id")))
         workspace = workspace_from_state(state.get("workspace"), task_id=task_id)
-    except (TypeError, ValueError):
+        repair_count = _repair_count(state)
+        job_id = test_job_id(task_id, repair_count)
+    except (TypeError, ValueError, RunnerRejected):
         logger.error("tests rejected the workspace")
         return _failed_update(RUNNER_REJECTED, stage=STAGE_TEST)
     try:
@@ -671,7 +742,7 @@ def test_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
         report = collect_test_report(
             worktree=worktree,
             runner_root=context.runner_root,
-            job_id=task_id,
+            job_id=job_id,
             wait_seconds=context.runner_wait_seconds,
             lease_lost=context.lease_lost,
         )
@@ -686,7 +757,7 @@ def test_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
     except Exception as exc:
         logger.error("test node failed: %s", type(exc).__name__)
         return _failed_update(TEST_FAILURE, stage=STAGE_TEST)
-    if report.job_id != task_id or report.status == TestStatus.INVALID_REQUEST:
+    if report.job_id != job_id or report.status == TestStatus.INVALID_REQUEST:
         return _failed_update(RUNNER_REJECTED, stage=STAGE_TEST)
     if _lease_is_lost(runtime):
         raise LeaseLost()
@@ -696,6 +767,71 @@ def test_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
         "failed_stage": None,
         "status": "completed",
     }
+
+
+def review_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:
+    """Ask for a verdict. Policy, not the model, chooses accept, repair, or failure."""
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    context = runtime.context
+    try:
+        budget = context.max_repairs
+        if isinstance(budget, bool) or not isinstance(budget, int) or not 0 <= budget <= 2:
+            raise ValueError("repair budget")
+        prepared = _review_inputs(state)
+    except (TypeError, ValidationError, ValueError):
+        logger.error("review rejected the stored patch")
+        return _failed_update(REVIEW_FAILURE, stage=STAGE_REVIEW)
+    if prepared is None:
+        return _failed_update(REVIEW_FAILURE, stage=STAGE_REVIEW)
+    plan, investigation, patch, tests, repair_count = prepared
+    if not applied_diff_is_allowed(patch["diff"], plan):
+        logger.error("review rejected the diff")
+        return _failed_update(
+            "The patch violates the edit policy. A person needs to intervene.",
+            stage=STAGE_REVIEW,
+        )
+    if len(_cycle_list(state)) > budget:
+        return _failed_update(
+            "Repair stopped after 2 attempts. A person needs to intervene.",
+            stage=STAGE_REVIEW,
+        )
+    try:
+        verdict = ReviewerAgent(context.provider, lease_lost=context.lease_lost).run(
+            title=state["title"],
+            description=state["description"],
+            plan=plan,
+            report=investigation,
+            diff=patch["diff"],
+            tests=tests,
+            repair_count=repair_count,
+        )
+    except StopForLease:
+        raise LeaseLost() from None
+    except LLMError as exc:
+        return _failed_update(failure_text(exc), stage=STAGE_REVIEW)
+    except Exception as exc:
+        logger.error("review node failed: %s", type(exc).__name__)
+        return _failed_update(REVIEW_FAILURE, stage=STAGE_REVIEW)
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    try:
+        decision = decide_review(
+            review=verdict,
+            tests_passed=tests.status is TestStatus.PASSED,
+            patch_allowed=True,
+            repair_count=repair_count,
+            max_repairs=budget,
+        )
+    except ValueError:
+        logger.error("review policy rejected the verdict")
+        return _failed_update(REVIEW_FAILURE, stage=STAGE_REVIEW)
+    return _review_stop(
+        state,
+        review=verdict,
+        decision_action=decision.action,
+        reason=decision.reason,
+    )
 
 
 def triage_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:
@@ -808,6 +944,19 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
             logger.error("finalize rejected the approval payload")
             return _failed_update(GENERIC_FAILURE)
     if state.get("status") == "failed" or state.get("error"):
+        try:
+            reviewed = bool(_cycle_list(state))
+        except ValueError:
+            return _failed_update(REVIEW_FAILURE, stage=STAGE_REVIEW)
+        if reviewed:
+            reason = _message(state.get("error") or state.get("result_summary"))
+            return {
+                "status": "failed",
+                "error": reason,
+                "result_summary": reason,
+                "failed_stage": STAGE_REVIEW,
+                "policy": PolicyAction.FAIL.value,
+            }
         message = _message(state.get("error"))
         stage = state.get("failed_stage") or STAGE_TRIAGE
         return _failed_update(message, stage=stage if isinstance(stage, str) else STAGE_TRIAGE)
@@ -840,6 +989,21 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
     except ValueError:
         logger.error("finalize rejected the test report")
         return _failed_update(TEST_FAILURE, stage=STAGE_TEST)
+    if patch is not None:
+        try:
+            judged, _repairs, _cycles = _judge_cycles(state)
+        except (ValidationError, ValueError):
+            logger.error("finalize rejected the review")
+            return _failed_update(REVIEW_FAILURE, stage=STAGE_REVIEW)
+        if judged.action is not PolicyAction.ACCEPT:
+            reason = _message(judged.reason)
+            return {
+                "status": "failed",
+                "error": reason,
+                "result_summary": reason,
+                "failed_stage": STAGE_REVIEW,
+                "policy": PolicyAction.FAIL.value,
+            }
     summary = checked.summary
     if plan is not None:
         summary = str(plan["plan"]["problem_statement"])
@@ -876,6 +1040,16 @@ def outcome_from_state(state: TriageState) -> TriageOutcome:
             return _rejected_outcome(state)
         except (ValidationError, ValueError):
             return failure_outcome(GENERIC_FAILURE)
+    try:
+        reviewed = bool(_cycle_list(state))
+    except ValueError:
+        return failure_outcome(REVIEW_FAILURE, stage=STAGE_REVIEW)
+    if reviewed:
+        try:
+            return _reviewed_outcome(state)
+        except (ValidationError, ValueError):
+            logger.error("outcome rejected the review")
+            return failure_outcome(REVIEW_FAILURE, stage=STAGE_REVIEW)
     if state.get("status") != "completed" or state.get("error"):
         stage = state.get("failed_stage")
         return failure_outcome(
@@ -997,6 +1171,267 @@ def _rejected_update(state: TriageState) -> dict[str, Any]:
     }
 
 
+def _reviewed_outcome(state: dict[str, Any]) -> TriageOutcome:
+    """Build the task record from the review cycles. Policy is applied again here."""
+    checked = TriageResult.model_validate(state.get("triage"))
+    investigation = _checked_investigation(state.get("investigation"))
+    plan = _checked_plan(state.get("plan"))
+    approval = _checked_approval(state.get("approval"))
+    if investigation is None or plan is None:
+        raise ValueError("review is missing its plan")
+    if _plan_requests_changes(plan) and (approval is None or approval["decision"] != "approve"):
+        raise ValueError("review without approval")
+    workspace = _accepted_workspace(state, plan)
+    decision, repairs, cycles = _judge_cycles(state)
+    body, accepted = _planned_body(checked, investigation, plan, approval, workspace)
+    last = cycles[-1]
+    stored = _store_patch(
+        body,
+        {
+            "summary": last.applied.summary,
+            "paths": list(last.applied.paths),
+            "diff": last.applied.diff.decode("utf-8"),
+            "proposal": last.proposal,
+        },
+    )
+    stored_tests = _store_tests(body, last.tests)
+    _store_review(body, last, repair_count=len(repairs))
+    body["repairs"] = [{"index": item["index"], "reason": item["reason"]} for item in repairs]
+    accepted_finish = (
+        decision.action is PolicyAction.ACCEPT
+        and state.get("status") == "completed"
+        and not state.get("error")
+    )
+    if accepted_finish:
+        return TriageOutcome(
+            status=TaskStatus.COMPLETED,
+            stage=STAGE_FINALIZE,
+            result_summary=last.applied.summary,
+            result_json=body,
+            plan=accepted,
+            workspace=workspace,
+            patch=stored,
+            tests=stored_tests,
+            review=last.review,
+            policy=PolicyAction.ACCEPT.value,
+            repair_count=len(repairs),
+            repairs=repairs,
+            cycles=cycles,
+        )
+    reason = decision.reason if decision.action is PolicyAction.FAIL else REVIEW_FAILURE
+    reason = _message(reason)
+    body["error"] = reason
+    return TriageOutcome(
+        status=TaskStatus.FAILED,
+        stage=STAGE_REVIEW,
+        result_summary=reason,
+        result_json=body,
+        plan=accepted,
+        patch=stored,
+        tests=stored_tests,
+        review=last.review,
+        policy=PolicyAction.FAIL.value,
+        repair_count=len(repairs),
+        repairs=repairs,
+        cycles=cycles,
+    )
+
+
+def _judge_cycles(
+    state: dict[str, Any],
+) -> tuple[Any, tuple[dict[str, Any], ...], tuple[ReviewedCycle, ...]]:
+    plan_state = _checked_plan(state.get("plan"))
+    if plan_state is None:
+        raise ValueError("review is missing its plan")
+    plan = ChangePlan.model_validate(plan_state["plan"])
+    raw_cycles = _cycle_list(state)
+    if not raw_cycles or len(raw_cycles) > DEFAULT_MAX_REPAIRS + 1:
+        raise ValueError("review cycles are missing")
+    task_raw = state.get("task_id")
+    if not isinstance(task_raw, str):
+        raise ValueError("task id missing")
+    task_id = UUID(task_raw)
+    built: list[ReviewedCycle] = []
+    repairs: list[dict[str, Any]] = []
+    final = None
+    for index, item in enumerate(raw_cycles):
+        proposal, applied, tests, review = _cycle_parts(item, plan, task_id, index)
+        decision = decide_review(
+            review=review,
+            tests_passed=tests.status is TestStatus.PASSED,
+            patch_allowed=applied_diff_is_allowed(applied.diff.decode("utf-8"), plan),
+            repair_count=index,
+        )
+        cycle = ReviewedCycle(
+            proposal=proposal,
+            applied=applied,
+            tests=tests,
+            review=review,
+            policy=decision.action.value,
+            reason=decision.reason,
+            repair_index=index,
+        )
+        built.append(cycle)
+        if index < len(raw_cycles) - 1:
+            if decision.action is not PolicyAction.REPAIR:
+                raise ValueError("a repair cycle did not request a repair")
+            repairs.append({"index": index + 1, "reason": decision.reason})
+        else:
+            final = decision
+    if final is None or final.action is PolicyAction.REPAIR:
+        raise ValueError("review stopped while a repair was still allowed")
+    current = _checked_patch(state.get("patch"))
+    if current is None or current["diff"] != built[-1].applied.diff.decode("utf-8"):
+        raise ValueError("the stored patch does not match the review")
+    return final, tuple(repairs), tuple(built)
+
+
+def _cycle_parts(
+    item: object,
+    plan: ChangePlan,
+    task_id: UUID,
+    index: int,
+) -> tuple[Any, AppliedPatch, TestReport, ReviewResult]:
+    if not isinstance(item, dict):
+        raise ValueError("review cycle is not an object")
+    proposal = PatchProposal.model_validate(item.get("proposal"))
+    diff = item.get("diff")
+    paths = item.get("paths")
+    if not isinstance(diff, str) or not diff.startswith("diff --git ") or "\x00" in diff:
+        raise ValueError("review cycle diff is missing")
+    encoded = diff.encode()
+    if len(encoded) > MAX_DIFF_BYTES:
+        raise ValueError("review cycle diff is too large")
+    if (
+        not isinstance(paths, list)
+        or not paths
+        or not all(isinstance(path, str) and path for path in paths)
+    ):
+        raise ValueError("review cycle paths are missing")
+    planned = {modification.relative_path for modification in plan.modifications}
+    if any(path not in planned for path in paths):
+        raise ValueError("review cycle path is outside the plan")
+    if item.get("summary") != proposal.summary:
+        raise ValueError("review cycle summary does not match the proposal")
+    tests = TestReport.model_validate(item.get("tests"))
+    try:
+        expected = test_job_id(task_id, index)
+    except RunnerRejected:
+        raise ValueError("review cycle job is not valid") from None
+    if tests.job_id != expected or tests.status is TestStatus.INVALID_REQUEST:
+        raise ValueError("review cycle job does not match the task")
+    review = ReviewResult.model_validate(item.get("review"))
+    applied = AppliedPatch(summary=proposal.summary, paths=tuple(paths), diff=encoded)
+    return proposal, applied, tests, review
+
+
+def _review_stop(
+    state: TriageState,
+    *,
+    review: ReviewResult,
+    decision_action: PolicyAction,
+    reason: str,
+) -> dict[str, Any]:
+    patch = _checked_patch(state.get("patch"))
+    tests = _checked_tests(state.get("tests"))
+    repair_count = _repair_count(state)
+    if patch is None or tests is None:
+        return _failed_update(REVIEW_FAILURE, stage=STAGE_REVIEW)
+    cycle = {
+        "summary": patch["summary"],
+        "paths": list(patch["paths"]),
+        "diff": patch["diff"],
+        "proposal": patch["proposal"].model_dump(mode="json"),
+        "tests": tests.model_dump(mode="json"),
+        "review": review.model_dump(mode="json"),
+        "policy": decision_action.value,
+        "reason": reason,
+        "repair_index": repair_count,
+    }
+    update: dict[str, Any] = {
+        "review": review.model_dump(mode="json"),
+        "policy": decision_action.value,
+        "cycles": [*_cycle_list(state), cycle],
+        "repair_count": repair_count,
+    }
+    if decision_action is PolicyAction.REPAIR:
+        update["status"] = "running"
+        update["repair_count"] = repair_count + 1
+        update["error"] = None
+        update["failed_stage"] = None
+        return update
+    if decision_action is PolicyAction.ACCEPT:
+        update["status"] = "completed"
+        update["error"] = None
+        update["failed_stage"] = None
+        return update
+    update["status"] = "failed"
+    update["error"] = reason
+    update["result_summary"] = reason
+    update["failed_stage"] = STAGE_REVIEW
+    return update
+
+
+def _review_inputs(
+    state: TriageState,
+) -> tuple[ChangePlan, InvestigationReport, dict[str, Any], TestReport, int] | None:
+    plan_state = _checked_plan(state.get("plan"))
+    investigation = _checked_investigation(state.get("investigation"))
+    if plan_state is None or investigation is None:
+        return None
+    plan = ChangePlan.model_validate(plan_state["plan"])
+    report = InvestigationReport.model_validate(investigation["report"])
+    patch = _checked_patch(state.get("patch"))
+    tests = _checked_tests(state.get("tests"))
+    if patch is None or tests is None or not plan.can_proceed:
+        return None
+    return plan, report, patch, tests, _repair_count(state)
+
+
+def _store_review(body: dict[str, Any], cycle: ReviewedCycle, *, repair_count: int) -> None:
+    """Record the verdict checksum. The review body stays in the artifact file."""
+    payload = review_document(cycle.review, policy=cycle.policy, repair_count=repair_count)
+    body["review"] = {
+        "action": cycle.review.action.value,
+        "policy": cycle.policy,
+        "repair_count": repair_count,
+        "critical": any(
+            item.severity is FindingSeverity.CRITICAL for item in cycle.review.findings
+        ),
+        "checksum": checksum(payload),
+    }
+
+
+def _cycle_list(state: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = state.get("cycles")
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        raise ValueError("review cycles are not a list")
+    return list(raw)
+
+
+def _repair_count(state: dict[str, Any]) -> int:
+    value = state.get("repair_count")
+    if value is None:
+        return 0
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= DEFAULT_MAX_REPAIRS
+    ):
+        raise ValueError("repair count is not valid")
+    return value
+
+
+def _stored_review(value: object) -> ReviewResult | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("review payload is not an object")
+    return ReviewResult.model_validate(value)
+
+
 def _accepted_patch(
     state: dict[str, Any],
     plan: dict[str, Any] | None,
@@ -1060,7 +1495,13 @@ def _accepted_tests(state: dict[str, Any], patch: dict[str, Any] | None) -> Test
     if report is None:
         raise ValueError("patch has no test report")
     task_raw = state.get("task_id")
-    if not isinstance(task_raw, str) or str(report.job_id) != task_raw:
+    if not isinstance(task_raw, str):
+        raise ValueError("test job does not match the task")
+    try:
+        expected = test_job_id(UUID(task_raw), _repair_count(state))
+    except (TypeError, ValueError, RunnerRejected):
+        raise ValueError("test job does not match the task") from None
+    if report.job_id != expected:
         raise ValueError("test job does not match the task")
     if report.status == TestStatus.INVALID_REQUEST:
         raise ValueError("test runner rejected the job")

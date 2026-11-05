@@ -162,8 +162,10 @@ async def test_approve_survives_restart_and_a_repeated_decision(
         if runner is not None:
             stop_runner(runner)
 
-    assert len(provider.calls) == calls + 1
-    assert provider.calls[-1].schema_name == "PatchProposal"
+    assert [call.schema_name for call in provider.calls[calls:]] == [
+        "PatchProposal",
+        "ReviewResult",
+    ]
     done = client.get(f"/api/v1/tasks/{task_id}")
     body = done.json()
     assert body["status"] == "completed"
@@ -230,6 +232,25 @@ async def test_approve_survives_restart_and_a_repeated_decision(
     assert tested[1]["payload"]["passed"] is True
     assert tested[1]["payload"]["checksum"] == tests_meta["checksum"]
     assert "stdout" not in tested[1]["payload"]
+    review_meta = body["result_json"]["review"]
+    assert review_meta["action"] == "accept"
+    assert review_meta["policy"] == "accept"
+    assert review_meta["repair_count"] == 0
+    assert review_meta["critical"] is False
+    assert review_meta["checksum"] != patch_meta["checksum"]
+    assert review_meta["checksum"] != patch_meta["proposal_checksum"]
+    assert "diff --git" not in json.dumps(review_meta)
+    reviewed = client.get(f"/api/v1/tasks/{task_id}/review")
+    assert reviewed.status_code == 200
+    assert reviewed.json()["action"] == "accept"
+    assert reviewed.json()["policy"] == "accept"
+    assert reviewed.json()["checksum"] == review_meta["checksum"]
+    assert "diff --git" not in reviewed.text
+    assert "repair" not in kinds
+    review_events = [item for item in events if item["stage"] == "review"]
+    assert [item["event_type"] for item in review_events] == ["stage_started", "stage_completed"]
+    assert review_events[1]["payload"]["policy"] == "accept"
+    assert review_events[1]["payload"]["repair_count"] == 0
     assert prepared[1]["payload"]["base_sha"] == body["result_json"]["workspace"]["base_sha"]
     assert prepared[1]["payload"]["branch"] == f"patchpilot/{task_id}"
     assert str(workspace_root) not in json.dumps(prepared)
@@ -402,6 +423,7 @@ async def _pause_demo(
     *,
     repository_root: Path | None = None,
     workspace_root: Path | None = None,
+    description: str = DEMO_DESCRIPTION,
 ) -> tuple[str, int]:
     checkout_root = DEMO_ROOT.resolve() if repository_root is None else repository_root
     engine, factory = open_session_factory(database_url)
@@ -416,7 +438,7 @@ async def _pause_demo(
             "/api/v1/tasks",
             json={
                 "title": DEMO_TITLE,
-                "description": DEMO_DESCRIPTION,
+                "description": description,
                 "repo_id": str(repository.id),
             },
         )

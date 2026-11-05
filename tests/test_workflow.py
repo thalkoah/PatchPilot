@@ -133,7 +133,10 @@ def test_triage_graph_plans_only_after_investigation():
         ("prepare_workspace", "finalize"),
         ("develop", "test"),
         ("develop", "finalize"),
+        ("test", "review"),
         ("test", "finalize"),
+        ("review", "develop"),
+        ("review", "finalize"),
         ("finalize", "__end__"),
     }
 

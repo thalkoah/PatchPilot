@@ -17,6 +17,7 @@ from patchpilot.llm.limits import MAX_PROMPT_CHARS
 from patchpilot.llm.patch import PatchProposal
 from patchpilot.llm.plan import ChangePlan, ModificationKind
 from patchpilot.llm.provider import LLMProvider
+from patchpilot.llm.review import ReviewResult
 from patchpilot.patching.apply import AppliedPatch, apply_patch
 from patchpilot.patching.errors import PatchError
 from patchpilot.patching.policy import path_is_writable
@@ -64,6 +65,8 @@ class DeveloperAgent:
         description: str,
         plan: ChangePlan,
         report: InvestigationReport,
+        review: ReviewResult | None = None,
+        repair_count: int = 0,
     ) -> DevelopOutcome:
         self._check_lease()
         proposal = self._provider.generate_structured(
@@ -73,6 +76,8 @@ class DeveloperAgent:
                 plan=plan,
                 report=report,
                 worktree=self._worktree,
+                review=review,
+                repair_count=repair_count,
             ),
             PatchProposal,
         )
@@ -92,6 +97,8 @@ def _prompt(
     plan: ChangePlan,
     report: InvestigationReport,
     worktree: Path,
+    review: ReviewResult | None,
+    repair_count: int,
 ) -> str:
     text = description.strip()
     if len(text) > _DESCRIPTION_CHARS:
@@ -107,9 +114,17 @@ def _prompt(
         f"Problem: {plan.problem_statement}\n"
         f"Approved paths:\n{paths or 'none'}\n"
         f"Evidence:\n{_evidence(report)}\n\n"
+        f"Repair count: {repair_count}\n"
+        f"{_review_block(review)}\n\n"
         f"{_file_blocks(worktree, plan)}"
     )
     return prompt[:MAX_PROMPT_CHARS]
+
+
+def _review_block(review: ReviewResult | None) -> str:
+    if review is None:
+        return "Reviewer action: none"
+    return f"Reviewer action: {review.action.value}\nReviewer summary: {review.summary}"
 
 
 def _evidence(report: InvestigationReport) -> str:

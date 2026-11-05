@@ -13,6 +13,7 @@ from patchpilot.artifacts import (
     load_diff_file,
     load_plan_file,
     load_proposal_file,
+    load_review_file,
     load_test_report_file,
 )
 from patchpilot.config import get_settings
@@ -34,6 +35,7 @@ from patchpilot.schemas.approvals import ApprovalList, ApprovalResponse, Decisio
 from patchpilot.schemas.events import EventList, EventResponse
 from patchpilot.schemas.patches import PatchResponse
 from patchpilot.schemas.plans import PlanResponse
+from patchpilot.schemas.reviews import ReviewResponse
 from patchpilot.schemas.tasks import (
     DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
@@ -231,6 +233,45 @@ async def get_task_tests(
         stdout=report.stdout,
         stderr=report.stderr,
         output_truncated=report.output_truncated,
+    )
+
+
+@router.get("/{task_id}/review", response_model=ReviewResponse)
+async def get_task_review(
+    task_id: UUID,
+    repository: RepositoryDep,
+    artifacts: ArtifactRepositoryDep,
+    version: Annotated[int | None, Query(ge=1, le=1000)] = None,
+) -> ReviewResponse:
+    """Return one stored review. The handler does not edit the worktree."""
+    task = await repository.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    row = await artifacts.get_review(task_id, version)
+    root = get_settings().artifacts_root
+    if row is None or root is None:
+        raise HTTPException(status_code=404, detail="Review not found")
+    try:
+        review, policy, repair_count = load_review_file(
+            Path(root),
+            relative_path=row.relative_path,
+            expected_checksum=row.checksum,
+            size=row.size,
+        )
+    except ArtifactStoreError:
+        raise HTTPException(status_code=404, detail="Review not found") from None
+    return ReviewResponse(
+        task_id=task_id,
+        version=row.version,
+        checksum=row.checksum,
+        size=row.size,
+        created_at=row.created_at,
+        policy=policy,
+        repair_count=repair_count,
+        summary=review.summary,
+        action=review.action.value,
+        findings=review.findings,
+        evidence=review.evidence,
     )
 
 

@@ -9,9 +9,12 @@ task again. The next claim resumes that thread with `Command(resume=...)`.
 Approval clones the checkout into `WORKSPACE_ROOT` and records that association.
 The developer then applies a patch in that private worktree. The test stage
 copies that worktree to `RUNNER_ROOT` and waits for a result file. Pytest runs
-in the separate runner process, not in this one. Rejection and a declined plan
-do not reach either stage. A declined plan is stored as a versioned artifact
-and completes without asking.
+in the separate runner process, not in this one. The reviewer reads that diff
+and the test report and cannot edit the worktree. Policy may send the patch
+back through develop and test at most twice. A failure that still cannot be
+accepted is stored as `failed` and needs a person. Rejection and a declined
+plan do not reach either stage. A declined plan is stored as a versioned
+artifact and completes without asking.
 
 The process owns the LangGraph checkpointer connection: it opens one after
 checkpoint setup and closes it when the loop stops. A claim stores a lease on
@@ -372,10 +375,12 @@ async def _finish(
             artifacts_root=artifacts_root,
         )
         return
-    plan = outcome.plan if outcome.status in {TaskStatus.COMPLETED, TaskStatus.REJECTED} else None
+    reviewed = bool(outcome.cycles)
+    kept = outcome.status in {TaskStatus.COMPLETED, TaskStatus.REJECTED} or reviewed
+    plan = outcome.plan if kept else None
     workspace = outcome.workspace if outcome.status == TaskStatus.COMPLETED else None
-    patch = outcome.patch if outcome.status == TaskStatus.COMPLETED else None
-    tests = outcome.tests if outcome.status == TaskStatus.COMPLETED else None
+    patch = outcome.patch if outcome.status == TaskStatus.COMPLETED and not reviewed else None
+    tests = outcome.tests if outcome.status == TaskStatus.COMPLETED and not reviewed else None
     try:
         async with session_factory() as session:
             saved = await JobRepository(session).finish_run(
@@ -388,6 +393,7 @@ async def _finish(
                 workspace=workspace,
                 patch=patch,
                 tests=tests,
+                cycles=outcome.cycles,
                 artifacts_root=artifacts_root,
             )
     except TestReportStoreError:

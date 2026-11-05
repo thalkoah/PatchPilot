@@ -33,6 +33,7 @@ from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from patchpilot.agents.developer import DevelopOutcome
+from patchpilot.agents.reviewer import ReviewedCycle
 from patchpilot.artifacts import (
     ArtifactStoreError,
     TestReportStoreError,
@@ -48,6 +49,7 @@ from patchpilot.audit import (
     RECOVERY,
     RECOVERY_EXHAUSTED,
     RECOVERY_RESUME,
+    REPAIR,
     RETRY,
     STAGE_COMPLETED,
     STAGE_STARTED,
@@ -55,6 +57,7 @@ from patchpilot.audit import (
     TASK_REJECTED,
     approval_requested_key,
     event_key,
+    repair_event_key,
     require_attempts,
     require_lease,
     require_stage,
@@ -65,7 +68,12 @@ from patchpilot.audit import (
 from patchpilot.db.models import Task, TaskEvent, TaskRun, TaskStatus
 from patchpilot.llm.plan import ChangePlan
 from patchpilot.repositories.approvals import insert_pending_approval
-from patchpilot.repositories.artifacts import persist_patch, persist_plan, persist_test_report
+from patchpilot.repositories.artifacts import (
+    persist_patch,
+    persist_plan,
+    persist_review,
+    persist_test_report,
+)
 from patchpilot.repositories.events import append_event
 from patchpilot.repositories.workspaces import insert_workspace
 from patchpilot.runner.protocol import TestReport
@@ -81,6 +89,7 @@ _STAGE_APPROVAL = "request_plan_approval"
 _STAGE_WORKSPACE = "prepare_workspace"
 _STAGE_DEVELOP = "develop"
 _STAGE_TEST = "test"
+_STAGE_REVIEW = "review"
 _STAGE_FINALIZE = "finalize"
 
 
@@ -322,6 +331,7 @@ class JobRepository:
         workspace: IsolatedWorkspace | None = None,
         patch: DevelopOutcome | None = None,
         tests: TestReport | None = None,
+        cycles: tuple[ReviewedCycle, ...] = (),
         artifacts_root: Path | None = None,
     ) -> bool:
         """Store a terminal outcome when this worker still holds the lease.
@@ -341,14 +351,20 @@ class JobRepository:
             await self._session.rollback()
             return False
         stored = dict(result_json)
-        if plan is not None and status in {TaskStatus.COMPLETED, TaskStatus.REJECTED}:
+        if plan is not None and (
+            status in {TaskStatus.COMPLETED, TaskStatus.REJECTED} or bool(cycles)
+        ):
             stored = await self._with_plan_version(
                 claimed.id,
                 stored,
                 plan,
                 artifacts_root,
             )
-        if patch is not None:
+        if cycles:
+            if status not in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+                raise ArtifactStoreError
+            stored = await self._with_cycles(claimed.id, stored, cycles, artifacts_root)
+        elif patch is not None:
             if status != TaskStatus.COMPLETED or workspace is None:
                 raise ArtifactStoreError
             stored = await self._with_patch_version(
@@ -358,7 +374,7 @@ class JobRepository:
                 artifacts_root,
             )
         if tests is not None:
-            if status != TaskStatus.COMPLETED or patch is None:
+            if cycles or status != TaskStatus.COMPLETED or patch is None:
                 raise TestReportStoreError
             stored = await self._with_test_version(
                 claimed.id,
@@ -390,12 +406,21 @@ class JobRepository:
             )
         )
         if status == TaskStatus.FAILED:
-            await self._record_model_error(
-                task.id,
-                claimed,
-                stage=checked_stage,
-                result_summary=result_summary,
-            )
+            if cycles:
+                await self._record_reviewed_failure(
+                    task.id,
+                    claimed,
+                    stored,
+                    stage=checked_stage,
+                    result_summary=result_summary,
+                )
+            else:
+                await self._record_model_error(
+                    task.id,
+                    claimed,
+                    stage=checked_stage,
+                    result_summary=result_summary,
+                )
         else:
             await self._record_success(
                 task.id,
@@ -839,6 +864,7 @@ class JobRepository:
                 ),
                 run_id=claimed.run_id,
             )
+        await self._emit_review_trail(task_id, claimed, result_json, emit)
         await emit(
             stage=_STAGE_FINALIZE,
             event_type=STAGE_STARTED,
@@ -879,6 +905,204 @@ class JobRepository:
             key=task_completed_key(task_id),
             run_id=None,
         )
+
+    async def _record_reviewed_failure(
+        self,
+        task_id: UUID,
+        claimed: ClaimedTask,
+        result_json: dict[str, Any],
+        *,
+        stage: str,
+        result_summary: str,
+    ) -> None:
+        """Record the patch, the tests, each repair reason, and the review failure."""
+        attempt = {"attempt": claimed.attempt}
+        ordinal = 0
+
+        async def emit(
+            *,
+            stage: str,
+            event_type: str,
+            payload: dict[str, Any],
+            key: str,
+            run_id: UUID | None,
+        ) -> None:
+            nonlocal ordinal
+            await append_event(
+                self._session,
+                task_id=task_id,
+                run_id=run_id,
+                stage=stage,
+                event_type=event_type,
+                payload=payload,
+                idempotency_key=key,
+                ordinal=ordinal,
+            )
+            ordinal += 1
+
+        patch = _patch_payload(result_json, claimed.attempt)
+        if patch is not None and not await self._stage_completed(task_id, _STAGE_DEVELOP):
+            await emit(
+                stage=_STAGE_DEVELOP,
+                event_type=STAGE_STARTED,
+                payload=attempt,
+                key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_STARTED,
+                    stage=_STAGE_DEVELOP,
+                ),
+                run_id=claimed.run_id,
+            )
+            await emit(
+                stage=_STAGE_DEVELOP,
+                event_type=STAGE_COMPLETED,
+                payload=patch,
+                key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_COMPLETED,
+                    stage=_STAGE_DEVELOP,
+                ),
+                run_id=claimed.run_id,
+            )
+        tests = _tests_payload(result_json, claimed.attempt)
+        if tests is not None and not await self._stage_completed(task_id, _STAGE_TEST):
+            await emit(
+                stage=_STAGE_TEST,
+                event_type=STAGE_STARTED,
+                payload=attempt,
+                key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_STARTED,
+                    stage=_STAGE_TEST,
+                ),
+                run_id=claimed.run_id,
+            )
+            await emit(
+                stage=_STAGE_TEST,
+                event_type=STAGE_COMPLETED,
+                payload=tests,
+                key=event_key(
+                    task_id=task_id,
+                    run_id=claimed.run_id,
+                    event_type=STAGE_COMPLETED,
+                    stage=_STAGE_TEST,
+                ),
+                run_id=claimed.run_id,
+            )
+        await self._emit_review_trail(task_id, claimed, result_json, emit)
+        await emit(
+            stage=stage,
+            event_type=MODEL_ERROR,
+            payload={
+                "attempt": claimed.attempt,
+                "error_code": ERROR_MODEL,
+                "message": result_summary,
+            },
+            key=event_key(
+                task_id=task_id,
+                run_id=claimed.run_id,
+                event_type=MODEL_ERROR,
+                stage=stage,
+            ),
+            run_id=claimed.run_id,
+        )
+
+    async def _emit_review_trail(
+        self,
+        task_id: UUID,
+        claimed: ClaimedTask,
+        result_json: dict[str, Any],
+        emit: Any,
+    ) -> None:
+        attempt = {"attempt": claimed.attempt}
+        for repair in _repair_payloads(result_json, claimed.attempt):
+            index = repair["index"]
+            await emit(
+                stage=_STAGE_REVIEW,
+                event_type=REPAIR,
+                payload=repair,
+                key=repair_event_key(task_id, index),
+                run_id=claimed.run_id,
+            )
+        review = _review_payload(result_json, claimed.attempt)
+        if review is None or await self._stage_completed(task_id, _STAGE_REVIEW):
+            return
+        await emit(
+            stage=_STAGE_REVIEW,
+            event_type=STAGE_STARTED,
+            payload=attempt,
+            key=event_key(
+                task_id=task_id,
+                run_id=claimed.run_id,
+                event_type=STAGE_STARTED,
+                stage=_STAGE_REVIEW,
+            ),
+            run_id=claimed.run_id,
+        )
+        await emit(
+            stage=_STAGE_REVIEW,
+            event_type=STAGE_COMPLETED,
+            payload=review,
+            key=event_key(
+                task_id=task_id,
+                run_id=claimed.run_id,
+                event_type=STAGE_COMPLETED,
+                stage=_STAGE_REVIEW,
+            ),
+            run_id=claimed.run_id,
+        )
+
+    async def _with_cycles(
+        self,
+        task_id: UUID,
+        stored: dict[str, Any],
+        cycles: tuple[ReviewedCycle, ...],
+        artifacts_root: Path | None,
+    ) -> dict[str, Any]:
+        if artifacts_root is None or not cycles:
+            raise ArtifactStoreError
+        patch_version = 0
+        test_version = 0
+        review_version = 0
+        for cycle in cycles:
+            patch_version = await persist_patch(
+                self._session,
+                artifacts_root,
+                task_id,
+                cycle.proposal,
+                cycle.applied.diff,
+            )
+            test_version = await persist_test_report(
+                self._session,
+                artifacts_root,
+                task_id,
+                cycle.tests,
+            )
+            review_version = await persist_review(
+                self._session,
+                artifacts_root,
+                task_id,
+                cycle.review,
+                policy=cycle.policy,
+                repair_count=cycle.repair_index,
+            )
+        patch_meta = stored.get("patch")
+        if isinstance(patch_meta, dict):
+            stored["patch"] = {**patch_meta, "version": patch_version}
+        tests_meta = stored.get("tests")
+        if isinstance(tests_meta, dict):
+            stored["tests"] = {
+                **tests_meta,
+                "version": test_version,
+                "checksum": checksum(test_report_document(cycles[-1].tests)),
+            }
+        review_meta = stored.get("review")
+        if isinstance(review_meta, dict):
+            stored["review"] = {**review_meta, "version": review_version}
+        return stored
 
     async def _stage_completed(self, task_id: UUID, stage: str) -> bool:
         found = await self._session.scalar(
@@ -969,6 +1193,41 @@ def _patch_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any] 
         "proposal_checksum": patch.get("proposal_checksum"),
         "version": patch.get("version"),
     }
+
+
+def _review_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any] | None:
+    """The verdict and the policy. The diff and the findings stay in the artifact."""
+    review = result_json.get("review")
+    if not isinstance(review, dict):
+        return None
+    return {
+        "attempt": attempt,
+        "action": review.get("action"),
+        "policy": review.get("policy"),
+        "repair_count": review.get("repair_count"),
+        "critical": review.get("critical") is True,
+        "checksum": review.get("checksum"),
+        "version": review.get("version"),
+    }
+
+
+def _repair_payloads(result_json: dict[str, Any], attempt: int) -> list[dict[str, Any]]:
+    """One reason per repair. The list is empty when the first review was accepted."""
+    raw = result_json.get("repairs")
+    if not isinstance(raw, list):
+        return []
+    found: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("index")
+        reason = item.get("reason")
+        if isinstance(index, bool) or not isinstance(index, int) or not 1 <= index <= 2:
+            continue
+        if not isinstance(reason, str) or not reason.strip():
+            continue
+        found.append({"attempt": attempt, "index": index, "reason": reason})
+    return found
 
 
 def _investigation_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any] | None:

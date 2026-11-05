@@ -3,7 +3,8 @@
 The relative path is chosen here from the task id and version. Model output never
 selects it. A plan file is JSON with `schema_version` 1 and a `ChangePlan`.
 A proposal file is the model `PatchProposal`. A diff file is the unified diff
-Git applied, which is a different byte string from the proposal.
+Git applied, which is a different byte string from the proposal. A review file
+is the reviewer verdict over that diff and the test report.
 """
 
 import hashlib
@@ -14,6 +15,7 @@ from uuid import UUID, uuid4
 
 from patchpilot.llm.patch import PatchProposal
 from patchpilot.llm.plan import ChangePlan
+from patchpilot.llm.review import ReviewResult
 from patchpilot.runner.limits import MAX_REPORT_BYTES
 from patchpilot.runner.protocol import TestReport, report_bytes
 from patchpilot.source.paths import is_inside
@@ -22,9 +24,11 @@ PLAN_ARTIFACT_TYPE = "plan"
 DIFF_ARTIFACT_TYPE = "diff"
 PROPOSAL_ARTIFACT_TYPE = "proposal"
 TEST_REPORT_ARTIFACT_TYPE = "test-report"
+REVIEW_ARTIFACT_TYPE = "review"
 PLAN_SCHEMA_VERSION = 1
 PATCH_SCHEMA_VERSION = 1
 TEST_REPORT_SCHEMA_VERSION = 1
+REVIEW_SCHEMA_VERSION = 1
 MAX_PLAN_BYTES = 32_768
 MAX_DIFF_BYTES = 16_384
 MAX_PLAN_VERSION = 1000
@@ -34,6 +38,7 @@ _PLAN_FILE = re.compile(rf"^{_TASK}/plan/v([1-9][0-9]{{0,3}})\.json$")
 _DIFF_FILE = re.compile(rf"^{_TASK}/diff/v([1-9][0-9]{{0,3}})\.patch$")
 _PROPOSAL_FILE = re.compile(rf"^{_TASK}/proposal/v([1-9][0-9]{{0,3}})\.json$")
 _REPORT_FILE = re.compile(rf"^{_TASK}/test-report/v([1-9][0-9]{{0,3}})\.json$")
+_REVIEW_FILE = re.compile(rf"^{_TASK}/review/v([1-9][0-9]{{0,3}})\.json$")
 
 
 class ArtifactStoreError(Exception):
@@ -115,6 +120,56 @@ def proposal_relative_path(task_id: UUID, version: int) -> str:
 def test_report_relative_path(task_id: UUID, version: int) -> str:
     """Internal path for one test report. It is not taken from the model."""
     return _versioned_path(task_id, version, "test-report", "json", _REPORT_FILE)
+
+
+def review_relative_path(task_id: UUID, version: int) -> str:
+    """Internal path for one review. It is not taken from the model."""
+    return _versioned_path(task_id, version, "review", "json", _REVIEW_FILE)
+
+
+def review_document(review: ReviewResult, *, policy: str, repair_count: int) -> bytes:
+    """Canonical JSON for one review. This document is not the applied diff."""
+    if policy not in {"accept", "repair", "fail"}:
+        raise ArtifactStoreError
+    if isinstance(repair_count, bool) or not isinstance(repair_count, int):
+        raise ArtifactStoreError
+    if not 0 <= repair_count <= 2:
+        raise ArtifactStoreError
+    body = {
+        "policy": policy,
+        "repair_count": repair_count,
+        "review": review.model_dump(mode="json"),
+        "schema_version": REVIEW_SCHEMA_VERSION,
+    }
+    payload = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    if len(payload) > MAX_PLAN_BYTES:
+        raise ArtifactStoreError
+    return payload
+
+
+def parse_review_document(payload: bytes) -> tuple[ReviewResult, str, int]:
+    """Validate a review file. The error does not include the file body."""
+    if not isinstance(payload, bytes) or len(payload) > MAX_PLAN_BYTES:
+        raise ArtifactStoreError
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        raise ArtifactStoreError from None
+    if not isinstance(data, dict) or data.get("schema_version") != REVIEW_SCHEMA_VERSION:
+        raise ArtifactStoreError
+    policy = data.get("policy")
+    repair_count = data.get("repair_count")
+    if policy not in {"accept", "repair", "fail"}:
+        raise ArtifactStoreError
+    if isinstance(repair_count, bool) or not isinstance(repair_count, int):
+        raise ArtifactStoreError
+    if not 0 <= repair_count <= 2:
+        raise ArtifactStoreError
+    try:
+        review = ReviewResult.model_validate(data.get("review"))
+    except ValueError:
+        raise ArtifactStoreError from None
+    return review, policy, repair_count
 
 
 def test_report_document(report: TestReport) -> bytes:
@@ -201,6 +256,11 @@ def write_test_report_file(root: Path, relative_path: str, payload: bytes) -> No
         _write_file(root, relative_path, payload, _REPORT_FILE, MAX_REPORT_BYTES)
     except ArtifactStoreError as exc:
         raise TestReportStoreError from exc
+
+
+def write_review_file(root: Path, relative_path: str, payload: bytes) -> None:
+    """Write a review once. The same bytes may already be there."""
+    _write_file(root, relative_path, payload, _REVIEW_FILE, MAX_PLAN_BYTES)
 
 
 def _write_file(
@@ -304,6 +364,25 @@ def load_test_report_file(
     except ArtifactStoreError as exc:
         raise TestReportStoreError from exc
     return parse_test_report_document(payload)
+
+
+def load_review_file(
+    root: Path,
+    *,
+    relative_path: str,
+    expected_checksum: str,
+    size: int,
+) -> tuple[ReviewResult, str, int]:
+    """Read a review only when its size and checksum match the artifact row."""
+    payload = _read_file(
+        root,
+        relative_path=relative_path,
+        pattern=_REVIEW_FILE,
+        expected_checksum=expected_checksum,
+        size=size,
+        limit=MAX_PLAN_BYTES,
+    )
+    return parse_review_document(payload)
 
 
 def load_proposal_file(

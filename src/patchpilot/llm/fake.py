@@ -20,6 +20,7 @@ from patchpilot.llm.parsing import coerce_model, require_prompt, require_schema,
 from patchpilot.llm.patch import FileEdit, PatchProposal
 from patchpilot.llm.plan import ChangePlan, ModificationKind, ProposedModification
 from patchpilot.llm.provider import GenerateOptions, ModelT
+from patchpilot.llm.review import FindingSeverity, ReviewAction, ReviewFinding, ReviewResult
 from patchpilot.llm.triage import Classification, Severity, TriageResult
 
 Fixture = BaseModel | Mapping[str, Any]
@@ -242,6 +243,70 @@ def builtin_investigator_step(prompt: str) -> InvestigatorStep:
 
 
 _FILE_SHA = re.compile(r"^FILE (\S+) sha256=([0-9a-f]{64}|new)$", re.M)
+_FILE_BLOCK = re.compile(
+    r"^FILE (\S+) sha256=(?:[0-9a-f]{64}|new)\n(.*?)(?=^FILE |\Z)",
+    re.M | re.S,
+)
+_REPAIR_COUNT = re.compile(r"^Repair count: (\d+)$", re.M)
+
+ACCEPT_REVIEW = ReviewResult(
+    summary="The patch matches the plan and the tests passed.",
+    action=ReviewAction.ACCEPT,
+    findings=[
+        ReviewFinding(
+            summary="The diff handles an unknown tier and the suite passed.",
+            severity=FindingSeverity.LOW,
+            evidence="src/demo_service/discounts.py",
+        )
+    ],
+    evidence=["src/demo_service/discounts.py"],
+)
+
+REPAIR_ONCE_REVIEW = ReviewResult(
+    summary="The unknown tier still raises KeyError.",
+    action=ReviewAction.REPAIR,
+    findings=[
+        ReviewFinding(
+            summary="The lookup still indexes KNOWN_TIERS without a validation error.",
+            severity=FindingSeverity.HIGH,
+            evidence="src/demo_service/discounts.py",
+        )
+    ],
+    evidence=["src/demo_service/discounts.py"],
+)
+
+ACCEPT_DESPITE_TESTS = ReviewResult(
+    summary="The tests are acceptable.",
+    action=ReviewAction.ACCEPT,
+    findings=[],
+    evidence=["src/demo_service/discounts.py"],
+)
+
+REJECT_REVIEW = ReviewResult(
+    summary="The patch needs a person to decide before another edit.",
+    action=ReviewAction.REPAIR,
+    findings=[
+        ReviewFinding(
+            summary="The change is not safe to accept.",
+            severity=FindingSeverity.CRITICAL,
+            evidence="src/demo_service/discounts.py",
+        )
+    ],
+    evidence=["src/demo_service/discounts.py"],
+)
+
+FOREVER_REVIEW = ReviewResult(
+    summary="The patch still needs another revision.",
+    action=ReviewAction.REPAIR,
+    findings=[
+        ReviewFinding(
+            summary="The reviewer requested another revision.",
+            severity=FindingSeverity.MEDIUM,
+            evidence="src/demo_service/discounts.py",
+        )
+    ],
+    evidence=["src/demo_service/discounts.py"],
+)
 
 DEMO_PATCH_SUMMARY = (
     "Reject an unknown customer tier with HTTP 422 and cover it with a regression test."
@@ -362,6 +427,14 @@ def builtin_patch_proposal(prompt: str) -> PatchProposal:
             summary="The diff is not unified.",
             unified_diff="this is not a unified diff\n",
         )
+    attempt = _repair_attempt(prompt)
+    if "review tests fail" in folded:
+        return _unchanged_lookup(prompt, attempt)
+    if "review repair once" in folded and "Reviewer action: repair" not in prompt:
+        return _unchanged_lookup(prompt, attempt)
+    repair_markers = ("review repair once", "review forever", "review reject")
+    if any(marker in folded for marker in repair_markers):
+        return _fixed_lookup(prompt, attempt)
     edits: list[FileEdit] = []
     for path, content in _DEMO_FILES:
         digest = _file_sha(prompt, path)
@@ -371,6 +444,83 @@ def builtin_patch_proposal(prompt: str) -> PatchProposal:
     if not edits:
         raise LLMResponseError("PatchProposal rejected model output (1 validation error)")
     return PatchProposal(summary=DEMO_PATCH_SUMMARY, edits=edits)
+
+
+def builtin_review(prompt: str) -> ReviewResult:
+    """Accept, request one repair, or keep rejecting until policy stops the loop."""
+    folded = prompt.casefold()
+    if "review schema failure" in folded:
+        raise LLMResponseError("ReviewResult rejected model output (1 validation error)")
+    if "invented/not_read.py" in folded and "review bogus evidence" in folded:
+        return ReviewResult(
+            summary="The crash is explained by invented/not_read.py.",
+            action=ReviewAction.ACCEPT,
+            findings=[
+                ReviewFinding(
+                    summary="See invented/not_read.py.",
+                    severity=FindingSeverity.LOW,
+                    evidence="invented/not_read.py",
+                )
+            ],
+            evidence=["invented/not_read.py"],
+        )
+    if "review reject" in folded:
+        return REJECT_REVIEW
+    if "review forever" in folded:
+        return FOREVER_REVIEW
+    if "review tests fail" in folded:
+        return ACCEPT_DESPITE_TESTS
+    if "review repair once" in folded and (
+        "tests status: failed" in folded or "tests status: timed_out" in folded
+    ):
+        return REPAIR_ONCE_REVIEW
+    return ACCEPT_REVIEW
+
+
+def _repair_attempt(prompt: str) -> int:
+    match = _REPAIR_COUNT.search(prompt)
+    if match is None:
+        return 0
+    value = int(match.group(1))
+    if 0 <= value <= 2:
+        return value
+    return 0
+
+
+def _unchanged_lookup(prompt: str, attempt: int) -> PatchProposal:
+    path = "src/demo_service/discounts.py"
+    digest = _file_sha(prompt, path)
+    body = _file_body(prompt, path)
+    if digest is None or body is None:
+        raise LLMResponseError("PatchProposal rejected model output (1 validation error)")
+    content = body.rstrip() + f"\n# patchpilot attempt {attempt}\n"
+    return PatchProposal(
+        summary="Leave the unknown tier lookup unchanged.",
+        edits=[FileEdit(relative_path=path, expected_sha256=digest, content=content)],
+    )
+
+
+def _fixed_lookup(prompt: str, attempt: int) -> PatchProposal:
+    edits: list[FileEdit] = []
+    for path, content in _DEMO_FILES:
+        digest = _file_sha(prompt, path)
+        if digest is None:
+            continue
+        body = content
+        if path.endswith("discounts.py"):
+            body = content.rstrip() + f"\n# patchpilot attempt {attempt}\n"
+        edits.append(FileEdit(relative_path=path, expected_sha256=digest, content=body))
+    if not edits:
+        raise LLMResponseError("PatchProposal rejected model output (1 validation error)")
+    return PatchProposal(summary=DEMO_PATCH_SUMMARY, edits=edits)
+
+
+def _file_body(prompt: str, path: str) -> str | None:
+    for match in _FILE_BLOCK.finditer(prompt):
+        if match.group(1) != path:
+            continue
+        return match.group(2).strip("\n")
+    return None
 
 
 def _file_sha(prompt: str, path: str) -> str | None:
@@ -586,6 +736,8 @@ class FakeProvider:
             return coerce_model(checked_schema, builtin_change_plan(checked_prompt))
         if checked_schema is PatchProposal:
             return coerce_model(checked_schema, builtin_patch_proposal(checked_prompt))
+        if checked_schema is ReviewResult:
+            return coerce_model(checked_schema, builtin_review(checked_prompt))
         raise LLMResponseError(f"FakeProvider has no fixture for {checked_schema.__name__}")
 
     def close(self) -> None:

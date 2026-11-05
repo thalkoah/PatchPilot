@@ -9,7 +9,7 @@ import math
 import time
 from collections.abc import Callable
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from patchpilot.agents.errors import StopForLease
 from patchpilot.runner.errors import RunnerRejected, RunnerUnavailable
@@ -23,6 +23,22 @@ from patchpilot.runner.protocol import (
 )
 from patchpilot.runner.staging import remove_project, stage_project
 
+# Attempt 0 keeps the task id so a resumed first test reuses its result file.
+_ATTEMPT_NAMESPACE = UUID("c0ffee00-0000-4000-8000-000000000014")
+
+
+def test_job_id(task_id: UUID, repair_count: int) -> UUID:
+    """Job id for one test pass. Repair passes do not reuse the first result."""
+    if not isinstance(task_id, UUID):
+        raise RunnerRejected
+    if isinstance(repair_count, bool) or not isinstance(repair_count, int):
+        raise RunnerRejected
+    if repair_count == 0:
+        return task_id
+    if not 1 <= repair_count <= 2:
+        raise RunnerRejected
+    return uuid5(_ATTEMPT_NAMESPACE, f"{task_id}:{repair_count}")
+
 
 def collect_test_report(
     *,
@@ -34,8 +50,9 @@ def collect_test_report(
 ) -> TestReport:
     """Publish one job and return the runner's report.
 
-    `job_id` is the task id. A report that is already stored is reused, so a
-    resumed node does not ask for a second run.
+    `job_id` selects the result file. A report that is already stored for that
+    id is reused, so a resumed node does not ask for a second run. A repair
+    passes a different id from `test_job_id`.
     """
     _check_lease(lease_lost)
     wait = _wait(wait_seconds)

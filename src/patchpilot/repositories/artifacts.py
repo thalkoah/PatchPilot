@@ -11,6 +11,7 @@ from patchpilot.artifacts import (
     MAX_PLAN_VERSION,
     PLAN_ARTIFACT_TYPE,
     PROPOSAL_ARTIFACT_TYPE,
+    REVIEW_ARTIFACT_TYPE,
     TEST_REPORT_ARTIFACT_TYPE,
     ArtifactStoreError,
     TestReportStoreError,
@@ -21,16 +22,20 @@ from patchpilot.artifacts import (
     prepare_artifact_root,
     proposal_document,
     proposal_relative_path,
+    review_document,
+    review_relative_path,
     test_report_document,
     test_report_relative_path,
     write_diff_file,
     write_plan_file,
     write_proposal_file,
+    write_review_file,
     write_test_report_file,
 )
 from patchpilot.db.models import Artifact
 from patchpilot.llm.patch import PatchProposal
 from patchpilot.llm.plan import ChangePlan
+from patchpilot.llm.review import ReviewResult
 from patchpilot.runner.protocol import TestReport
 
 
@@ -63,6 +68,10 @@ class ArtifactRepository:
     async def get_test_report(self, task_id: UUID, version: int | None = None) -> Artifact | None:
         """Return one test report, or the newest when `version` is omitted."""
         return await self._get(task_id, TEST_REPORT_ARTIFACT_TYPE, version)
+
+    async def get_review(self, task_id: UUID, version: int | None = None) -> Artifact | None:
+        """Return one review, or the newest when `version` is omitted."""
+        return await self._get(task_id, REVIEW_ARTIFACT_TYPE, version)
 
     async def _get(self, task_id: UUID, artifact_type: str, version: int | None) -> Artifact | None:
         statement = select(Artifact).where(
@@ -244,4 +253,57 @@ async def persist_test_report(
         raise
     except ArtifactStoreError:
         raise TestReportStoreError from None
+    return version
+
+
+async def persist_review(
+    session: AsyncSession,
+    root: Path,
+    task_id: UUID,
+    review: ReviewResult,
+    *,
+    policy: str,
+    repair_count: int,
+) -> int:
+    """Store one review and return its version. The caller commits.
+
+    The same bytes reuse the existing version. This function does not edit the
+    worktree and does not run pytest.
+    """
+    if not isinstance(root, Path):
+        raise ArtifactStoreError
+    payload = review_document(review, policy=policy, repair_count=repair_count)
+    digest = checksum(payload)
+    existing = await session.scalar(
+        select(Artifact).where(
+            Artifact.task_id == task_id,
+            Artifact.artifact_type == REVIEW_ARTIFACT_TYPE,
+            Artifact.checksum == digest,
+        )
+    )
+    if existing is not None:
+        return existing.version
+    current = await session.scalar(
+        select(func.max(Artifact.version)).where(
+            Artifact.task_id == task_id,
+            Artifact.artifact_type == REVIEW_ARTIFACT_TYPE,
+        )
+    )
+    version = int(current or 0) + 1
+    if version > MAX_PLAN_VERSION:
+        raise ArtifactStoreError
+    relative = review_relative_path(task_id, version)
+    write_review_file(prepare_artifact_root(root), relative, payload)
+    session.add(
+        Artifact(
+            id=uuid4(),
+            task_id=task_id,
+            artifact_type=REVIEW_ARTIFACT_TYPE,
+            version=version,
+            relative_path=relative,
+            checksum=digest,
+            size=len(payload),
+        )
+    )
+    await session.flush()
     return version
