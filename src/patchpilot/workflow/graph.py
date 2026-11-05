@@ -1,16 +1,15 @@
 """Triage workflow.
 
-A task with no repository follows `START -> triage -> finalize -> END`. A task
-with a repo_id follows `START -> triage -> investigate -> plan`, then either
-`finalize` or `request_plan_approval`. Approval runs only when the plan names a
-code change. It calls `interrupt()` and does no I/O before that call, because
-resume runs the node from the top. An approval continues to `prepare_workspace`,
-then `develop`, then `test`, then `review`. The reviewer recommends
-`accept`, `repair`, or `escalate` and cannot edit the worktree. Policy decides.
-A failing suite, a repair request, or a critical finding can return to
-`develop` at most twice. Anything that still cannot be accepted ends at
-`finalize` as a visible failure. A rejection of the plan goes straight to
-`finalize` and does not review a patch.
+Every specialist node returns to `supervisor`. Deterministic rules choose the
+next node. A model may recommend a route only when those rules already allow
+it, and it cannot approve work or write files. A task with no repository is
+finalized after triage. A task with a repo_id is investigated, then planned.
+Incomplete evidence can investigate once more. A plan whose paths are all
+forbidden can be replanned once. A plan that names a code change goes to
+`request_plan_approval`, which calls `interrupt()` and does no I/O before that
+call, because resume runs the node from the top. Approval continues to
+`prepare_workspace`, then `develop`, then `test`, then `review`. Policy may
+repair at most twice. Rejection, a decline, and an escalation end at `finalize`.
 
 The investigate node reads the registered checkout. The plan node proposes
 paths and does not write them. `prepare_workspace` clones that checkout into
@@ -29,8 +28,9 @@ later resume does not run that node again.
 """
 
 import logging
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 from uuid import UUID
@@ -45,7 +45,13 @@ from pydantic import ValidationError
 from patchpilot.agents.developer import DeveloperAgent, DevelopOutcome
 from patchpilot.agents.errors import StopForLease
 from patchpilot.agents.investigator import InvestigatorAgent
-from patchpilot.agents.limits import DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS, DEFAULT_MAX_REPAIRS
+from patchpilot.agents.limits import (
+    DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
+    DEFAULT_MAX_REPAIRS,
+    DEFAULT_SUPERVISOR_DEADLINE_SECONDS,
+    GRAPH_RECURSION_LIMIT,
+    require_supervisor_deadline,
+)
 from patchpilot.agents.planner import PlannerAgent
 from patchpilot.agents.review_policy import (
     PolicyAction,
@@ -53,6 +59,13 @@ from patchpilot.agents.review_policy import (
     decide_review,
 )
 from patchpilot.agents.reviewer import ReviewedCycle, ReviewerAgent
+from patchpilot.agents.supervisor import (
+    NODE_FOR_ROUTE,
+    SupervisorDecision,
+    decide_route,
+    route_trace,
+    with_model,
+)
 from patchpilot.artifacts import checksum, proposal_document, review_document
 from patchpilot.db.models import APPROVAL_REASON_MAX_LENGTH, TaskStatus
 from patchpilot.llm.errors import LLMError
@@ -61,6 +74,7 @@ from patchpilot.llm.patch import PatchProposal
 from patchpilot.llm.plan import ChangePlan
 from patchpilot.llm.provider import LLMProvider
 from patchpilot.llm.review import FindingSeverity, ReviewResult
+from patchpilot.llm.supervisor import SupervisorRoute
 from patchpilot.llm.triage import TriageResult
 from patchpilot.patching.apply import MAX_DIFF_BYTES, AppliedPatch
 from patchpilot.patching.errors import PatchError
@@ -141,6 +155,13 @@ class TriageState(TypedDict):
     repair_count: int
     cycles: list[dict[str, Any]]
     policy: str | None
+    phase: str
+    route: str | None
+    routes: list[dict[str, Any]]
+    investigation_count: int
+    plan_count: int
+    supervisor_steps: int
+    started_at: float | None
     result_summary: str | None
     error: str | None
     failed_stage: str | None
@@ -164,6 +185,8 @@ class WorkflowContext:
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS
     max_repairs: int = DEFAULT_MAX_REPAIRS
     repository_error: str | None = None
+    supervisor_model: bool = False
+    supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +206,7 @@ class TriageOutcome:
     repair_count: int = 0
     repairs: tuple[dict[str, Any], ...] = ()
     cycles: tuple[ReviewedCycle, ...] = ()
+    routes: tuple[dict[str, Any], ...] = ()
 
 
 def triage_prompt(*, title: str, description: str) -> str:
@@ -191,8 +215,15 @@ def triage_prompt(*, title: str, description: str) -> str:
 
 
 def thread_config(task_id: UUID) -> dict[str, Any]:
-    """Stable LangGraph thread. The id is the task UUID and nothing else."""
-    return {"configurable": {"thread_id": str(task_id)}}
+    """Stable LangGraph thread. The id is the task UUID and nothing else.
+
+    `recursion_limit` stops a routing loop. The supervisor step cap trips first
+    on a normal task.
+    """
+    return {
+        "configurable": {"thread_id": str(task_id)},
+        "recursion_limit": GRAPH_RECURSION_LIMIT,
+    }
 
 
 def initial_triage_state(
@@ -218,6 +249,13 @@ def initial_triage_state(
         "repair_count": 0,
         "cycles": [],
         "policy": None,
+        "phase": "",
+        "route": None,
+        "routes": [],
+        "investigation_count": 0,
+        "plan_count": 0,
+        "supervisor_steps": 0,
+        "started_at": None,
         "result_summary": None,
         "error": None,
         "failed_stage": None,
@@ -241,6 +279,7 @@ def compile_triage_graph(
         context_schema=WorkflowContext,
     )
     builder.add_node("triage", triage_node)
+    builder.add_node("supervisor", supervisor_node)
     builder.add_node("investigate", investigate_node)
     builder.add_node("plan", plan_node)
     builder.add_node("request_plan_approval", request_plan_approval)
@@ -250,45 +289,30 @@ def compile_triage_graph(
     builder.add_node("review", review_node)
     builder.add_node("finalize", finalize_node)
     builder.add_edge(START, "triage")
-    builder.add_conditional_edges(
+    for name in (
         "triage",
-        route_after_triage,
-        {"investigate": "investigate", "finalize": "finalize"},
-    )
-    builder.add_conditional_edges(
         "investigate",
-        route_after_investigate,
-        {"plan": "plan", "finalize": "finalize"},
-    )
-    builder.add_conditional_edges(
         "plan",
-        route_after_plan,
-        {"request_plan_approval": "request_plan_approval", "finalize": "finalize"},
-    )
-    builder.add_conditional_edges(
         "request_plan_approval",
-        route_after_approval,
-        {"prepare_workspace": "prepare_workspace", "finalize": "finalize"},
-    )
-    builder.add_conditional_edges(
         "prepare_workspace",
-        route_after_workspace,
-        {"develop": "develop", "finalize": "finalize"},
-    )
-    builder.add_conditional_edges(
         "develop",
-        route_after_develop,
-        {"test": "test", "finalize": "finalize"},
-    )
-    builder.add_conditional_edges(
         "test",
-        route_after_test,
-        {"review": "review", "finalize": "finalize"},
-    )
-    builder.add_conditional_edges(
         "review",
-        route_after_review,
-        {"develop": "develop", "finalize": "finalize"},
+    ):
+        builder.add_edge(name, "supervisor")
+    builder.add_conditional_edges(
+        "supervisor",
+        route_from_supervisor,
+        {
+            "investigate": "investigate",
+            "plan": "plan",
+            "request_plan_approval": "request_plan_approval",
+            "prepare_workspace": "prepare_workspace",
+            "develop": "develop",
+            "test": "test",
+            "review": "review",
+            "finalize": "finalize",
+        },
     )
     builder.add_edge("finalize", END)
     options: dict[str, Any] = {}
@@ -312,6 +336,8 @@ async def run_triage(
     runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     repository_error: str | None = None,
+    supervisor_model: bool = False,
+    supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS,
 ) -> TriageOutcome:
     """Run one triage. Provider failures become a failed outcome instead of raw text."""
     state = initial_triage_state(
@@ -333,6 +359,8 @@ async def run_triage(
             runner_wait_seconds=runner_wait_seconds,
             max_tool_calls=max_tool_calls,
             repository_error=repository_error,
+            supervisor_model=supervisor_model,
+            supervisor_deadline_seconds=supervisor_deadline_seconds,
         )
     except LeaseLost:
         raise
@@ -357,6 +385,8 @@ async def run_claimed_triage(
     runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     repository_error: str | None = None,
+    supervisor_model: bool = False,
+    supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS,
     resume_decision: dict[str, Any] | None = None,
 ) -> TriageOutcome:
     """Resume a checkpointed thread, or start one when no checkpoint exists.
@@ -385,6 +415,8 @@ async def run_claimed_triage(
                     runner_wait_seconds=runner_wait_seconds,
                     max_tool_calls=max_tool_calls,
                     repository_error=repository_error,
+                    supervisor_model=supervisor_model,
+                    supervisor_deadline_seconds=supervisor_deadline_seconds,
                 )
             except LeaseLost:
                 raise
@@ -411,6 +443,8 @@ async def run_claimed_triage(
                     runner_wait_seconds=runner_wait_seconds,
                     max_tool_calls=max_tool_calls,
                     repository_error=repository_error,
+                    supervisor_model=supervisor_model,
+                    supervisor_deadline_seconds=supervisor_deadline_seconds,
                 )
             except LeaseLost:
                 raise
@@ -432,6 +466,8 @@ async def run_claimed_triage(
         runner_wait_seconds=runner_wait_seconds,
         max_tool_calls=max_tool_calls,
         repository_error=repository_error,
+        supervisor_model=supervisor_model,
+        supervisor_deadline_seconds=supervisor_deadline_seconds,
     )
 
 
@@ -450,6 +486,8 @@ async def invoke_triage(
     runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     repository_error: str | None = None,
+    supervisor_model: bool = False,
+    supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS,
 ) -> dict[str, Any]:
     """Run or resume one thread.
 
@@ -477,6 +515,8 @@ async def invoke_triage(
             runner_wait_seconds=runner_wait_seconds,
             max_tool_calls=max_tool_calls,
             repository_error=repository_error,
+            supervisor_model=supervisor_model,
+            supervisor_deadline_seconds=supervisor_deadline_seconds,
         ),
         **options,
     )
@@ -501,73 +541,87 @@ async def read_thread_state(graph: CompiledStateGraph, task_id: UUID) -> dict[st
     return dict(values)
 
 
-def route_after_triage(state: TriageState) -> str:
-    """Investigate only after a successful triage of a task that names a repository."""
-    if state.get("status") == "failed" or state.get("error") or not state.get("repo_id"):
+def route_from_supervisor(state: TriageState) -> str:
+    """Follow the route the supervisor just stored. An unknown route stops."""
+    try:
+        chosen = SupervisorRoute(state.get("route"))
+    except ValueError:
         return "finalize"
-    return "investigate"
-
-
-def route_after_investigate(state: TriageState) -> str:
-    """Plan only after a stored investigation. A failed read does not call the planner."""
-    if state.get("status") == "failed" or state.get("error") or not state.get("investigation"):
-        return "finalize"
-    return "plan"
-
-
-def route_after_plan(state: TriageState) -> str:
-    """Ask for approval only when the plan names a code change."""
-    if state.get("status") == "failed" or state.get("error"):
-        return "finalize"
-    if not _plan_requests_changes(state.get("plan")):
-        return "finalize"
-    return "request_plan_approval"
+    return NODE_FOR_ROUTE[chosen]
 
 
 def route_after_approval(state: TriageState) -> str:
     """Create a workspace only after an approval. Rejection stores no clone."""
-    if state.get("status") in {"failed", "rejected"} or state.get("error"):
-        return "finalize"
-    approval = state.get("approval")
-    if isinstance(approval, dict) and approval.get("decision") == "approve":
-        return "prepare_workspace"
-    return "finalize"
+    view = dict(state)
+    view["phase"] = STAGE_APPROVAL
+    return NODE_FOR_ROUTE[decide_route(view).route]
 
 
-def route_after_workspace(state: TriageState) -> str:
-    """Develop only when the private worktree was created."""
-    if state.get("status") == "failed" or state.get("error") or not state.get("workspace"):
-        return "finalize"
-    return "develop"
+def supervisor_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:
+    """Record why the next node was chosen. This node does not touch the checkout."""
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    now = time.time()
+    try:
+        deadline = require_supervisor_deadline(runtime.context.supervisor_deadline_seconds)
+    except ValueError:
+        deadline = DEFAULT_SUPERVISOR_DEADLINE_SECONDS
+    decision = decide_route(state, now=now, deadline_seconds=deadline)
+    if runtime.context.supervisor_model:
+        decision = with_model(decision, provider=runtime.context.provider, state=state)
+        if _lease_is_lost(runtime):
+            raise LeaseLost()
+    return _supervisor_update(state, decision, now=now)
 
 
-def route_after_develop(state: TriageState) -> str:
-    """Ask the runner for pytest only after a patch was applied."""
-    if state.get("status") == "failed" or state.get("error") or not state.get("patch"):
-        return "finalize"
-    return "test"
+def _supervisor_update(
+    state: TriageState,
+    decision: SupervisorDecision,
+    *,
+    now: float,
+) -> dict[str, Any]:
+    steps = state.get("supervisor_steps")
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+        steps = 0
+    raw_routes = state.get("routes")
+    routes = list(raw_routes) if isinstance(raw_routes, list) else []
+    phase = state.get("phase")
+    routes.append(
+        {
+            "route": decision.route.value,
+            "reason": decision.reason,
+            "phase": phase if isinstance(phase, str) and phase else "triage",
+        }
+    )
+    update: dict[str, Any] = {
+        "routes": routes,
+        "route": decision.route.value,
+        "supervisor_steps": steps + 1,
+    }
+    started = state.get("started_at")
+    if isinstance(started, bool) or not isinstance(started, (int, float)):
+        update["started_at"] = now
+    if decision.route in {SupervisorRoute.INVESTIGATE, SupervisorRoute.INVESTIGATE_MORE}:
+        update["investigation_count"] = _next_count(state.get("investigation_count"))
+    if decision.route in {SupervisorRoute.PLAN, SupervisorRoute.REPLAN}:
+        update["plan_count"] = _next_count(state.get("plan_count"))
+    if decision.route is SupervisorRoute.ESCALATE and state.get("status") not in {
+        "failed",
+        "rejected",
+    }:
+        failed = phase if isinstance(phase, str) and phase in _FAILURE_STAGES else STAGE_TRIAGE
+        update["status"] = "failed"
+        update["error"] = decision.reason
+        update["result_summary"] = decision.reason
+        update["failed_stage"] = failed
+        update["policy"] = PolicyAction.FAIL.value
+    return update
 
 
-def route_after_test(state: TriageState) -> str:
-    """Review only after a stored test report. A missing report does not call the model."""
-    if state.get("status") == "failed" or state.get("error") or not state.get("tests"):
-        return "finalize"
-    return "review"
-
-
-def route_after_review(state: TriageState) -> str:
-    """Repair only when policy asked for one and the cap has not been passed."""
-    count = state.get("repair_count")
-    if (
-        state.get("policy") == PolicyAction.REPAIR.value
-        and state.get("status") == "running"
-        and not state.get("error")
-        and isinstance(count, int)
-        and not isinstance(count, bool)
-        and 0 < count <= DEFAULT_MAX_REPAIRS
-    ):
-        return "develop"
-    return "finalize"
+def _next_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 1
+    return value + 1
 
 
 def request_plan_approval(state: TriageState) -> dict[str, Any]:
@@ -589,6 +643,7 @@ def request_plan_approval(state: TriageState) -> dict[str, Any]:
         "error": None,
         "failed_stage": None,
         "status": "rejected" if parsed["decision"] == "reject" else "running",
+        "phase": STAGE_APPROVAL,
     }
 
 
@@ -628,6 +683,7 @@ def prepare_workspace_node(state: TriageState, runtime: Runtime[WorkflowContext]
         "error": None,
         "failed_stage": None,
         "status": "completed",
+        "phase": STAGE_WORKSPACE,
     }
 
 
@@ -705,6 +761,7 @@ def develop_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[
         "error": None,
         "failed_stage": None,
         "status": "completed",
+        "phase": STAGE_DEVELOP,
     }
 
 
@@ -766,6 +823,7 @@ def test_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
         "error": None,
         "failed_stage": None,
         "status": "completed",
+        "phase": STAGE_TEST,
     }
 
 
@@ -849,6 +907,7 @@ def triage_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[s
         "triage": result.model_dump(mode="json"),
         "error": None,
         "status": "completed",
+        "phase": STAGE_TRIAGE,
     }
 
 
@@ -886,6 +945,7 @@ def investigate_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> d
         "error": None,
         "failed_stage": None,
         "status": "completed",
+        "phase": STAGE_INVESTIGATE,
     }
 
 
@@ -932,6 +992,7 @@ def plan_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
         "error": None,
         "failed_stage": None,
         "status": "completed",
+        "phase": STAGE_PLAN,
     }
 
 
@@ -1033,6 +1094,11 @@ def failure_outcome(message: str, *, stage: str = STAGE_TRIAGE) -> TriageOutcome
 
 
 def outcome_from_state(state: TriageState) -> TriageOutcome:
+    """Build the task record and keep the supervisor trace off `result_json`."""
+    return replace(_outcome_from_state(state), routes=route_trace(state))
+
+
+def _outcome_from_state(state: TriageState) -> TriageOutcome:
     if _INTERRUPT in state:
         return _pause_or_fail(state)
     if state.get("status") == "rejected":
@@ -1112,10 +1178,11 @@ def failure_text(exc: LLMError) -> str:
 
 def _pause_or_fail(state: dict[str, Any]) -> TriageOutcome:
     try:
-        return _paused_outcome(state)
+        outcome = _paused_outcome(state)
     except (ValidationError, ValueError):
         logger.error("approval pause rejected the stored plan")
-        return failure_outcome(PLAN_FAILURE, stage=STAGE_PLAN)
+        outcome = failure_outcome(PLAN_FAILURE, stage=STAGE_PLAN)
+    return replace(outcome, routes=route_trace(state))
 
 
 def _paused_outcome(state: dict[str, Any]) -> TriageOutcome:
@@ -1353,6 +1420,7 @@ def _review_stop(
         "policy": decision_action.value,
         "cycles": [*_cycle_list(state), cycle],
         "repair_count": repair_count,
+        "phase": STAGE_REVIEW,
     }
     if decision_action is PolicyAction.REPAIR:
         update["status"] = "running"
@@ -1722,11 +1790,13 @@ def _checked_plan(value: object) -> dict[str, Any] | None:
 
 def _failed_update(message: str, *, stage: str = STAGE_TRIAGE) -> dict[str, Any]:
     text = _message(message)
+    failed = stage if stage in _FAILURE_STAGES else STAGE_TRIAGE
     return {
         "status": "failed",
         "error": text,
         "result_summary": text,
-        "failed_stage": stage if stage in _FAILURE_STAGES else STAGE_TRIAGE,
+        "failed_stage": failed,
+        "phase": failed,
         "triage": None,
     }
 

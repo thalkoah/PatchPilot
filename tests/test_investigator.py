@@ -329,14 +329,27 @@ async def test_worker_investigates_the_registered_demo_bug(
     assert [item["stage"] for item in items] == [
         "triage",
         "triage",
+        "supervisor",
+        "supervisor",
+        "supervisor",
         "investigate",
         "investigate",
         "plan",
         "plan",
         "request_plan_approval",
     ]
-    completed = items[3]
-    assert completed["event_type"] == "stage_completed"
+    routes = [item for item in items if item["event_type"] == "route"]
+    assert [item["payload"]["route"] for item in routes] == [
+        "investigate",
+        "plan",
+        "proceed_to_approval",
+    ]
+    assert "repository" in routes[0]["payload"]["reason"]
+    completed = next(
+        item
+        for item in items
+        if item["stage"] == "investigate" and item["event_type"] == "stage_completed"
+    )
     assert any(
         label.startswith("src/demo_service/discounts.py:")
         for label in completed["payload"]["citations"]

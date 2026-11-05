@@ -72,7 +72,7 @@ curl -s http://127.0.0.1:8000/api/v1/tasks/<id>/events
 curl -s 'http://127.0.0.1:8000/api/v1/tasks?status=queued&limit=20&offset=0'
 ```
 
-`GET /api/v1/tasks/{id}/events` returns the append-only trail, oldest first. A missing task is HTTP 404. A task with no events yet returns `{"items": [], "truncated": false}`. The event names are `stage_started`, `stage_completed`, `model_error`, `task_completed`, `task_rejected`, `approval_requested`, `approval_decided`, `retry`, and `recovery`. Payloads are small JSON objects. Fields whose names look like passwords, tokens, or database URLs are stored as `[redacted]`.
+`GET /api/v1/tasks/{id}/events` returns the append-only trail, oldest first. A missing task is HTTP 404. A task with no events yet returns `{"items": [], "truncated": false}`. The event names are `stage_started`, `stage_completed`, `model_error`, `task_completed`, `task_rejected`, `approval_requested`, `approval_decided`, `retry`, `recovery`, `repair`, and `route`. A `route` event records why the supervisor chose the next stage. Its payload is the route name, the reason, and the stage that had just finished. Payloads are small JSON objects. Fields whose names look like passwords, tokens, or database URLs are stored as `[redacted]`.
 
 ## Registered repositories
 
@@ -109,7 +109,7 @@ Read-only tools are `list_tree`, `read_text_file`, and `search_text`. Each takes
 
 ## Triage workflow
 
-The worker runs a LangGraph `StateGraph`. A task with no `repo_id` follows `START -> triage -> finalize -> END`. A task with a `repo_id` follows `START -> triage -> investigate -> plan`. A plan that declines continues to `finalize`. A plan that names a code change continues to `request_plan_approval`, which calls `interrupt()` and does not write the checkout. The graph is compiled with the async Postgres checkpointer from `langgraph-checkpoint-postgres`. The LangGraph `thread_id` is the task UUID, with no extra prefix. Each finished node is stored before the next node starts (`durability="sync"`).
+The worker runs a LangGraph `StateGraph`. Every specialist node returns to `supervisor`, which chooses the next node. The choice is a deterministic rule. Set `SUPERVISOR_MODEL=true` to also ask the configured model for a recommendation. The model result is schema-validated, and a route the rules did not allow is ignored. The model cannot approve a plan, write a file, or raise a limit. A task with no `repo_id` is finalized after triage. A task with a `repo_id` is investigated, then planned. An investigation that cited no line may run once more. A plan whose paths are all forbidden may be replanned once. A plan that declines continues to `finalize`. A plan that names a code change continues to `request_plan_approval`, which calls `interrupt()` and does not write the checkout. The graph stops after 24 supervisor decisions, after 900 seconds, or at LangGraph's recursion limit of 40. The graph is compiled with the async Postgres checkpointer from `langgraph-checkpoint-postgres`. The LangGraph `thread_id` is the task UUID, with no extra prefix. Each finished node is stored before the next node starts (`durability="sync"`).
 
 Checkpoint tables live in the same PostgreSQL database and stay out of Alembic. `AsyncPostgresSaver.setup()` creates `checkpoint_migrations`, `checkpoints`, `checkpoint_blobs`, and `checkpoint_writes`. The business result stays on `tasks`: status, stage, `result_summary`, and `result_json`.
 

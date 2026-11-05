@@ -21,6 +21,7 @@ from patchpilot.llm.patch import FileEdit, PatchProposal
 from patchpilot.llm.plan import ChangePlan, ModificationKind, ProposedModification
 from patchpilot.llm.provider import GenerateOptions, ModelT
 from patchpilot.llm.review import FindingSeverity, ReviewAction, ReviewFinding, ReviewResult
+from patchpilot.llm.supervisor import SupervisorRecommendation, SupervisorRoute
 from patchpilot.llm.triage import Classification, Severity, TriageResult
 
 Fixture = BaseModel | Mapping[str, Any]
@@ -446,6 +447,20 @@ def builtin_patch_proposal(prompt: str) -> PatchProposal:
     return PatchProposal(summary=DEMO_PATCH_SUMMARY, edits=edits)
 
 
+def builtin_supervisor(prompt: str) -> SupervisorRecommendation:
+    """A recommendation policy may ignore. The stored reason never comes from here."""
+    folded = prompt.casefold()
+    if "supervisor recommend approval" in folded:
+        route = SupervisorRoute.PROCEED_TO_APPROVAL
+    elif "supervisor recommend finalize" in folded:
+        route = SupervisorRoute.FINALIZE
+    elif "supervisor recommend repair" in folded:
+        route = SupervisorRoute.REPAIR
+    else:
+        route = SupervisorRoute.ESCALATE
+    return SupervisorRecommendation(route=route, reason="model recommendation")
+
+
 def builtin_review(prompt: str) -> ReviewResult:
     """Accept, request one repair, or keep rejecting until policy stops the loop."""
     folded = prompt.casefold()
@@ -738,6 +753,8 @@ class FakeProvider:
             return coerce_model(checked_schema, builtin_patch_proposal(checked_prompt))
         if checked_schema is ReviewResult:
             return coerce_model(checked_schema, builtin_review(checked_prompt))
+        if checked_schema is SupervisorRecommendation:
+            return coerce_model(checked_schema, builtin_supervisor(checked_prompt))
         raise LLMResponseError(f"FakeProvider has no fixture for {checked_schema.__name__}")
 
     def close(self) -> None:

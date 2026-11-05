@@ -51,6 +51,7 @@ def test_worker_reaches_host_ollama_only_through_the_documented_gateway():
     assert "WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-30}" in worker
     assert "WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-3}" in worker
     assert "INVESTIGATOR_MAX_TOOL_CALLS: ${INVESTIGATOR_MAX_TOOL_CALLS:-6}" in worker
+    assert "SUPERVISOR_MODEL: ${SUPERVISOR_MODEL:-false}" in worker
     assert "OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}" in worker
     assert "11434" not in api
 
@@ -170,5 +171,6 @@ def test_env_example_is_present_and_env_is_ignored():
     assert "WORKER_LEASE_SECONDS=30" in example
     assert "WORKER_MAX_ATTEMPTS=3" in example
     assert "INVESTIGATOR_MAX_TOOL_CALLS=6" in example
+    assert "SUPERVISOR_MODEL=false" in example
     assert "patchpilot_dev" in example
     assert ".env" in ignore.splitlines()

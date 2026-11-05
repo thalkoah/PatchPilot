@@ -27,6 +27,7 @@ APPROVAL_DECIDED = "approval_decided"
 RETRY = "retry"
 RECOVERY = "recovery"
 REPAIR = "repair"
+ROUTE = "route"
 
 EVENT_TYPES = frozenset(
     {
@@ -40,6 +41,7 @@ EVENT_TYPES = frozenset(
         RETRY,
         RECOVERY,
         REPAIR,
+        ROUTE,
     }
 )
 
@@ -51,6 +53,7 @@ RECOVERY_RESUME = "resume"
 RECOVERY_EXHAUSTED = "exhausted"
 
 MAX_EVENT_PAGE = 500
+MAX_EVENT_ORDINAL = 40
 MAX_EVENT_PAYLOAD_BYTES = 2048
 MAX_EVENT_STRING = 300
 MAX_EVENT_DEPTH = 4
@@ -137,6 +140,13 @@ def task_rejected_key(task_id: UUID) -> str:
 def approval_requested_key(task_id: UUID) -> str:
     """One pause row per task. Parking again after a crash does not insert another."""
     return _task_key(task_id, "approval_requested")
+
+
+def route_event_key(task_id: UUID, index: int) -> str:
+    """One route row per supervisor decision. A resumed run does not insert it again."""
+    if isinstance(index, bool) or not isinstance(index, int) or not 1 <= index <= MAX_EVENT_ORDINAL:
+        raise ValueError("route index is out of range")
+    return _task_key(task_id, f"route:{index}")
 
 
 def repair_event_key(task_id: UUID, repair_index: int) -> str:

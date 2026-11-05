@@ -203,6 +203,7 @@ async def test_event_api_explains_a_completed_task(
     assert [item["event_type"] for item in body["items"]] == [
         "stage_started",
         "stage_completed",
+        "route",
         "stage_started",
         "stage_completed",
         "task_completed",
@@ -210,10 +211,15 @@ async def test_event_api_explains_a_completed_task(
     assert [item["stage"] for item in body["items"]] == [
         "triage",
         "triage",
+        "supervisor",
         "finalize",
         "finalize",
         "finalize",
     ]
+    route = body["items"][2]["payload"]
+    assert route["route"] == "finalize"
+    assert route["index"] == 1
+    assert "repository" in route["reason"]
     assert body["items"][0]["payload"]["attempt"] == 1
     assert body["items"][-1]["payload"]["status"] == "completed"
     assert "idempotency_key" not in body["items"][0]

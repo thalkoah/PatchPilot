@@ -6,7 +6,13 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from patchpilot.audit import MAX_EVENT_PAGE, bound_payload, require_event_type, require_stage
+from patchpilot.audit import (
+    MAX_EVENT_ORDINAL,
+    MAX_EVENT_PAGE,
+    bound_payload,
+    require_event_type,
+    require_stage,
+)
 from patchpilot.db.models import TaskEvent
 
 
@@ -47,7 +53,12 @@ async def append_event(
     """
     checked_stage = require_stage(stage)
     checked_type = require_event_type(event_type)
-    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0 or ordinal > 20:
+    if (
+        isinstance(ordinal, bool)
+        or not isinstance(ordinal, int)
+        or ordinal < 0
+        or ordinal > MAX_EVENT_ORDINAL
+    ):
         raise ValueError("event ordinal must be a small non-negative integer")
     statement = pg_insert(TaskEvent).values(
         id=uuid4(),

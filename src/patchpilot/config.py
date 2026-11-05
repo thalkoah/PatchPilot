@@ -74,6 +74,9 @@ class Settings(LLMSettings):
         ge=1,
         le=HARD_MAX_INVESTIGATOR_TOOL_CALLS,
     )
+    # When true, a model may recommend a supervisor route. Policy still decides
+    # which routes are allowed. The default is rules only.
+    supervisor_model: bool = False
     repository_root: str | None = None
     artifacts_root: str | None = None
     workspace_root: str | None = None

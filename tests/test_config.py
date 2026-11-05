@@ -226,6 +226,7 @@ def test_investigator_budget_defaults_to_six_and_stays_bounded():
     )
 
     assert settings.investigator_max_tool_calls == 6
+    assert settings.supervisor_model is False
     with pytest.raises(ValidationError):
         Settings(
             database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",

@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from patchpilot.agents.developer import DevelopOutcome
 from patchpilot.agents.reviewer import ReviewedCycle
+from patchpilot.agents.supervisor import route_records
 from patchpilot.artifacts import (
     ArtifactStoreError,
     TestReportStoreError,
@@ -51,6 +52,7 @@ from patchpilot.audit import (
     RECOVERY_RESUME,
     REPAIR,
     RETRY,
+    ROUTE,
     STAGE_COMPLETED,
     STAGE_STARTED,
     TASK_COMPLETED,
@@ -62,6 +64,7 @@ from patchpilot.audit import (
     require_lease,
     require_stage,
     require_worker_id,
+    route_event_key,
     task_completed_key,
     task_rejected_key,
 )
@@ -91,6 +94,7 @@ _STAGE_DEVELOP = "develop"
 _STAGE_TEST = "test"
 _STAGE_REVIEW = "review"
 _STAGE_FINALIZE = "finalize"
+_STAGE_SUPERVISOR = "supervisor"
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,6 +337,7 @@ class JobRepository:
         tests: TestReport | None = None,
         cycles: tuple[ReviewedCycle, ...] = (),
         artifacts_root: Path | None = None,
+        routes: tuple[dict[str, Any], ...] = (),
     ) -> bool:
         """Store a terminal outcome when this worker still holds the lease.
 
@@ -413,6 +418,7 @@ class JobRepository:
                     stored,
                     stage=checked_stage,
                     result_summary=result_summary,
+                    routes=routes,
                 )
             else:
                 await self._record_model_error(
@@ -420,6 +426,7 @@ class JobRepository:
                     claimed,
                     stage=checked_stage,
                     result_summary=result_summary,
+                    routes=routes,
                 )
         else:
             await self._record_success(
@@ -428,6 +435,7 @@ class JobRepository:
                 stored,
                 terminal=status,
                 workspace=workspace if status == TaskStatus.COMPLETED else None,
+                routes=routes,
             )
         await self._session.commit()
         return True
@@ -441,6 +449,7 @@ class JobRepository:
         result_json: dict[str, Any],
         plan: ChangePlan,
         artifacts_root: Path | None,
+        routes: tuple[dict[str, Any], ...] = (),
     ) -> bool:
         """Store the plan, open one approval, and release the lease.
 
@@ -483,6 +492,7 @@ class JobRepository:
             stored,
             waiting=True,
             approval_id=approval.id,
+            routes=routes,
         )
         await self._session.commit()
         return True
@@ -644,7 +654,20 @@ class JobRepository:
         *,
         stage: str,
         result_summary: str,
+        routes: tuple[dict[str, Any], ...] = (),
     ) -> None:
+        pending = await self._unwritten_routes(task_id, routes)
+        for offset, item in enumerate(pending):
+            await append_event(
+                self._session,
+                task_id=task_id,
+                run_id=claimed.run_id,
+                stage=_STAGE_SUPERVISOR,
+                event_type=ROUTE,
+                payload=_route_payload(item, claimed.attempt),
+                idempotency_key=item["key"],
+                ordinal=offset,
+            )
         await append_event(
             self._session,
             task_id=task_id,
@@ -662,7 +685,7 @@ class JobRepository:
                 event_type=MODEL_ERROR,
                 stage=stage,
             ),
-            ordinal=0,
+            ordinal=len(pending),
         )
 
     async def _record_success(
@@ -675,6 +698,7 @@ class JobRepository:
         approval_id: UUID | None = None,
         terminal: TaskStatus = TaskStatus.COMPLETED,
         workspace: IsolatedWorkspace | None = None,
+        routes: tuple[dict[str, Any], ...] = (),
     ) -> None:
         attempt = {"attempt": claimed.attempt}
         ordinal = 0
@@ -713,6 +737,7 @@ class JobRepository:
                 ),
                 run_id=claimed.run_id,
             )
+        await self._emit_routes(task_id, claimed, routes, emit)
         investigation = _investigation_payload(result_json, claimed.attempt)
         if investigation is not None and not await self._stage_completed(
             task_id, _STAGE_INVESTIGATE
@@ -914,6 +939,7 @@ class JobRepository:
         *,
         stage: str,
         result_summary: str,
+        routes: tuple[dict[str, Any], ...] = (),
     ) -> None:
         """Record the patch, the tests, each repair reason, and the review failure."""
         attempt = {"attempt": claimed.attempt}
@@ -940,6 +966,7 @@ class JobRepository:
             )
             ordinal += 1
 
+        await self._emit_routes(task_id, claimed, routes, emit)
         patch = _patch_payload(result_json, claimed.attempt)
         if patch is not None and not await self._stage_completed(task_id, _STAGE_DEVELOP):
             await emit(
@@ -1104,6 +1131,44 @@ class JobRepository:
             stored["review"] = {**review_meta, "version": review_version}
         return stored
 
+    async def _emit_routes(
+        self,
+        task_id: UUID,
+        claimed: ClaimedTask,
+        routes: tuple[dict[str, Any], ...],
+        emit: Any,
+    ) -> None:
+        for item in await self._unwritten_routes(task_id, routes):
+            await emit(
+                stage=_STAGE_SUPERVISOR,
+                event_type=ROUTE,
+                payload=_route_payload(item, claimed.attempt),
+                key=item["key"],
+                run_id=claimed.run_id,
+            )
+
+    async def _unwritten_routes(
+        self,
+        task_id: UUID,
+        routes: tuple[dict[str, Any], ...],
+    ) -> list[dict[str, Any]]:
+        records = route_records(routes)
+        if not records:
+            return []
+        keys = [route_event_key(task_id, index) for index, _item in enumerate(records, start=1)]
+        found = set(
+            await self._session.scalars(
+                select(TaskEvent.idempotency_key).where(TaskEvent.idempotency_key.in_(keys))
+            )
+        )
+        pending: list[dict[str, Any]] = []
+        for index, item in enumerate(records, start=1):
+            key = keys[index - 1]
+            if key in found:
+                continue
+            pending.append({**item, "index": index, "key": key})
+        return pending
+
     async def _stage_completed(self, task_id: UUID, stage: str) -> bool:
         found = await self._session.scalar(
             select(TaskEvent.id)
@@ -1208,6 +1273,16 @@ def _review_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any]
         "critical": review.get("critical") is True,
         "checksum": review.get("checksum"),
         "version": review.get("version"),
+    }
+
+
+def _route_payload(item: dict[str, Any], attempt: int) -> dict[str, Any]:
+    return {
+        "attempt": attempt,
+        "index": item["index"],
+        "route": item["route"],
+        "reason": item["reason"],
+        "phase": item["phase"],
     }
 
 

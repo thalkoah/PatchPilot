@@ -95,6 +95,7 @@ async def process_one(
     runner_root: Path | None = None,
     runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
+    supervisor_model: bool = False,
 ) -> bool:
     """Claim and finish one task. Return False when there is nothing to do.
 
@@ -134,6 +135,7 @@ async def process_one(
         runner_root=runner_root,
         runner_wait_seconds=runner_wait_seconds,
         max_tool_calls=max_tool_calls,
+        supervisor_model=supervisor_model,
     )
     return True
 
@@ -153,6 +155,7 @@ async def process_task(
     runner_root: Path | None = None,
     runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
+    supervisor_model: bool = False,
 ) -> bool:
     """Triage one task when it is still queued. Return False if another worker owns it."""
     compiled = graph if graph is not None else compile_triage_graph()
@@ -179,6 +182,7 @@ async def process_task(
         runner_root=runner_root,
         runner_wait_seconds=runner_wait_seconds,
         max_tool_calls=max_tool_calls,
+        supervisor_model=supervisor_model,
     )
     return True
 
@@ -300,6 +304,7 @@ async def _poll(
                 runner_root=runner_root,
                 runner_wait_seconds=settings.runner_wait_seconds,
                 max_tool_calls=settings.investigator_max_tool_calls,
+                supervisor_model=settings.supervisor_model,
             )
         except Exception as exc:
             logger.error("worker iteration failed: %s", type(exc).__name__)
@@ -323,6 +328,7 @@ async def _finish(
     runner_root: Path | None,
     runner_wait_seconds: float,
     max_tool_calls: int,
+    supervisor_model: bool = False,
 ) -> None:
     logger.info("claimed task=%s", claimed.id)
     tools, repository_error = await _open_tools(session_factory, claimed, repository_root)
@@ -352,6 +358,7 @@ async def _finish(
                 runner_wait_seconds=runner_wait_seconds,
                 max_tool_calls=max_tool_calls,
                 repository_error=repository_error,
+                supervisor_model=supervisor_model,
                 resume_decision=resume_decision,
             )
         except LeaseLost:
@@ -395,6 +402,7 @@ async def _finish(
                 tests=tests,
                 cycles=outcome.cycles,
                 artifacts_root=artifacts_root,
+                routes=outcome.routes,
             )
     except TestReportStoreError:
         logger.error("test report failed task=%s", claimed.id)
@@ -478,6 +486,7 @@ async def _pause(
                 result_json=outcome.result_json,
                 plan=outcome.plan,
                 artifacts_root=artifacts_root,
+                routes=outcome.routes,
             )
     except ArtifactStoreError:
         logger.error("plan artifact failed task=%s", claimed.id)

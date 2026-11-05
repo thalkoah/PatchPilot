@@ -692,3 +692,49 @@ The running Compose stack was left as it was. It does not include the review nod
 ### Next task
 
 Task 15 — Supervisor routing and real multi-agent orchestration.
+
+## Task 15 — Supervisor routing and real multi-agent orchestration
+
+Status: complete (2026-11-05).
+
+Every specialist node returns to `supervisor`. Deterministic rules choose the next node and record why. The routes are `investigate`, `investigate_more`, `plan`, `replan`, `proceed_to_approval`, `prepare_workspace`, `develop`, `test`, `review`, `repair`, `finalize`, and `escalate`. A task with no repository finalizes after triage. An investigation that cited no line runs once more, then plans. A plan whose paths were all forbidden is replanned once, and the model may instead choose `finalize` for that case. A plan that names a change still waits for approval. Policy still owns repair: a failing suite or a repair request goes back to `develop` at most twice, and the model may only choose `repair` or `escalate` there. Escalation, rejection, and a decline end at `finalize`. The model is off unless `SUPERVISOR_MODEL=true`. A recommendation is schema-validated, and a route the rules did not allow is ignored. The model cannot approve a plan, write a file, or raise a limit. The graph stops after 24 supervisor decisions, after 900 seconds, or at LangGraph's recursion limit of 40. Each decision is a `route` event. Alembic head is still `0006_workspaces`.
+
+### Evidence
+
+`uv run pytest` — 242 passed in 29.61s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 132 files already formatted.
+
+A task with no repository stores one `finalize` route whose reason says investigation is skipped, and the only model call is `TriageResult`. A missing-evidence report is investigated a second time, then planned, and the stored plan has `can_proceed` false. One `ChangePlan` call is made. An all-forbidden plan is replanned once and then declines. Two `ChangePlan` calls are made. With `SUPERVISOR_MODEL=true`, a recommendation of `proceed_to_approval` on a task with no repository stays `finalize`, and the stored reason names the rejected route. The model's own reason text is not stored. The same switch lets the model choose `finalize` instead of `replan` for an all-forbidden plan, and that run makes one `ChangePlan` call. A reviewer `escalate`, a repair request, a step cap of 24, and a passed deadline each select the rule's route in the routing tests. Resuming a thread that stopped after triage enters `supervisor` and does not call the model again. The stored summary stays `pass-1`.
+
+The running Compose stack was left as it was. It does not include the supervisor node until the next image rebuild recreates the worker.
+
+### Changed files
+
+- `src/patchpilot/agents/supervisor.py`, `llm/supervisor.py` — `SupervisorDecision`, the rules, and the optional recommendation
+- `src/patchpilot/agents/limits.py` — investigation, plan, step, deadline, and recursion caps
+- `src/patchpilot/workflow/graph.py` — supervisor node and conditional edges
+- `src/patchpilot/llm/fake.py` — deterministic supervisor recommendations
+- `src/patchpilot/audit.py`, `repositories/events.py`, `repositories/jobs.py` — `route` events
+- `src/patchpilot/worker.py`, `config.py` — `SUPERVISOR_MODEL`, off by default
+- `tests/test_supervisor.py`, plus workflow, event, investigator, checkpoint, config, and Compose updates
+- `compose.yaml`, `.env.example`, `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` was not executed. The Compose containers were left running and do not include the supervisor node yet.
+- Host Ollama was not asked to choose a route. The rules, the override, and the accepted recommendation were exercised with `FakeProvider`.
+- `SUPERVISOR_MODEL` defaults to false. The rules are the route. Most decisions allow one route. The model can choose between `replan` and `finalize` when every proposed path was forbidden, and between `repair` and `escalate` when policy requested a repair.
+- A second investigation starts over and spends another tool budget. It does not continue the first investigation's notes.
+- A plan the model returns with invalid JSON still fails at `plan`. Replan is for a valid plan whose paths were all rejected. A deliberate decline with no rejected path is not replanned.
+- The step cap is 24, the deadline is 900 seconds from the first supervisor decision, and the LangGraph recursion limit is 40. They are constants. An environment setting cannot raise them.
+- Route events are written when the run is stored. On the first transaction they follow triage completion. On a resumed run, decisions already stored are not inserted again. The payload index is the decision order.
+- The event ordinal cap is 40 so one transaction can hold the route rows and the stage rows. It was 20.
+- A checkpoint that already chose its next node still enters that node. A task paused on approval resumes through the supervisor. A checkpoint that finished triage and was waiting for `finalize` now enters `supervisor`, then `finalize`.
+- The supervisor does not read the checkout, apply a patch, or approve a plan. Those controls stay in the existing nodes.
+
+### Next task
+
+Task 16 — Model routing, usage, limits and operational controls.

@@ -13,6 +13,7 @@ import pytest
 from tests.database import open_session_factory
 from tests.workflow_support import compiled_worker_graph
 
+from patchpilot.agents.limits import GRAPH_RECURSION_LIMIT
 from patchpilot.checkpoints import checkpointer_conninfo
 from patchpilot.config import Settings, get_settings
 from patchpilot.db.models import TaskStatus
@@ -126,9 +127,10 @@ class NumberedProvider:
 def test_thread_id_is_the_task_uuid():
     task_id = UUID("6f0d5c6e-3b1a-4f7e-9c2d-1a2b3c4d5e6f")
 
-    assert thread_config(task_id) == {
-        "configurable": {"thread_id": "6f0d5c6e-3b1a-4f7e-9c2d-1a2b3c4d5e6f"}
-    }
+    config = thread_config(task_id)
+
+    assert config["configurable"] == {"thread_id": "6f0d5c6e-3b1a-4f7e-9c2d-1a2b3c4d5e6f"}
+    assert config["recursion_limit"] == GRAPH_RECURSION_LIMIT
 
 
 def test_checkpointer_connection_is_named_without_changing_the_database():
@@ -187,7 +189,7 @@ async def test_resume_does_not_repeat_the_user_facing_summary(postgres_database_
 
     assert first.calls == 1
     assert not paused.get("result_summary")
-    assert snapshot.next == ("finalize",)
+    assert snapshot.next == ("supervisor",)
     paused_ids = _checkpoint_ids(postgres_database_url, task_id)
     assert paused_ids
 
