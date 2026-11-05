@@ -83,11 +83,13 @@ class InvestigatorAgent:
         *,
         max_tool_calls: int,
         lease_lost: Callable[[], bool] | None = None,
+        charge_tool: Callable[[], None] | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
         self._max_tool_calls = require_tool_budget(max_tool_calls)
         self._lease_lost = lease_lost
+        self._charge_tool = charge_tool
 
     def run(
         self,
@@ -118,6 +120,8 @@ class InvestigatorAgent:
             request = step.tool
             if request is None:
                 break
+            if self._charge_tool is not None:
+                self._charge_tool()
             observations.append(_execute(self._tools, request, ledger))
         self._check_lease()
         report = self._provider.generate_structured(

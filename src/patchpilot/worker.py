@@ -43,10 +43,15 @@ from patchpilot.config import (
 from patchpilot.db.models import TaskStatus
 from patchpilot.db.session import create_engine, create_session_factory
 from patchpilot.leases import LeaseKeeper
-from patchpilot.llm.factory import create_provider
+from patchpilot.llm.budget import TaskBudget
+from patchpilot.llm.local_gate import LocalGate
+from patchpilot.llm.meter import ModelCallDraft
+from patchpilot.llm.pricing import load_pricing
 from patchpilot.llm.provider import LLMProvider
+from patchpilot.llm.routing import StageModels, UsageControl, build_router
 from patchpilot.repositories.approvals import ApprovalRepository
 from patchpilot.repositories.jobs import ClaimedTask, JobRepository
+from patchpilot.repositories.model_calls import ModelCallRepository
 from patchpilot.repositories.repos import RepoRepository
 from patchpilot.runner.limits import DEFAULT_RUNNER_WAIT_SECONDS
 from patchpilot.source.errors import SourceError
@@ -96,6 +101,7 @@ async def process_one(
     runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     supervisor_model: bool = False,
+    usage: UsageControl | None = None,
 ) -> bool:
     """Claim and finish one task. Return False when there is nothing to do.
 
@@ -136,6 +142,7 @@ async def process_one(
         runner_wait_seconds=runner_wait_seconds,
         max_tool_calls=max_tool_calls,
         supervisor_model=supervisor_model,
+        usage=usage,
     )
     return True
 
@@ -156,6 +163,7 @@ async def process_task(
     runner_wait_seconds: float = DEFAULT_RUNNER_WAIT_SECONDS,
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     supervisor_model: bool = False,
+    usage: UsageControl | None = None,
 ) -> bool:
     """Triage one task when it is still queued. Return False if another worker owns it."""
     compiled = graph if graph is not None else compile_triage_graph()
@@ -183,6 +191,7 @@ async def process_task(
         runner_wait_seconds=runner_wait_seconds,
         max_tool_calls=max_tool_calls,
         supervisor_model=supervisor_model,
+        usage=usage,
     )
     return True
 
@@ -195,8 +204,23 @@ async def serve(
 ) -> None:
     """Poll until the process is interrupted. Model calls happen inside process_one."""
     owns_provider = provider is None
+    router = None
+    usage = None
     if provider is None:
-        provider = create_provider(settings)
+        router = build_router(settings)
+        provider = router.fallback()
+        usage = UsageControl(
+            router=router,
+            pricing=load_pricing(settings.llm_pricing_path),
+            max_model_calls=settings.task_max_model_calls,
+            max_tool_calls=settings.task_max_tool_calls,
+            max_tokens=settings.task_max_tokens,
+            max_runtime_seconds=settings.task_max_runtime_seconds,
+            max_parallelism=settings.task_max_parallelism,
+            max_repairs=settings.task_max_repairs,
+            database_url=settings.database_url,
+            gate=LocalGate(),
+        )
     engine = None
     factory = session_factory
     database_url = None if session_factory is not None else settings.database_url
@@ -223,6 +247,7 @@ async def serve(
                     artifacts_root=artifacts_root,
                     workspace_root=workspace_root,
                     runner_root=runner_root,
+                    usage=usage,
                 )
         else:
             await _poll(
@@ -236,9 +261,12 @@ async def serve(
                 artifacts_root=artifacts_root,
                 workspace_root=workspace_root,
                 runner_root=runner_root,
+                usage=usage,
             )
     finally:
-        if owns_provider:
+        if router is not None:
+            router.close()
+        elif owns_provider and provider is not None:
             provider.close()
         if engine is not None:
             await engine.dispose()
@@ -279,6 +307,7 @@ async def _poll(
     artifacts_root: Path | None,
     workspace_root: Path | None,
     runner_root: Path | None,
+    usage: UsageControl | None = None,
 ) -> None:
     worker_id = new_worker_id()
     logger.info(
@@ -305,6 +334,7 @@ async def _poll(
                 runner_wait_seconds=settings.runner_wait_seconds,
                 max_tool_calls=settings.investigator_max_tool_calls,
                 supervisor_model=settings.supervisor_model,
+                usage=usage,
             )
         except Exception as exc:
             logger.error("worker iteration failed: %s", type(exc).__name__)
@@ -329,8 +359,10 @@ async def _finish(
     runner_wait_seconds: float,
     max_tool_calls: int,
     supervisor_model: bool = False,
+    usage: UsageControl | None = None,
 ) -> None:
     logger.info("claimed task=%s", claimed.id)
+    budget, models = await _bind_models(session_factory, claimed.id, usage)
     tools, repository_error = await _open_tools(session_factory, claimed, repository_root)
     resume_decision = await _load_resume_decision(session_factory, claimed.id)
     keeper = None
@@ -360,6 +392,8 @@ async def _finish(
                 repository_error=repository_error,
                 supervisor_model=supervisor_model,
                 resume_decision=resume_decision,
+                budget=budget,
+                models=models,
             )
         except LeaseLost:
             logger.warning("lease lost task=%s", claimed.id)
@@ -371,6 +405,8 @@ async def _finish(
         lost = False
         if keeper is not None:
             lost = not keeper.stop()
+        if models is not None:
+            await _store_model_calls(session_factory, models.take_records(), claimed.id)
     if lost:
         logger.warning("lease lost task=%s", claimed.id)
         return
@@ -503,6 +539,50 @@ async def _pause(
         logger.warning("discarded result task=%s run=%s", claimed.id, claimed.run_id)
         return
     logger.info("waiting for approval task=%s", claimed.id)
+
+
+async def _bind_models(
+    session_factory: async_sessionmaker[AsyncSession],
+    task_id: UUID,
+    usage: UsageControl | None,
+) -> tuple[TaskBudget | None, StageModels | None]:
+    """Attach this task's budget. A missing control keeps the single provider."""
+    if usage is None:
+        return None, None
+    async with session_factory() as session:
+        seed = await ModelCallRepository(session).seed(task_id)
+    budget = TaskBudget.from_seed(
+        seed,
+        max_model_calls=usage.max_model_calls,
+        max_tool_calls=usage.max_tool_calls,
+        max_tokens=usage.max_tokens,
+        max_runtime_seconds=usage.max_runtime_seconds,
+        max_parallelism=usage.max_parallelism,
+        max_repairs=usage.max_repairs,
+    )
+    models = usage.router.bind(
+        task_id=task_id,
+        budget=budget,
+        pricing=usage.pricing,
+        gate=usage.gate,
+        advisory=True,
+        database_url=usage.database_url,
+    )
+    return budget, models
+
+
+async def _store_model_calls(
+    session_factory: async_sessionmaker[AsyncSession],
+    records: list[ModelCallDraft],
+    task_id: UUID,
+) -> None:
+    if not records:
+        return
+    try:
+        async with session_factory() as session:
+            await ModelCallRepository(session).insert_many(records)
+    except Exception:
+        logger.error("model call record failed task=%s", task_id)
 
 
 async def _load_resume_decision(

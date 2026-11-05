@@ -53,6 +53,9 @@ def test_worker_reaches_host_ollama_only_through_the_documented_gateway():
     assert "INVESTIGATOR_MAX_TOOL_CALLS: ${INVESTIGATOR_MAX_TOOL_CALLS:-6}" in worker
     assert "SUPERVISOR_MODEL: ${SUPERVISOR_MODEL:-false}" in worker
     assert "OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}" in worker
+    assert "LLM_CLOUD_ENABLED: ${LLM_CLOUD_ENABLED:-false}" in worker
+    assert "LLM_CLOUD_API_KEY" not in api
+    assert "TASK_MAX_PARALLELISM: ${TASK_MAX_PARALLELISM:-1}" in worker
     assert "11434" not in api
 
 
@@ -148,6 +151,7 @@ def test_runner_container_has_no_network_and_no_secrets():
         "POSTGRES_PASSWORD",
         "LLM_PROVIDER",
         "OLLAMA_BASE_URL",
+        "LLM_CLOUD_API_KEY",
         "docker.sock",
         "privileged",
     ):
@@ -167,6 +171,8 @@ def test_env_example_is_present_and_env_is_ignored():
 
     assert "DATABASE_URL=" in example
     assert "LLM_PROVIDER=fake" in example
+    assert "LLM_CLOUD_ENABLED=false" in example
+    assert "TASK_MAX_PARALLELISM=1" in example
     assert "WORKER_IDLE_SLEEP_SECONDS=2" in example
     assert "WORKER_LEASE_SECONDS=30" in example
     assert "WORKER_MAX_ATTEMPTS=3" in example

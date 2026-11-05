@@ -21,6 +21,7 @@ from patchpilot.dependencies import (
     get_approval_repository,
     get_artifact_repository,
     get_event_repository,
+    get_model_call_repository,
     get_task_repository,
 )
 from patchpilot.repositories.approvals import (
@@ -30,6 +31,7 @@ from patchpilot.repositories.approvals import (
 )
 from patchpilot.repositories.artifacts import ArtifactRepository
 from patchpilot.repositories.events import EventRepository
+from patchpilot.repositories.model_calls import ModelCallRepository
 from patchpilot.repositories.tasks import TaskRepository, UnregisteredRepositoryError
 from patchpilot.schemas.approvals import ApprovalList, ApprovalResponse, DecisionCreate
 from patchpilot.schemas.events import EventList, EventResponse
@@ -46,12 +48,14 @@ from patchpilot.schemas.tasks import (
     TaskStatus,
 )
 from patchpilot.schemas.test_reports import TestReportResponse
+from patchpilot.schemas.usage import UsageLimits, UsageResponse, usage_response
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 RepositoryDep = Annotated[TaskRepository, Depends(get_task_repository)]
 EventRepositoryDep = Annotated[EventRepository, Depends(get_event_repository)]
 ArtifactRepositoryDep = Annotated[ArtifactRepository, Depends(get_artifact_repository)]
 ApprovalRepositoryDep = Annotated[ApprovalRepository, Depends(get_approval_repository)]
+ModelCallRepositoryDep = Annotated[ModelCallRepository, Depends(get_model_call_repository)]
 
 
 @router.post("", status_code=201, response_model=TaskResponse)
@@ -89,6 +93,29 @@ async def get_task(task_id: UUID, repository: RepositoryDep) -> TaskResponse:
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return TaskResponse.model_validate(task)
+
+
+@router.get("/{task_id}/usage", response_model=UsageResponse)
+async def get_task_usage(
+    task_id: UUID,
+    repository: RepositoryDep,
+    calls: ModelCallRepositoryDep,
+) -> UsageResponse:
+    """Return stored model calls. This handler does not call a model."""
+    task = await repository.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    settings = get_settings()
+    rows = await calls.list_for_task(task_id)
+    limits = UsageLimits(
+        model_calls=settings.task_max_model_calls,
+        tool_calls=settings.task_max_tool_calls,
+        tokens=settings.task_max_tokens,
+        runtime_seconds=settings.task_max_runtime_seconds,
+        parallelism=settings.task_max_parallelism,
+        repairs=settings.task_max_repairs,
+    )
+    return usage_response(task_id, rows, limits)
 
 
 @router.get("/{task_id}/events", response_model=EventList)

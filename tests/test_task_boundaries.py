@@ -70,7 +70,7 @@ def test_worker_runs_the_graph_outside_the_api():
 
     assert "patchpilot.workflow.graph" in modules
     assert "patchpilot.checkpoints" in modules
-    assert "patchpilot.llm.factory" in modules
+    assert "patchpilot.llm.routing" in modules
     assert "BackgroundTasks" not in source
     assert not any(name == "fastapi" or name.startswith("fastapi.") for name in modules)
 

@@ -2,6 +2,7 @@
 
 import enum
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -12,6 +13,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -444,3 +446,67 @@ class Workspace(Base):
 
     def __repr__(self) -> str:
         return f"Workspace(task_id={self.task_id!s}, status={self.status})"
+
+
+class ModelCall(Base):
+    """One structured model call. The prompt and the reply are not stored."""
+
+    __tablename__ = "model_calls"
+    __table_args__ = (
+        CheckConstraint(
+            "provider IN ('fake', 'ollama', 'openai')",
+            name="ck_model_calls_provider",
+        ),
+        CheckConstraint(
+            "stage IN ('triage', 'investigate', 'plan', 'develop', 'review', 'supervisor')",
+            name="ck_model_calls_stage",
+        ),
+        CheckConstraint(
+            "outcome IN ("
+            "'success', 'transient_error', 'permanent_error', 'invalid_output', "
+            "'budget_exhausted', 'circuit_open', 'capability_rejected'"
+            ")",
+            name="ck_model_calls_outcome",
+        ),
+        CheckConstraint("latency_ms >= 0", name="ck_model_calls_latency"),
+        CheckConstraint(
+            "prompt_tokens IS NULL OR prompt_tokens >= 0",
+            name="ck_model_calls_prompt_tokens",
+        ),
+        CheckConstraint(
+            "output_tokens IS NULL OR output_tokens >= 0",
+            name="ck_model_calls_output_tokens",
+        ),
+        CheckConstraint(
+            "(cost_known = false AND estimated_cost_usd IS NULL) OR "
+            "(cost_known = true AND estimated_cost_usd IS NOT NULL "
+            "AND estimated_cost_usd >= 0)",
+            name="ck_model_calls_cost",
+        ),
+        Index("ix_model_calls_task_created", "task_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("tasks.id", name="fk_model_calls_task_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    stage: Mapped[str] = mapped_column(String(STAGE_MAX_LENGTH), nullable=False)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    estimated_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(14, 6), nullable=True)
+    cost_known: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return f"ModelCall(task_id={self.task_id!s}, stage={self.stage}, outcome={self.outcome})"

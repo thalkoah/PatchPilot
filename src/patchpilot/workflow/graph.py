@@ -68,12 +68,14 @@ from patchpilot.agents.supervisor import (
 )
 from patchpilot.artifacts import checksum, proposal_document, review_document
 from patchpilot.db.models import APPROVAL_REASON_MAX_LENGTH, TaskStatus
+from patchpilot.llm.budget import TaskBudget
 from patchpilot.llm.errors import LLMError
 from patchpilot.llm.investigation import InvestigationReport
 from patchpilot.llm.patch import PatchProposal
 from patchpilot.llm.plan import ChangePlan
 from patchpilot.llm.provider import LLMProvider
 from patchpilot.llm.review import FindingSeverity, ReviewResult
+from patchpilot.llm.routing import StageModels
 from patchpilot.llm.supervisor import SupervisorRoute
 from patchpilot.llm.triage import TriageResult
 from patchpilot.patching.apply import MAX_DIFF_BYTES, AppliedPatch
@@ -102,6 +104,7 @@ STAGE_WORKSPACE = "prepare_workspace"
 STAGE_DEVELOP = "develop"
 STAGE_TEST = "test"
 STAGE_REVIEW = "review"
+STAGE_SUPERVISOR = "supervisor"
 STAGE_FINALIZE = "finalize"
 GENERIC_FAILURE = "Triage failed before a valid result was produced."
 INVESTIGATION_FAILURE = "Investigation failed before a valid report was produced."
@@ -187,6 +190,8 @@ class WorkflowContext:
     repository_error: str | None = None
     supervisor_model: bool = False
     supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS
+    budget: TaskBudget | None = None
+    models: StageModels | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +212,13 @@ class TriageOutcome:
     repairs: tuple[dict[str, Any], ...] = ()
     cycles: tuple[ReviewedCycle, ...] = ()
     routes: tuple[dict[str, Any], ...] = ()
+
+
+def _provider(context: WorkflowContext, stage: str) -> LLMProvider:
+    """The stage's model when routing is configured, otherwise the single provider."""
+    if context.models is not None:
+        return context.models.for_stage(stage)
+    return context.provider
 
 
 def triage_prompt(*, title: str, description: str) -> str:
@@ -338,6 +350,8 @@ async def run_triage(
     repository_error: str | None = None,
     supervisor_model: bool = False,
     supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS,
+    budget: TaskBudget | None = None,
+    models: StageModels | None = None,
 ) -> TriageOutcome:
     """Run one triage. Provider failures become a failed outcome instead of raw text."""
     state = initial_triage_state(
@@ -361,6 +375,8 @@ async def run_triage(
             repository_error=repository_error,
             supervisor_model=supervisor_model,
             supervisor_deadline_seconds=supervisor_deadline_seconds,
+            budget=budget,
+            models=models,
         )
     except LeaseLost:
         raise
@@ -387,6 +403,8 @@ async def run_claimed_triage(
     repository_error: str | None = None,
     supervisor_model: bool = False,
     supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS,
+    budget: TaskBudget | None = None,
+    models: StageModels | None = None,
     resume_decision: dict[str, Any] | None = None,
 ) -> TriageOutcome:
     """Resume a checkpointed thread, or start one when no checkpoint exists.
@@ -417,6 +435,8 @@ async def run_claimed_triage(
                     repository_error=repository_error,
                     supervisor_model=supervisor_model,
                     supervisor_deadline_seconds=supervisor_deadline_seconds,
+                    budget=budget,
+                    models=models,
                 )
             except LeaseLost:
                 raise
@@ -445,6 +465,8 @@ async def run_claimed_triage(
                     repository_error=repository_error,
                     supervisor_model=supervisor_model,
                     supervisor_deadline_seconds=supervisor_deadline_seconds,
+                    budget=budget,
+                    models=models,
                 )
             except LeaseLost:
                 raise
@@ -468,6 +490,8 @@ async def run_claimed_triage(
         repository_error=repository_error,
         supervisor_model=supervisor_model,
         supervisor_deadline_seconds=supervisor_deadline_seconds,
+        budget=budget,
+        models=models,
     )
 
 
@@ -488,6 +512,8 @@ async def invoke_triage(
     repository_error: str | None = None,
     supervisor_model: bool = False,
     supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS,
+    budget: TaskBudget | None = None,
+    models: StageModels | None = None,
 ) -> dict[str, Any]:
     """Run or resume one thread.
 
@@ -517,6 +543,8 @@ async def invoke_triage(
             repository_error=repository_error,
             supervisor_model=supervisor_model,
             supervisor_deadline_seconds=supervisor_deadline_seconds,
+            budget=budget,
+            models=models,
         ),
         **options,
     )
@@ -568,7 +596,11 @@ def supervisor_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> di
         deadline = DEFAULT_SUPERVISOR_DEADLINE_SECONDS
     decision = decide_route(state, now=now, deadline_seconds=deadline)
     if runtime.context.supervisor_model:
-        decision = with_model(decision, provider=runtime.context.provider, state=state)
+        decision = with_model(
+            decision,
+            provider=_provider(runtime.context, STAGE_SUPERVISOR),
+            state=state,
+        )
         if _lease_is_lost(runtime):
             raise LeaseLost()
     return _supervisor_update(state, decision, now=now)
@@ -732,8 +764,10 @@ def develop_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[
         except ValueError:
             logger.error("patch rejected the review state")
             return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
+        if context.budget is not None:
+            context.budget.allow_repair(repair_count)
         outcome = DeveloperAgent(
-            context.provider,
+            _provider(context, STAGE_DEVELOP),
             worktree,
             lease_lost=context.lease_lost,
         ).run(
@@ -833,7 +867,7 @@ def review_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[s
         raise LeaseLost()
     context = runtime.context
     try:
-        budget = context.max_repairs
+        budget = context.max_repairs if context.budget is None else context.budget.max_repairs
         if isinstance(budget, bool) or not isinstance(budget, int) or not 0 <= budget <= 2:
             raise ValueError("repair budget")
         prepared = _review_inputs(state)
@@ -855,7 +889,10 @@ def review_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[s
             stage=STAGE_REVIEW,
         )
     try:
-        verdict = ReviewerAgent(context.provider, lease_lost=context.lease_lost).run(
+        verdict = ReviewerAgent(
+            _provider(context, STAGE_REVIEW),
+            lease_lost=context.lease_lost,
+        ).run(
             title=state["title"],
             description=state["description"],
             plan=plan,
@@ -895,7 +932,7 @@ def review_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[s
 def triage_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:
     prompt = triage_prompt(title=state["title"], description=state["description"])
     try:
-        result = runtime.context.provider.generate_structured(prompt, TriageResult)
+        result = _provider(runtime.context, STAGE_TRIAGE).generate_structured(prompt, TriageResult)
     except LLMError as exc:
         return _failed_update(failure_text(exc))
     except Exception as exc:
@@ -926,10 +963,11 @@ def investigate_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> d
         return _failed_update(GENERIC_FAILURE, stage=STAGE_TRIAGE)
     try:
         outcome = InvestigatorAgent(
-            context.provider,
+            _provider(context, STAGE_INVESTIGATE),
             context.repository_tools,
             max_tool_calls=context.max_tool_calls,
             lease_lost=context.lease_lost,
+            charge_tool=None if context.budget is None else context.budget.charge_tool,
         ).run(title=state["title"], description=state["description"], triage=triage)
     except StopForLease:
         raise LeaseLost() from None
@@ -969,7 +1007,7 @@ def plan_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
         return _failed_update(INVESTIGATION_FAILURE, stage=STAGE_INVESTIGATE)
     try:
         outcome = PlannerAgent(
-            context.provider,
+            _provider(context, STAGE_PLAN),
             context.repository_tools.root,
             lease_lost=context.lease_lost,
         ).run(

@@ -59,6 +59,21 @@ services:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-180}
       LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
+      LLM_RETRY_BACKOFF_SECONDS: ${LLM_RETRY_BACKOFF_SECONDS:-0.5}
+      LLM_STAGE_MODELS: ${LLM_STAGE_MODELS:-}
+      OLLAMA_TOOL_CALLING: ${OLLAMA_TOOL_CALLING:-false}
+      # Cloud stays off. A key is read only by this service, and only when enabled.
+      LLM_CLOUD_ENABLED: ${LLM_CLOUD_ENABLED:-false}
+      LLM_CLOUD_BASE_URL: ${LLM_CLOUD_BASE_URL:-}
+      LLM_CLOUD_API_KEY: ${LLM_CLOUD_API_KEY:-}
+      LLM_CLOUD_CAPABILITIES: ${LLM_CLOUD_CAPABILITIES:-}
+      LLM_PRICING_PATH: ${LLM_PRICING_PATH:-}
+      TASK_MAX_MODEL_CALLS: ${TASK_MAX_MODEL_CALLS:-24}
+      TASK_MAX_TOOL_CALLS: ${TASK_MAX_TOOL_CALLS:-12}
+      TASK_MAX_TOKENS: ${TASK_MAX_TOKENS:-100000}
+      TASK_MAX_RUNTIME_SECONDS: ${TASK_MAX_RUNTIME_SECONDS:-900}
+      TASK_MAX_PARALLELISM: ${TASK_MAX_PARALLELISM:-1}
+      TASK_MAX_REPAIRS: ${TASK_MAX_REPAIRS:-2}
       # Checkouts registered under this directory. The host path is
       # REPOSITORY_ROOT_HOST. The worker sees only /repositories, read-only.
       REPOSITORY_ROOT: /repositories

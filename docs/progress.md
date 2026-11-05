@@ -738,3 +738,51 @@ The running Compose stack was left as it was. It does not include the supervisor
 ### Next task
 
 Task 16 — Model routing, usage, limits and operational controls.
+
+## Task 16 — Model routing, usage, limits and operational controls
+
+Status: complete (2026-11-05).
+
+Each stage can name `fake`, Ollama, or an explicitly enabled OpenAI-compatible model. An empty `LLM_STAGE_MODELS` keeps `LLM_PROVIDER` and `LLM_MODEL` for triage, investigate, plan, develop, review, and supervisor. Current stages require `structured_output`. Fake always has it. Ollama has it, and native tool calling stays off unless `OLLAMA_TOOL_CALLING=true`. A cloud stage runs only when `LLM_CLOUD_ENABLED=true`, a base URL and API key are set, and `LLM_CLOUD_CAPABILITIES` includes `structured_output`. The cloud client is built only for a stage that selects it. The key is a bearer header on the worker. The API and the runner do not receive it.
+
+A task stops at its model-call, tool-call, reported-token, runtime, parallelism, or repair ceiling. Defaults are 24 model calls, 12 tool calls, 100000 tokens, 900 seconds, parallelism 1, and 2 repairs. Hard caps are 48, 24, 500000, 3600, 1, and 2. Tokens are counted only when the provider reports them. Missing counts stay null. Two invalid outputs for the same stage, provider, and model open a circuit, and the next call does not reach the provider. Invalid JSON, timeouts, and HTTP 408, 429, 502, 503, and 504 wait between attempts. HTTP 500 and connection failures are not retried. Local Ollama calls take one in-process slot and one Postgres advisory lock. Fake and cloud do not take that slot.
+
+Each metered call is a `model_calls` row: stage, provider, model, latency, reported tokens, outcome, and cost. Cost is estimated only from a local JSON file at `LLM_PRICING_PATH` whose entry for that exact model has `verified: true`. Otherwise cost is unknown. Alembic head is `0007_model_calls`. `GET /api/v1/tasks/{id}/usage` reads those rows and does not call a model.
+
+### Evidence
+
+`uv run pytest` — 260 passed in 29.57s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 145 files already formatted.
+
+The usage tests exhaust every budget with `FakeProvider`: model calls, reported tokens, runtime, parallelism, the local slot, investigator tool calls, and repairs. A third invalid output does not call the provider. A pricing file with `verified: true` stores the calculated cost. A missing file, an unverified entry, and a call with no token counts stay unknown. An Ollama 429 waits and then succeeds. An Ollama 500 is one request. `TASK_MAX_PARALLELISM=2` is a validation error. A second advisory lock on disposable PostgreSQL does not acquire. `GET /api/v1/tasks/{id}/usage` after one fake triage lists that call with cost unknown, and a missing task is HTTP 404.
+
+`llm_provider=openai` is still rejected until the cloud flag, URL, and key are set. A stage that needs `structured_output` fails closed when the cloud capability list omits it. Building a fake router does not construct an HTTP client. A disabled cloud provider does not open one. An enabled provider with a mock transport posts once to `{base}/chat/completions`, sends the key as a bearer header, and does not put the key in the URL.
+
+The running Compose stack was left as it was. It does not include `model_calls` or the usage route until the next image rebuild recreates the API and the worker.
+
+### Changed files
+
+- `src/patchpilot/llm/routing.py`, `meter.py`, `budget.py`, `capabilities.py`, `pricing.py`, `backoff.py`, `local_gate.py`, `usage_report.py`, `openai_compatible.py` — stage routing, ceilings, metering, and the cloud client
+- `src/patchpilot/llm/errors.py`, `factory.py`, `fake.py`, `ollama.py` — error classes, reported usage, and transient backoff
+- `src/patchpilot/config.py`, `worker.py`, `workflow/graph.py`, `agents/investigator.py` — settings, the worker router, and per-stage calls
+- `alembic/versions/20261105_0007_model_calls.py`, `db/models.py`, `repositories/model_calls.py`, `schemas/usage.py`, `routes/tasks.py`, `dependencies.py` — `model_calls` and `GET /api/v1/tasks/{id}/usage`
+- `tests/test_usage.py`, plus checkpoint head and boundary updates
+- `compose.yaml`, `.env.example`, `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` was not executed. The Compose containers were left running and do not include this revision yet.
+- Host Ollama and a live cloud API were not called. Backoff and the cloud request were exercised with HTTP mocks. Budgets, the circuit, and the usage route were exercised with `FakeProvider`.
+- Tests that inject a provider do not meter. The worker builds the router, and therefore the records, only when it creates the provider itself.
+- Tool-call counts live in the running task. A resumed investigation can spend another tool budget. Model-call counts, reported tokens, and the invalid-output streak are seeded from `model_calls`.
+- A call that reports no tokens does not spend the token budget. A later call that does report tokens is checked against the sum of reported tokens.
+- Cost stays unknown when any call in the task lacks a verified price or a token count. The usage payload does not add a partial total.
+- Parallelism cannot be raised above one. The advisory lock is held for one Ollama call. Process exit releases it. A lock error does not include the database URL.
+- Prompts and model text are not stored on `model_calls`.
+
+### Next task
+
+Task 17 — Local web dashboard and progress stream.

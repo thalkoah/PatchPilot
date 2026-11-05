@@ -178,6 +178,12 @@ uv run python scripts/check_workflow.py --api-url http://127.0.0.1:8000 --timeou
 
 `LLM_PROVIDER` defaults to `fake`. Leave that value for pytest and CI.
 
+Each stage can name its own provider and model with `LLM_STAGE_MODELS` (`triage=ollama:gemma4:12b`). An empty value uses `LLM_PROVIDER` and `LLM_MODEL` for triage, investigate, plan, develop, review, and supervisor. A stage runs only when that model advertises the capability the stage needs. Current stages need `structured_output`. Native tool calling is separate and stays off for Ollama unless `OLLAMA_TOOL_CALLING=true`.
+
+An OpenAI-compatible cloud API is off unless `LLM_CLOUD_ENABLED=true` and a base URL, API key, and capability list are set. The worker is the only service that receives the key. Building the router does not open a cloud client for a stage that still uses `fake` or Ollama. Invalid JSON, timeouts, and HTTP 408, 429, 502, 503, and 504 wait `LLM_RETRY_BACKOFF_SECONDS` between attempts. HTTP 500 and connection failures are not retried. Two invalid outputs for the same stage and model open a circuit, and the next call does not reach the provider.
+
+A task stops when it exceeds its model-call, tool-call, reported-token, runtime, parallelism, or repair budget. Parallelism is one and cannot be raised. Local Ollama calls also take one shared slot, in this process and with a Postgres advisory lock across workers. `GET /api/v1/tasks/{id}/usage` lists each call's stage, provider, model, latency, reported tokens, and outcome. Cost is `unknown` unless `LLM_PRICING_PATH` points at a local JSON file that marks that exact model `verified`. A missing token count stays null. The file is not fetched from the network, and a price that is not in it is not invented.
+
 Offline check:
 
 ```bash

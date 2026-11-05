@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from patchpilot.llm.capabilities import ModelCapability
 from patchpilot.llm.errors import LLMResponseError
 from patchpilot.llm.investigation import (
     EvidenceCitation,
@@ -23,6 +24,7 @@ from patchpilot.llm.provider import GenerateOptions, ModelT
 from patchpilot.llm.review import FindingSeverity, ReviewAction, ReviewFinding, ReviewResult
 from patchpilot.llm.supervisor import SupervisorRecommendation, SupervisorRoute
 from patchpilot.llm.triage import Classification, Severity, TriageResult
+from patchpilot.llm.usage_report import ReportedUsage
 
 Fixture = BaseModel | Mapping[str, Any]
 
@@ -717,10 +719,24 @@ def _report_from_reads(prompt: str) -> InvestigationReport:
 
 
 class FakeProvider:
-    """Return schema-valid fixtures. The same prompt always returns the same value."""
+    """Return schema-valid fixtures. The same prompt always returns the same value.
 
-    def __init__(self, fixtures: Mapping[str, Fixture] | None = None) -> None:
+    Token counts are reported only when a test or caller supplies them.
+    """
+
+    capabilities = frozenset({ModelCapability.STRUCTURED_OUTPUT, ModelCapability.TOOL_CALLING})
+
+    def __init__(
+        self,
+        fixtures: Mapping[str, Fixture] | None = None,
+        *,
+        usage: ReportedUsage | None = None,
+        usages: list[ReportedUsage | None] | None = None,
+    ) -> None:
         self._fixtures = dict(fixtures or {})
+        self._usage = usage
+        self._usages = None if usages is None else list(usages)
+        self._last_usage: ReportedUsage | None = None
         self.calls: list[ProviderCall] = []
 
     def generate_structured(
@@ -740,22 +756,37 @@ class FakeProvider:
             )
         )
         if checked_prompt in self._fixtures:
-            return coerce_model(checked_schema, self._fixtures[checked_prompt])
-        if checked_schema is TriageResult:
-            return coerce_model(checked_schema, builtin_triage(checked_prompt))
-        if checked_schema is InvestigatorStep:
-            return coerce_model(checked_schema, builtin_investigator_step(checked_prompt))
-        if checked_schema is InvestigationReport:
-            return coerce_model(checked_schema, builtin_investigation_report(checked_prompt))
-        if checked_schema is ChangePlan:
-            return coerce_model(checked_schema, builtin_change_plan(checked_prompt))
-        if checked_schema is PatchProposal:
-            return coerce_model(checked_schema, builtin_patch_proposal(checked_prompt))
-        if checked_schema is ReviewResult:
-            return coerce_model(checked_schema, builtin_review(checked_prompt))
-        if checked_schema is SupervisorRecommendation:
-            return coerce_model(checked_schema, builtin_supervisor(checked_prompt))
-        raise LLMResponseError(f"FakeProvider has no fixture for {checked_schema.__name__}")
+            result: ModelT = coerce_model(checked_schema, self._fixtures[checked_prompt])
+        elif checked_schema is TriageResult:
+            result = coerce_model(checked_schema, builtin_triage(checked_prompt))
+        elif checked_schema is InvestigatorStep:
+            result = coerce_model(checked_schema, builtin_investigator_step(checked_prompt))
+        elif checked_schema is InvestigationReport:
+            result = coerce_model(checked_schema, builtin_investigation_report(checked_prompt))
+        elif checked_schema is ChangePlan:
+            result = coerce_model(checked_schema, builtin_change_plan(checked_prompt))
+        elif checked_schema is PatchProposal:
+            result = coerce_model(checked_schema, builtin_patch_proposal(checked_prompt))
+        elif checked_schema is ReviewResult:
+            result = coerce_model(checked_schema, builtin_review(checked_prompt))
+        elif checked_schema is SupervisorRecommendation:
+            result = coerce_model(checked_schema, builtin_supervisor(checked_prompt))
+        else:
+            raise LLMResponseError(f"FakeProvider has no fixture for {checked_schema.__name__}")
+        self._last_usage = self._next_usage()
+        return result
+
+    def take_usage(self) -> ReportedUsage | None:
+        usage = self._last_usage
+        self._last_usage = None
+        return usage
 
     def close(self) -> None:
         return None
+
+    def _next_usage(self) -> ReportedUsage | None:
+        if self._usages is None:
+            return self._usage
+        if not self._usages:
+            return None
+        return self._usages.pop(0)
