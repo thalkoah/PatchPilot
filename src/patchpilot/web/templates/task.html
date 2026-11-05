@@ -1,0 +1,251 @@
+{% extends "base.html" %}
+{% block title %}{{ page.title }} — PatchPilot{% endblock %}
+{% block body %}
+<article
+  class="panel"
+  data-task-page
+  data-status="{{ page.status }}"
+  data-stage="{{ page.stage }}"
+  data-summary="{{ page.summary }}"
+  data-progress-url="{{ page.progress_url }}"
+>
+  <p class="crumb"><a href="/">Tasks</a></p>
+  <h1>{{ page.title }}</h1>
+  <p class="labels">
+    <span class="badge {{ page.status_class }}">{{ page.status_label }}</span>
+    <span class="stage">{{ page.stage_label }}</span>
+  </p>
+  <p id="result-summary">{{ page.summary or "No summary yet." }}</p>
+  <p class="times">Created {{ page.created }} · Updated {{ page.updated }}</p>
+
+  <section>
+    <h2>Report</h2>
+    <p class="report">{{ page.description }}</p>
+  </section>
+
+  <section id="triage">
+    <h2>Triage</h2>
+    {% if page.triage %}
+    <p>{{ page.triage.classification }} · {{ page.triage.severity }} · confidence {{ page.triage.confidence }}</p>
+    <p>{{ page.triage.summary }}</p>
+    {% if page.triage.needs_clarification %}<p>Needs clarification.</p>{% else %}<p>No clarification requested.</p>{% endif %}
+    <ul>
+      {% for item in page.triage.criteria %}<li>{{ item }}</li>{% endfor %}
+    </ul>
+    {% else %}
+    <p>No triage yet.</p>
+    {% endif %}
+  </section>
+
+  <section id="evidence">
+    <h2>Evidence</h2>
+    {% if page.citations %}
+    <ul class="citations">
+      {% for label in page.citations %}
+      <li><code>{{ label }}</code></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p>No citations yet.</p>
+    {% endif %}
+    {% if page.hypotheses %}
+    <h3>Hypotheses</h3>
+    <ul>
+      {% for item in page.hypotheses %}<li>{{ item.statement }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if page.probable_files %}
+    <h3>Probable files</h3>
+    <ul>
+      {% for path in page.probable_files %}<li><code>{{ path }}</code></li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if page.questions %}
+    <h3>Unanswered</h3>
+    <ul>
+      {% for item in page.questions %}<li>{{ item }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  <section id="plan">
+    <h2>Plan</h2>
+    {% if page.plan %}
+    <p>Version {{ page.plan.version }} · confidence {{ page.plan.confidence }} ·
+      {% if page.plan.can_proceed %}Can proceed{% else %}Declined{% endif %}
+    </p>
+    <p>{{ page.plan.problem_statement }}</p>
+    {% if page.plan.modifications %}
+    <ul>
+      {% for item in page.plan.modifications %}
+      <li><code>{{ item.path }}</code> — {{ item.kind_label }}. {{ item.summary }}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    <p>{{ page.plan.test_strategy }}</p>
+    {% if page.plan.assumptions %}
+    <h3>Assumptions</h3>
+    <ul>{% for item in page.plan.assumptions %}<li>{{ item }}</li>{% endfor %}</ul>
+    {% endif %}
+    {% if page.plan.risks %}
+    <h3>Risks</h3>
+    <ul>{% for item in page.plan.risks %}<li>{{ item }}</li>{% endfor %}</ul>
+    {% endif %}
+    {% elif page.plan_hint %}
+    <p>{% if page.plan_hint.can_proceed %}Can proceed{% else %}Declined{% endif %}
+      {% if page.plan_hint.confidence %}· confidence {{ page.plan_hint.confidence }}{% endif %}
+    </p>
+    <ul>
+      {% for path in page.plan_hint.paths %}<li><code>{{ path }}</code></li>{% endfor %}
+    </ul>
+    {% else %}
+    <p>No plan yet.</p>
+    {% endif %}
+  </section>
+
+  <section id="approval">
+    <h2>Approval</h2>
+    {% if page.pending %}
+    <form
+      id="decision-form"
+      data-decision-url="{{ page.decision_url }}"
+      data-approval-id="{{ page.pending.id }}"
+    >
+      <p>Plan version {{ page.pending.plan_version }} is waiting. This posts JSON to the decisions API.</p>
+      <label for="reason">Reason</label>
+      <input id="reason" name="reason" maxlength="300" autocomplete="off">
+      <div class="actions">
+        <button type="button" data-decision="approve">Approve plan</button>
+        <button type="button" data-decision="reject">Reject plan</button>
+      </div>
+      <p id="decision-error" class="error" role="alert"></p>
+    </form>
+    {% elif page.approvals %}
+    <ul>
+      {% for item in page.approvals %}
+      <li>{{ item.status_label }} · plan version {{ item.plan_version }}{% if item.reason %} · {{ item.reason }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p>No approval request yet.</p>
+    {% endif %}
+  </section>
+
+  <section id="patch">
+    <h2>Patch</h2>
+    {% if page.patch %}
+    <p>Applied diff version {{ page.patch.version }}. The model proposal is a different document.</p>
+    <p>Applied checksum <code data-diff-checksum="{{ page.patch.checksum }}">{{ page.patch.checksum }}</code></p>
+    <p>Proposal checksum <code data-proposal-checksum="{{ page.patch.proposal_checksum }}">{{ page.patch.proposal_checksum }}</code></p>
+    <p>{{ page.patch.summary }}</p>
+    <ul>
+      {% for path in page.patch.paths %}<li><code>{{ path }}</code></li>{% endfor %}
+    </ul>
+    <pre class="diff">{{ page.patch.diff }}</pre>
+    {% else %}
+    <p>No patch yet.</p>
+    {% endif %}
+  </section>
+
+  <section id="tests">
+    <h2>Tests</h2>
+    {% if page.tests %}
+    <p>{{ page.tests.status_label }} · exit {{ page.tests.exit_code }} · {{ page.tests.duration_ms }} ms</p>
+    {% if page.tests.output_truncated %}<p>Output was truncated.</p>{% endif %}
+    <h3>stdout</h3>
+    <pre>{{ page.tests.stdout }}</pre>
+    <h3>stderr</h3>
+    <pre>{{ page.tests.stderr }}</pre>
+    {% else %}
+    <p>No test report yet.</p>
+    {% endif %}
+  </section>
+
+  <section id="review">
+    <h2>Review</h2>
+    {% if page.review %}
+    <p>Reviewer {{ page.review.action }} · policy {{ page.review.policy }} · repairs {{ page.review.repair_count }}</p>
+    <p>{{ page.review.summary }}</p>
+    {% if page.review.findings %}
+    <ul>
+      {% for item in page.review.findings %}
+      <li>{{ item.severity }} · {{ item.summary }} · <code>{{ item.evidence }}</code></li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% else %}
+    <p>No review yet.</p>
+    {% endif %}
+  </section>
+
+  <section id="usage">
+    <h2>Model usage</h2>
+    <p data-cost="{{ page.usage.cost }}">Cost {{ page.usage.cost }}</p>
+    <p>{{ page.usage.model_calls }} model calls · prompt tokens {{ page.usage.prompt_tokens }} · output tokens {{ page.usage.output_tokens }} · {{ page.usage.latency_ms }} ms</p>
+    <p>Limits: {{ page.usage.model_call_limit }} model calls, {{ page.usage.tool_call_limit }} tool calls, {{ page.usage.token_limit }} tokens, {{ page.usage.runtime_limit }} seconds, {{ page.usage.repair_limit }} repairs.</p>
+    {% if page.usage.calls %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Stage</th>
+            <th>Provider</th>
+            <th>Model</th>
+            <th>Prompt</th>
+            <th>Output</th>
+            <th>Latency</th>
+            <th>Cost</th>
+            <th>Outcome</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for call in page.usage.calls %}
+          <tr>
+            <td>{{ call.stage }}</td>
+            <td>{{ call.provider }}</td>
+            <td>{{ call.model }}</td>
+            <td>{{ call.prompt_tokens }}</td>
+            <td>{{ call.output_tokens }}</td>
+            <td>{{ call.latency_ms }} ms</td>
+            <td>{{ call.cost }}</td>
+            <td>{{ call.outcome }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p>No model calls yet.</p>
+    {% endif %}
+  </section>
+
+  <section id="timeline-section">
+    <h2>Timeline</h2>
+    <p>This page polls for new events and appends each id once.</p>
+    {% if page.events_truncated %}<p>The event list is truncated.</p>{% endif %}
+    <ol id="timeline" aria-live="polite">
+      {% if page.events %}
+      {% for event in page.events %}
+      {% include "event.html" %}
+      {% endfor %}
+      {% else %}
+      <li id="timeline-empty">No events yet.</li>
+      {% endif %}
+    </ol>
+  </section>
+
+  <section id="api-links">
+    <h2>JSON API</h2>
+    <ul>
+      <li><a href="/api/v1/tasks/{{ page.id }}">Task</a></li>
+      <li><a href="/api/v1/tasks/{{ page.id }}/events">Events</a></li>
+      <li><a href="/api/v1/tasks/{{ page.id }}/plan">Plan</a></li>
+      <li><a href="/api/v1/tasks/{{ page.id }}/approvals">Approvals</a></li>
+      <li><a href="/api/v1/tasks/{{ page.id }}/patch">Patch</a></li>
+      <li><a href="/api/v1/tasks/{{ page.id }}/tests">Tests</a></li>
+      <li><a href="/api/v1/tasks/{{ page.id }}/review">Review</a></li>
+      <li><a href="/api/v1/tasks/{{ page.id }}/usage">Usage</a></li>
+    </ul>
+  </section>
+</article>
+{% endblock %}

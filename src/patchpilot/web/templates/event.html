@@ -1,0 +1,12 @@
+<li data-event-id="{{ event.id }}">
+  <time datetime="{{ event.iso }}">{{ event.display_time }}</time>
+  <span class="event-type">{{ event.event_label }}</span>
+  <span class="event-stage">{{ event.stage_label }}</span>
+  {% if event.details %}
+  <dl>
+    {% for key, value in event.details %}
+    <div><dt>{{ key }}</dt><dd>{{ value }}</dd></div>
+    {% endfor %}
+  </dl>
+  {% endif %}
+</li>

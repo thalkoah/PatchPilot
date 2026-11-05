@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Tasks — PatchPilot{% endblock %}
+{% block body %}
+<section class="panel">
+  <h1>Tasks</h1>
+  <h2>New task</h2>
+  <p>Submitting posts JSON to <code>POST /api/v1/tasks</code>. The worker triages it.</p>
+  <form id="create-task" data-create-url="/api/v1/tasks">
+    <label for="title">Title</label>
+    <input id="title" name="title" required maxlength="200" autocomplete="off">
+    <label for="description">Description</label>
+    <textarea id="description" name="description" required maxlength="20000" rows="6"></textarea>
+    <label for="repo_id">Repository</label>
+    <select id="repo_id" name="repo_id">
+      <option value="">No repository</option>
+      {% for repo_id, name in page.repositories %}
+      <option value="{{ repo_id }}">{{ name }}</option>
+      {% endfor %}
+    </select>
+    <div class="actions">
+      <button type="submit">Create task</button>
+    </div>
+    <p id="form-error" class="error" role="alert"></p>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>Open tasks</h2>
+  <p>{{ page.total }} total</p>
+  <nav class="filters" aria-label="Status">
+    {% for item in page.filters %}
+    <a href="{{ item.href }}"{% if item.current %} aria-current="page"{% endif %}>{{ item.label }}</a>
+    {% endfor %}
+  </nav>
+  {% if page.tasks %}
+  <ul class="task-list">
+    {% for task in page.tasks %}
+    <li>
+      <a href="{{ task.href }}">{{ task.title }}</a>
+      <span class="badge {{ task.status_class }}">{{ task.status_label }}</span>
+      <span class="stage">{{ task.stage_label }}</span>
+      {% if task.summary %}<p>{{ task.summary }}</p>{% endif %}
+      <time>{{ task.created }}</time>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p>No tasks yet.</p>
+  {% endif %}
+  <nav class="pager" aria-label="Pages">
+    {% if page.previous_href %}<a href="{{ page.previous_href }}">Previous</a>{% endif %}
+    {% if page.next_href %}<a href="{{ page.next_href }}">Next</a>{% endif %}
+  </nav>
+</section>
+{% endblock %}

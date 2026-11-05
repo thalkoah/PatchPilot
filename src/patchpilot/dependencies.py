@@ -10,6 +10,7 @@ from patchpilot.repositories.approvals import ApprovalRepository
 from patchpilot.repositories.artifacts import ArtifactRepository
 from patchpilot.repositories.events import EventRepository
 from patchpilot.repositories.model_calls import ModelCallRepository
+from patchpilot.repositories.repos import RepoRepository
 from patchpilot.repositories.tasks import TaskRepository
 
 
@@ -47,3 +48,9 @@ def get_model_call_repository(
     session: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> ModelCallRepository:
     return ModelCallRepository(session)
+
+
+def get_repo_repository(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> RepoRepository:
+    return RepoRepository(session)

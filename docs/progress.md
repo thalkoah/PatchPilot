@@ -786,3 +786,46 @@ The running Compose stack was left as it was. It does not include `model_calls` 
 ### Next task
 
 Task 17 — Local web dashboard and progress stream.
+
+## Task 17 — Local web dashboard and progress stream
+
+Status: complete (2026-11-05).
+
+The API serves a server-rendered dashboard at `/`. The task list and the create form are HTML. Creating a task posts JSON to `POST /api/v1/tasks`. A task page shows status, stage, the report, triage, evidence citations, the plan, approval, the applied diff, the pytest report, the review, and model usage. Approve and reject post JSON to `POST /api/v1/tasks/{id}/decisions`. The page itself has no write route.
+
+The task page polls `GET /tasks/{id}/progress` every 2 seconds. The response contains only events after the last id already on the page, and the script skips an id that is already present. A status or stage change reloads the page from the database. Reading the page does not need JavaScript. Connection strings, bearer tokens, `sk-` keys, secret-like JSON fields, and configured secrets of at least eight characters are replaced before render. The page does not show artifact filesystem paths. Cost stays `unknown` unless a stored call was estimated. The layout is one column below 40rem. The wheel includes the templates and the static files.
+
+### Evidence
+
+`uv run pytest` — 271 passed in 29.16s.
+
+`uv run ruff check .` — all checks passed.
+
+`uv run ruff format --check .` — 152 files already formatted.
+
+`uv build --wheel` produced a wheel containing `patchpilot/web/templates/` and `patchpilot/web/static/`.
+
+A local API on disposable PostgreSQL was opened in the browser. The create form posted the sample issue and opened the task page at status Queued. Two inserted events appeared in the timeline, two distinct ids, with the first still present after the second poll. The list then showed that task as Queued. At a 390px width the page did not scroll sideways, and the database password was not in the page text.
+
+The running Compose stack was left as it was. It does not include this dashboard until the next image rebuild recreates the API.
+
+### Changed files
+
+- `src/patchpilot/web/` — pages, progress cursor, redaction, templates, and static files
+- `src/patchpilot/api.py`, `dependencies.py` — dashboard routes, static files, repository lookup
+- `tests/test_dashboard.py`, `tests/test_dashboard_view.py`
+- `pyproject.toml`, `uv.lock` — Jinja2
+- `.env.example`, `README.md`, `docs/progress.md`
+
+### Limitations
+
+- `docker compose` was not executed. The Compose containers were left running and do not include this dashboard yet.
+- Creating a task and recording a decision need JavaScript. The HTML does not submit a second form endpoint.
+- The progress poll reads status, stage, summary, and new events. Plan, diff, tests, review, and usage appear when the page reloads after the status or stage changes.
+- A configured secret shorter than eight characters is not stripped from free text. Connection strings, bearer tokens, and `sk-` keys are still removed.
+- Host Ollama was not asked to run a task. The browser check used the empty queue and inserted events. The worker was not started.
+- The dashboard does not add a repository picker from the filesystem. The select lists enabled registry rows by display name.
+
+### Next task
+
+Task 18 — Evaluation harness and benchmark report.

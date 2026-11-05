@@ -22,6 +22,8 @@ curl http://localhost:8000/health/ready
 
 `GET /health/ready` opens a PostgreSQL connection and runs `SELECT 1`.
 
+The same process serves the local dashboard at <http://127.0.0.1:8000/>.
+
 - Database accepts the probe: HTTP 200, `{"status":"ok","database":"ready"}`
 - Database is unreachable: HTTP 503, `{"status":"unavailable","database":"unavailable"}`
 
@@ -106,6 +108,28 @@ docker compose exec worker python -m patchpilot.source register \
 `examples/demo_service` is a small FastAPI project. Known customer tiers return a discount. An unknown tier currently produces HTTP 500; the intended response is HTTP 422. See `examples/demo_service/README.md` for the baseline pytest command and the regression that fails on purpose.
 
 Read-only tools are `list_tree`, `read_text_file`, and `search_text`. Each takes a relative path under that one checkout. They refuse `..`, absolute paths, symlink escapes, `.git`, credential names, binaries, and files past the byte limit. Listings omit denied names. Search uses a literal substring and skips symlinks. The investigator is the only caller. The limits are 200 tree entries, depth 6, 32768 bytes, 400 lines, 100 searched files, and 40 matches. One investigation may make at most `INVESTIGATOR_MAX_TOOL_CALLS` tool calls (default 6, hard maximum 12).
+
+## Dashboard
+
+Open <http://127.0.0.1:8000/> after the stack is up. The page is server-rendered HTML. Reading it does not need JavaScript. Creating a task and recording a decision do: those buttons post JSON to the task API. The page does not call a model.
+
+The default `fake` provider can run this walkthrough without Ollama or a cloud key. Register the demo checkout first, and leave the worker running. The dashboard only displays what the worker stores.
+
+1. Initialize and register `examples/demo_service` as above. `python -m patchpilot.source list` prints the repository id.
+2. Open the dashboard. Use the sample issue below and select that repository. The create button posts JSON to `POST /api/v1/tasks` and then opens the task page.
+3. The task page polls `GET /tasks/<id>/progress` every 2 seconds. Each event id is added once. When the status or stage changes, the page reloads from the database.
+4. At **Waiting for approval**, approve or reject the plan. The buttons post JSON to `POST /api/v1/tasks/<id>/decisions`. Rejection stops without a patch. Approval continues in the private worktree.
+5. The finished page shows the evidence citations, the plan, the applied diff, the pytest report, the review, and model usage. Links at the bottom are the same JSON records.
+
+Sample issue:
+
+```text
+Title: Unknown customer tier crashes discount endpoint
+
+When the demo-service discount endpoint receives a customer tier it does not recognize, it returns HTTP 500. It should respond with HTTP 422 and a clear validation error. Find the cause, propose a minimal fix and add a regression test.
+```
+
+The layout is one column on a narrow screen. Database URLs, bearer tokens, `sk-` keys, and configured secrets are not shown. The page does not show artifact filesystem paths.
 
 ## Triage workflow
 

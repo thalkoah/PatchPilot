@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}PatchPilot{% endblock %}</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="site-name" href="/">PatchPilot</a>
+    <p class="site-note">Local dashboard. The task API is the source of truth.</p>
+  </header>
+  <main>
+    {% block body %}{% endblock %}
+  </main>
+  <script src="/static/dashboard.js" defer></script>
+</body>
+</html>
