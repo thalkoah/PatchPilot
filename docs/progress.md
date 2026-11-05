@@ -921,3 +921,50 @@ A disposable API on `127.0.0.1:8765` rendered `/tasks/beb67048-b4aa-4b26-ab65-e0
 ### Next task
 
 Task 20 — Security review, documentation and reproducible demo.
+
+## Task 20 — Security review, documentation and reproducible demo
+
+Status: complete (2026-11-05).
+
+The pass did not add a product feature. It closed one hole in the existing path checks: a regular file with more than one directory entry is refused by the read tools, by patch application, and by the runner copy. Container logs rotate at 10 MB with three files kept. Process log lines are truncated at 500 characters, and a PostgreSQL password, a bearer token, or an `sk-` key in a log line is replaced before the line is written. Named volumes `pgdata`, `artifacts`, and `workspaces` still survive `docker compose down`.
+
+`docs/adr/` records why the worker is separate, why the workflow is a graph, why checkpoints stay in PostgreSQL outside Alembic, why routing stays deterministic, and why pytest runs in a restricted process. `docs/ARCHITECTURE.md` has the runtime picture and the supervisor graph. `docs/DEMO.md` is the five-minute walkthrough for the unknown-tier issue. The README now includes screenshot placeholders, the cost ceilings, limitations, and the threat model. GitHub Actions runs Ruff, mypy, and pytest with `LLM_PROVIDER=fake` and no cloud key.
+
+### Evidence
+
+`.venv/bin/ruff check .` — all checks passed.
+
+`.venv/bin/ruff format --check .` — 180 files already formatted.
+
+`.venv/bin/mypy` — success, 119 source files.
+
+`.venv/bin/pytest -q` — 300 passed in 41.44s.
+
+`tests/test_security_review.py` covers path traversal, a symlink escape, a hard link, a prompt-injection comment that cannot add a citation or a write, dangerous paths and a non-regular file mode, a repeated patch apply, runner command rejection and output bounds, log redaction, cloud and GitHub staying off, a repeated approval that keeps one event, recovery exhaustion that is not retried, and a duplicate audit insert that keeps the first payload.
+
+`docker compose` was not executed. The commands in the README and `docs/DEMO.md` match the Compose file and the existing smoke scripts.
+
+### Changed files
+
+- `src/patchpilot/source/paths.py`, `source/tools.py`, `patching/apply.py`, `runner/staging.py` — refuse hard-linked files
+- `src/patchpilot/logconfig.py` — bounded, redacted process logs, used by the API, worker, runner, checkpoints, and benchmark
+- `src/patchpilot/workflow/graph.py`, `worker.py`, `benchmark/run.py`, and the other modules mypy reported — annotations only, so `uv run mypy` passes
+- `compose.yaml` — json-file log rotation on `db`, `api`, `worker`, and `runner`
+- `tests/test_security_review.py`, `tests/test_compose_contract.py`
+- `README.md`, `docs/DEMO.md`, `docs/ARCHITECTURE.md`, `docs/adr/0001` through `0005`
+- `.github/workflows/ci.yml`, `pyproject.toml`, `uv.lock` — mypy in the dev group and in CI
+- `docs/progress.md`
+
+### Limitations
+
+- Screenshot files are named in the README and are not captured. `docs/screenshots/` is empty until someone saves a live run.
+- This machine was not used to run the new GitHub Actions workflow. The workflow file is what CI will execute.
+- `docker compose` was not executed. Podman has been the verified runner on this machine in earlier tasks.
+- mypy checks `src/patchpilot`. It does not check `tests/`.
+- The localhost API still has no authentication. That is stated in the threat model.
+- The shared runner volume is still one tree. Concurrency stays 1.
+- A registered checkout is still the tree the operator named. Hard links inside it are now refused; the registration command is still a trusted local action.
+
+### Next task
+
+None. Tasks 01–20 are complete.

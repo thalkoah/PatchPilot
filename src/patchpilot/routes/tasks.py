@@ -35,6 +35,7 @@ from patchpilot.repositories.events import EventRepository
 from patchpilot.repositories.model_calls import ModelCallRepository
 from patchpilot.repositories.publications import PublicationRepository
 from patchpilot.repositories.tasks import TaskRepository, UnregisteredRepositoryError
+from patchpilot.runner.protocol import TestStatus
 from patchpilot.schemas.approvals import ApprovalList, ApprovalResponse, DecisionCreate
 from patchpilot.schemas.events import EventList, EventResponse
 from patchpilot.schemas.patches import PatchResponse
@@ -248,7 +249,13 @@ async def get_task_tests(
         )
     except TestReportStoreError:
         raise HTTPException(status_code=404, detail="Test report not found") from None
-    if report.status.value == "invalid_request":
+    if report.status is TestStatus.PASSED:
+        status = "passed"
+    elif report.status is TestStatus.FAILED:
+        status = "failed"
+    elif report.status is TestStatus.TIMED_OUT:
+        status = "timed_out"
+    else:
         raise HTTPException(status_code=404, detail="Test report not found")
     return TestReportResponse(
         task_id=task_id,
@@ -256,7 +263,7 @@ async def get_task_tests(
         checksum=row.checksum,
         size=row.size,
         created_at=row.created_at,
-        status=report.status.value,
+        status=status,
         passed=report.status.value == "passed",
         exit_code=report.exit_code,
         timed_out=report.timed_out,
@@ -291,13 +298,17 @@ async def get_task_review(
         )
     except ArtifactStoreError:
         raise HTTPException(status_code=404, detail="Review not found") from None
+    if policy == "accept" or policy == "repair" or policy == "fail":
+        stored_policy = policy
+    else:
+        raise HTTPException(status_code=404, detail="Review not found")
     return ReviewResponse(
         task_id=task_id,
         version=row.version,
         checksum=row.checksum,
         size=row.size,
         created_at=row.created_at,
-        policy=policy,
+        policy=stored_policy,
         repair_count=repair_count,
         summary=review.summary,
         action=review.action.value,

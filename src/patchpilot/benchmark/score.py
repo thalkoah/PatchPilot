@@ -283,7 +283,7 @@ def aggregate(results: tuple[CaseResult, ...]) -> dict[str, Any]:
     def _case_failed(item: CaseResult) -> bool:
         return any(check.required and check.status == "fail" for check in item.checks)
 
-    def _rate(values: list[bool | None]) -> dict[str, int | None]:
+    def _rate(values: list[bool | None]) -> dict[str, int | float | None]:
         scored = [value for value in values if value is not None]
         if not scored:
             return {"passed": 0, "scored": 0, "rate": None}

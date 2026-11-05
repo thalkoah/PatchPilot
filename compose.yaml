@@ -3,6 +3,14 @@
 
 name: patchpilot
 
+# Rotate container logs. Named volumes below keep PostgreSQL, artifacts, and
+# workspaces across `docker compose down`. Adding `-v` deletes them.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: docker.io/library/postgres:16-alpine
@@ -18,6 +26,7 @@ services:
       start_period: 5s
     volumes:
       - pgdata:/var/lib/postgresql/data
+    logging: *default-logging
 
   api:
     build: .
@@ -36,6 +45,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    logging: *default-logging
 
   worker:
     build: .
@@ -99,6 +109,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    logging: *default-logging
 
   # Pytest runs here, never in the API or the worker. The request file is a job
   # id. This service does not receive the database password or model settings.
@@ -130,6 +141,7 @@ services:
       PYTHONUNBUFFERED: "1"
     volumes:
       - runner:/runner
+    logging: *default-logging
 
 volumes:
   pgdata:

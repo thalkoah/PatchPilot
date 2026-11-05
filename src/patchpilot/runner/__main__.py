@@ -13,6 +13,7 @@ from pathlib import Path
 from pydantic import Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from patchpilot.logconfig import configure_logging
 from patchpilot.runner.env import secret_environment
 from patchpilot.runner.limits import (
     DEFAULT_RUNNER_POLL_SECONDS,
@@ -50,10 +51,7 @@ class RunnerSettings(BaseSettings):
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging("INFO")
     if secret_environment():
         print("runner refused secret environment", file=sys.stderr)
         raise SystemExit(2)

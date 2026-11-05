@@ -24,7 +24,7 @@ from patchpilot.patching.git import (
 )
 from patchpilot.patching.policy import approved_modification, path_is_writable
 from patchpilot.source.errors import SourceError
-from patchpilot.source.paths import is_inside, relative_parts
+from patchpilot.source.paths import is_hard_linked_file, is_inside, relative_parts
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +181,7 @@ def _writable_path(root: Path, relative_path: str, plan: ChangePlan) -> str:
 
 def _read_current(root: Path, relative_path: str) -> bytes | None:
     candidate = root.joinpath(*relative_path.split("/"))
-    if candidate.is_symlink():
+    if candidate.is_symlink() or is_hard_linked_file(candidate):
         raise PatchError("denied_path")
     if not candidate.exists():
         return None
@@ -280,7 +280,7 @@ def _snapshot(root: Path) -> dict[str, str]:
     for path in root.rglob("*"):
         if ".git" in path.parts:
             continue
-        if path.is_symlink():
+        if path.is_symlink() or is_hard_linked_file(path):
             raise PatchError("denied_path")
         if not path.is_file():
             continue

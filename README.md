@@ -45,7 +45,9 @@ docker compose logs worker
 
 Podman reads the same `compose.yaml`. When the Docker CLI is absent, use `podman-compose up --build -d`. `podman compose` needs a separate Compose plugin. Image names are fully qualified so a non-interactive Podman run does not prompt for a registry.
 
-Stop the stack with `docker compose down`. Data stays in the `pgdata` volume, so a task is still there after the API and worker restart.
+Stop the stack with `docker compose down`. Named volumes `pgdata`, `artifacts`, and `workspaces` stay, so tasks, plans, and private worktrees are still there after the API and worker restart. `docker compose down -v` deletes those volumes. Compose rotates each service log at 10 MB and keeps three files.
+
+A five-minute walkthrough is in `docs/DEMO.md`. The runtime picture is in `docs/ARCHITECTURE.md`. The decisions behind the worker, the graph, PostgreSQL checkpoints, deterministic routing, and the restricted runner are in `docs/adr/`.
 
 ## Task API
 
@@ -263,14 +265,71 @@ uv run python -m patchpilot.benchmark --provider ollama --database-url "$DATABAS
 
 That command needs Ollama on the configured base URL. It is not part of `uv run pytest`.
 
+## Screenshots
+
+These files are not in the repository yet. Capture them from a live demo and keep the names:
+
+- `docs/screenshots/01-task-list.png` — task list and the create form
+- `docs/screenshots/02-waiting-approval.png` — plan waiting for a decision
+- `docs/screenshots/03-diff-and-tests.png` — applied diff, pytest report, and review
+
+## Cost limits
+
+A task stops when it exceeds one of these ceilings. The defaults are also the values in `.env.example`.
+
+| Limit | Default | Hard maximum |
+| --- | --- | --- |
+| Model calls | 24 | 48 |
+| Tool calls | 12 | 24 |
+| Reported tokens | 100000 | 500000 |
+| Runtime | 900 seconds | 3600 seconds |
+| Parallelism | 1 | 1 |
+| Repairs | 2 | 2 |
+
+Tokens count only when the provider reports them. Cost is `unknown` unless `LLM_PRICING_PATH` points at a local JSON file that marks that exact model `verified`. A price is never invented. Cloud calls stay off unless `LLM_CLOUD_ENABLED=true` and a base URL, API key, and capability list are set. `GET /api/v1/tasks/{id}/usage` reads the stored rows and does not call a model.
+
+## Limitations
+
+- The API listens on localhost and has no authentication. Do not publish port 8000.
+- `FakeProvider` makes the automated demo and the benchmark deterministic. Those scores measure this repository's fixtures. They are not an industry benchmark and they are not SWE-bench.
+- The runner volume is shared by every job. That is weaker isolation than a fresh mount per task, so worker concurrency stays 1.
+- Publication is off unless you set `GITHUB_ENABLED`, a token, an allowlist entry, and `registration.github` for a repository you own. There is no merge and no deploy.
+- Checkpoint tables come from `AsyncPostgresSaver.setup()`, not from Alembic.
+- A hard link inside a checkout is refused. The operator who registers a repository is still trusted to point `REPOSITORY_ROOT` at the intended tree.
+- Host Ollama is optional. Compose leaves the provider on `fake`. Binding Ollama beyond loopback is a separate choice and is described above.
+
+## Threat model
+
+The person running Compose is the administrator. The model is untrusted. Text in a registered repository is untrusted, including comments that tell the model to ignore instructions. A task description is untrusted.
+
+What the system is built to prevent:
+
+- The API and the runner do not receive the model key or the GitHub token. The runner exits if its environment contains a secret, and pytest inherits an allowlist.
+- A task cannot name an arbitrary path or Git URL. Read tools reject `..`, absolute paths, symlink escapes, `.git`, credential names, binaries, oversized files, and hard links.
+- A patch is applied only after plan approval, only in the private worktree, and only on paths the approved plan still allows. Docker files, CI workflows, dependency manifests, symlinks, hard links, and mode bits other than a normal file are refused. `git apply --check` runs before `git apply`. There is no shell.
+- A second approval is required before a task branch is pushed. The client has no merge method. The push refuses `main` and `master`. A repeated decision does not open a second pull request.
+- A crashed worker loses its lease. Recovery resumes the checkpoint until `WORKER_MAX_ATTEMPTS`, then the task stays `failed`. Event inserts with the same idempotency key do not replace the first payload.
+- Supervisor rules choose the route. A model recommendation that the rules did not allow is ignored.
+
+What this does not claim:
+
+- The localhost API is not an authenticated multi-user service. Anyone who can open `127.0.0.1:8000` can create tasks and record decisions.
+- The shared runner volume does not isolate two jobs from each other. Concurrency is 1 so that a second job is not staged at the same time.
+- A registered checkout is trusted as the tree you named. Registration is a local command because the API has no authentication.
+- Generated Python that the policy accepts still runs under pytest inside the runner. The runner's network, capability, and resource limits are the boundary around that process.
+- Checkpoint blobs can hold model text. The API does not serve those tables.
+
 ## Tests and lint
 
 ```bash
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
+uv run mypy
 uv run python scripts/check_llm.py
 ```
+
+GitHub Actions runs Ruff, mypy, and pytest on every push and pull request. The workflow sets `LLM_PROVIDER=fake`, leaves cloud and GitHub disabled, and blanks `GITHUB_TOKEN`. It does not use a cloud API key.
 
 `scripts/check_workflow.py --once` needs `DATABASE_URL` and a migrated database. It triages one task, closes the checkpointer, opens a second one, and reloads that thread. Stderr includes `checkpoint thread_id=<uuid> reloaded=true`. The pytest suite covers that path with `FakeProvider`.
 

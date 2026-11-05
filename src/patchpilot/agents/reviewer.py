@@ -97,12 +97,12 @@ def ground_review(
         summary = _UNVERIFIED
     findings: list[ReviewFinding] = []
     for item in review.findings:
-        evidence = item.evidence if _grounded(item.evidence, corpus) else _UNVERIFIED
+        grounded = item.evidence if _grounded(item.evidence, corpus) else _UNVERIFIED
         finding_summary = item.summary
         if _names_missing_path(finding_summary, corpus):
             finding_summary = _UNVERIFIED
         findings.append(
-            ReviewFinding(summary=finding_summary, severity=item.severity, evidence=evidence)
+            ReviewFinding(summary=finding_summary, severity=item.severity, evidence=grounded)
         )
     evidence = [item for item in review.evidence if _grounded(item, corpus)]
     return ReviewResult(

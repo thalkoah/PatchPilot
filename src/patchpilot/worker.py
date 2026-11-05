@@ -51,6 +51,7 @@ from patchpilot.llm.meter import ModelCallDraft
 from patchpilot.llm.pricing import load_pricing
 from patchpilot.llm.provider import LLMProvider
 from patchpilot.llm.routing import StageModels, UsageControl, build_router
+from patchpilot.logconfig import configure_logging
 from patchpilot.repositories.approvals import ApprovalRepository
 from patchpilot.repositories.jobs import ClaimedTask, JobRepository
 from patchpilot.repositories.model_calls import ModelCallRepository
@@ -72,7 +73,7 @@ from patchpilot.workflow.graph import (
     STAGE_WORKSPACE,
     TEST_FAILURE,
     WORKSPACE_FAILURE,
-    CompiledStateGraph,
+    CompiledGraph,
     LeaseLost,
     TriageOutcome,
     compile_triage_graph,
@@ -91,7 +92,7 @@ WORKER_CONCURRENCY = 1
 async def process_one(
     session_factory: async_sessionmaker[AsyncSession],
     provider: LLMProvider,
-    graph: CompiledStateGraph | None = None,
+    graph: CompiledGraph | None = None,
     *,
     worker_id: str | None = None,
     lease_seconds: float = DEFAULT_WORKER_LEASE_SECONDS,
@@ -156,7 +157,7 @@ async def process_task(
     session_factory: async_sessionmaker[AsyncSession],
     provider: LLMProvider,
     task_id: UUID,
-    graph: CompiledStateGraph | None = None,
+    graph: CompiledGraph | None = None,
     *,
     worker_id: str | None = None,
     lease_seconds: float = DEFAULT_WORKER_LEASE_SECONDS,
@@ -281,10 +282,7 @@ async def serve(
 
 def main() -> None:
     settings = get_settings()
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging(settings.log_level)
     # Python is PID 1 in the container, so the default SIGTERM is ignored.
     signal.signal(signal.SIGTERM, _stop_on_sigterm)
     try:
@@ -306,7 +304,7 @@ async def _poll(
     settings: Settings,
     session_factory: async_sessionmaker[AsyncSession],
     provider: LLMProvider,
-    graph: CompiledStateGraph,
+    graph: CompiledGraph,
     checkpointer_name: str,
     *,
     database_url: str | None,
@@ -355,7 +353,7 @@ async def _poll(
 async def _finish(
     session_factory: async_sessionmaker[AsyncSession],
     provider: LLMProvider,
-    graph: CompiledStateGraph,
+    graph: CompiledGraph,
     claimed: ClaimedTask,
     *,
     lease_seconds: float,

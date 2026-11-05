@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import Select, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from patchpilot.agents.developer import DevelopOutcome
@@ -534,7 +534,7 @@ class JobRepository:
 
     async def _claim(
         self,
-        statement: object,
+        statement: Select[Task],
         *,
         stage: str,
         worker_id: str,

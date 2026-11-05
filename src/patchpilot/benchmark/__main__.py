@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from patchpilot.benchmark.report import write_reports
 from patchpilot.benchmark.run import BenchmarkError, run_benchmark
 from patchpilot.config import get_settings
+from patchpilot.logconfig import configure_logging
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -45,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     if not str(args.database_url).strip():
         print("error: set DATABASE_URL or pass --database-url", file=sys.stderr)
         return 2
-    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s %(message)s")
+    configure_logging("WARNING")
     logging.getLogger("patchpilot.benchmark").setLevel(logging.INFO)
     settings = None
     if args.provider == "ollama":

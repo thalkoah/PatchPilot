@@ -440,10 +440,10 @@ def builtin_patch_proposal(prompt: str) -> PatchProposal:
         return _fixed_lookup(prompt, attempt)
     edits: list[FileEdit] = []
     for path, content in _DEMO_FILES:
-        digest = _file_sha(prompt, path)
-        if digest is None:
+        file_digest = _file_sha(prompt, path)
+        if file_digest is None:
             continue
-        edits.append(FileEdit(relative_path=path, expected_sha256=digest, content=content))
+        edits.append(FileEdit(relative_path=path, expected_sha256=file_digest, content=content))
     if not edits:
         raise LLMResponseError("PatchProposal rejected model output (1 validation error)")
     return PatchProposal(summary=DEMO_PATCH_SUMMARY, edits=edits)

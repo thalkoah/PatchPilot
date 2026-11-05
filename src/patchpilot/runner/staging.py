@@ -1,7 +1,7 @@
 """Copy a private worktree into the runner volume.
 
 The worker does this. The copy is a tree of regular files under a directory
-named by the task id. Symlinks, `.git`, and binary files are refused. The
+named by the task id. Symlinks, hard links, `.git`, and binary files are refused. The
 request file is written only after the copy finishes, and it does not name
 the source path.
 """
@@ -20,7 +20,7 @@ from patchpilot.runner.protocol import (
     request_path,
     write_request,
 )
-from patchpilot.source.paths import is_inside
+from patchpilot.source.paths import is_hard_linked_file, is_inside
 
 _SKIP = frozenset({".git", "__pycache__", ".pytest_cache", ".venv", "node_modules"})
 
@@ -85,7 +85,7 @@ def _copy(source: Path, destination: Path) -> None:
             if name in _SKIP:
                 continue
             file_path = current / name
-            if file_path.is_symlink() or not file_path.is_file():
+            if file_path.is_symlink() or is_hard_linked_file(file_path) or not file_path.is_file():
                 raise RunnerRejected
             try:
                 size = file_path.stat().st_size

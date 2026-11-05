@@ -20,6 +20,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic import ValidationError
 
 from patchpilot.config import get_settings
+from patchpilot.logconfig import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +49,7 @@ async def setup_checkpoints(database_url: str) -> None:
 
 
 def main() -> int:
-    logging.basicConfig(
-        level="INFO",
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging("INFO")
     try:
         settings = get_settings()
     except ValidationError:

@@ -7,6 +7,7 @@ pytest runs.
 """
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 _PASS_THROUGH = (
@@ -87,7 +88,7 @@ def pytest_child_env(environ: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
-def _allowlisted(source: dict[str, str]) -> dict[str, str]:
+def _allowlisted(source: Mapping[str, str]) -> dict[str, str]:
     env: dict[str, str] = {}
     for name in _PASS_THROUGH:
         value = source.get(name)

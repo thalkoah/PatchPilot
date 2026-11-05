@@ -36,6 +36,7 @@ class LocalAdvisoryLock:
 
     def __init__(self, database_url: str) -> None:
         self._held = False
+        self._connection: psycopg.Connection | None = None
         try:
             self._connection = psycopg.connect(database_url, autocommit=True)
             row = self._connection.execute(
@@ -53,8 +54,11 @@ class LocalAdvisoryLock:
     def release(self) -> None:
         if not self._held:
             return
+        connection = self._connection
+        if connection is None:
+            return
         try:
-            self._connection.execute(
+            connection.execute(
                 "SELECT pg_advisory_unlock(%s)",
                 (LOCAL_MODEL_LOCK_KEY,),
             )

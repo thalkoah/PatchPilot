@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -34,7 +35,7 @@ from patchpilot.benchmark.prepare import (
 from patchpilot.benchmark.report import build_document
 from patchpilot.benchmark.score import CaseResult, Observation, aggregate, score_case
 from patchpilot.checkpoints import open_checkpointer, setup_checkpoints
-from patchpilot.db.models import ApprovalStatus, Task, TaskStatus
+from patchpilot.db.models import ApprovalStatus, ModelCall, Task, TaskStatus
 from patchpilot.db.session import sqlalchemy_url
 from patchpilot.llm.budget import (
     DEFAULT_MAX_MODEL_CALLS,
@@ -46,6 +47,7 @@ from patchpilot.llm.capabilities import MODEL_STAGES, ModelCapability
 from patchpilot.llm.errors import LLMTimeoutError
 from patchpilot.llm.fake import FakeProvider
 from patchpilot.llm.local_gate import LocalGate
+from patchpilot.llm.provider import GenerateOptions, LLMProvider, ModelT
 from patchpilot.llm.routing import StageChoice, StageRouter, UsageControl, build_router
 from patchpilot.llm.triage import TriageResult
 from patchpilot.llm.usage_report import ReportedUsage
@@ -57,7 +59,7 @@ from patchpilot.repositories.tasks import TaskRepository
 from patchpilot.runner.env import runner_process_env
 from patchpilot.source.registry import register_checkout
 from patchpilot.worker import process_one
-from patchpilot.workflow.graph import compile_triage_graph
+from patchpilot.workflow.graph import CompiledGraph, compile_triage_graph
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +91,7 @@ class _Recorded:
 class RecordingProvider:
     """Remember the validated triage label and, for fake, steer one fixture."""
 
-    def __init__(self, inner: object, recorded: _Recorded) -> None:
+    def __init__(self, inner: LLMProvider, recorded: _Recorded) -> None:
         self._inner = inner
         self._recorded = recorded
 
@@ -112,12 +114,12 @@ class RecordingProvider:
     def generate_structured(
         self,
         prompt: str,
-        schema: type[object],
-        options: object = None,
-    ) -> object:
+        schema: type[ModelT],
+        options: GenerateOptions | None = None,
+    ) -> ModelT:
         script = self._recorded.script
         text = prompt if script == "" else f"{prompt}\nBenchmark script: {script}\n"
-        result = self._inner.generate_structured(text, schema, options)  # type: ignore[attr-defined]
+        result = self._inner.generate_structured(text, schema, options)
         if isinstance(result, TriageResult):
             self._recorded.classification = result.classification.value
         return result
@@ -130,7 +132,7 @@ class RecordingProvider:
         return usage if isinstance(usage, ReportedUsage) else None
 
     def close(self) -> None:
-        self._inner.close()  # type: ignore[attr-defined]
+        self._inner.close()
 
 
 class LeaseStall:
@@ -142,7 +144,7 @@ class LeaseStall:
     The graph drops the result when the renewal thread has lost the lease.
     """
 
-    def __init__(self, inner: object, database_url: str) -> None:
+    def __init__(self, inner: LLMProvider, database_url: str) -> None:
         self._inner = inner
         self._database_url = database_url
         self._stalled = False
@@ -151,16 +153,16 @@ class LeaseStall:
     def generate_structured(
         self,
         prompt: str,
-        schema: type[object],
-        options: object = None,
-    ) -> object:
+        schema: type[ModelT],
+        options: GenerateOptions | None = None,
+    ) -> ModelT:
         if not self._stalled:
             self._stalled = True
             self.started.set()
             if not self._wait_until_expired():
                 raise LLMTimeoutError("benchmark lease was not expired")
             time.sleep(1.0)
-        return self._inner.generate_structured(prompt, schema, options)  # type: ignore[attr-defined]
+        return self._inner.generate_structured(prompt, schema, options)
 
     def take_usage(self) -> ReportedUsage | None:
         method = getattr(self._inner, "take_usage", None)
@@ -257,7 +259,7 @@ async def _run_case(
     provider: str,
     database_url: str,
     factory: async_sessionmaker[AsyncSession],
-    graph: object,
+    graph: CompiledGraph,
     router: StageRouter,
     recording: RecordingProvider,
     usage: UsageControl,
@@ -444,7 +446,7 @@ async def _crash_once(
 async def _process(
     factory: async_sessionmaker[AsyncSession],
     provider: RecordingProvider,
-    graph: object,
+    graph: CompiledGraph,
     usage: UsageControl,
     *,
     worker_id: str,
@@ -457,8 +459,8 @@ async def _process(
 ) -> bool:
     return await process_one(
         factory,
-        provider,  # type: ignore[arg-type]
-        graph,  # type: ignore[arg-type]
+        provider,
+        graph,
         worker_id=worker_id,
         lease_seconds=lease_seconds,
         database_url=database_url,
@@ -595,15 +597,15 @@ def _open_router(provider: str, settings: object | None) -> tuple[StageRouter, R
         raise BenchmarkError("ollama settings are required")
     forced = settings.model_copy(update={"llm_provider": "ollama", "llm_stage_models": ""})  # type: ignore[attr-defined]
     router = build_router(forced)
-    recording: RecordingProvider | None = None
+    found: RecordingProvider | None = None
     for key, inner in list(router._providers.items()):
         wrapped = RecordingProvider(inner, recorded)
         router._providers[key] = wrapped
-        if recording is None:
-            recording = wrapped
-    if recording is None:
+        if found is None:
+            found = wrapped
+    if found is None:
         raise BenchmarkError("ollama provider was not built")
-    return router, recording
+    return router, found
 
 
 def _usage(router: StageRouter, database_url: str) -> UsageControl:
@@ -673,7 +675,7 @@ def _lease_expired(database_url: str) -> bool:
     return row is not None and bool(row[0])
 
 
-def _tokens(calls: list[object]) -> tuple[int | None, int | None, bool]:
+def _tokens(calls: Sequence[ModelCall]) -> tuple[int | None, int | None, bool]:
     prompt_values: list[int] = []
     output_values: list[int] = []
     complete = True

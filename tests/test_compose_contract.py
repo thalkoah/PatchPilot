@@ -19,6 +19,11 @@ def test_compose_starts_database_api_and_worker():
     assert API_COMMAND in text
     for service in ("db:", "api:", "worker:"):
         assert service in text
+    assert 'max-size: "10m"' in text
+    assert 'max-file: "3"' in text
+    assert text.count("logging: *default-logging") == 4
+    for volume in ("pgdata:", "artifacts:", "workspaces:", "runner:"):
+        assert volume in text
 
 
 def test_api_image_runs_migrations_before_serving():

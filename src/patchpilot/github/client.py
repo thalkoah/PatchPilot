@@ -6,6 +6,7 @@ Redirects are not followed, so the token stays on `api.github.com`.
 
 import json
 from dataclasses import dataclass
+from typing import Any
 
 import httpx2
 from pydantic import SecretStr
@@ -149,7 +150,7 @@ class GitHubClient:
             return None
         return min(matches, key=lambda item: item.number)
 
-    def _request(self, method: str, path: str, **kwargs: object) -> httpx2.Response:
+    def _request(self, method: str, path: str, **kwargs: Any) -> httpx2.Response:
         if "merge" in path.split("/"):
             raise GitHubError("rejected")
         try:

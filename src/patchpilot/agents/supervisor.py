@@ -8,7 +8,7 @@ outside the allowed set is ignored.
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeGuard
 
 from pydantic import ValidationError
 
@@ -227,8 +227,11 @@ def route_records(value: object) -> tuple[dict[str, Any], ...]:
     for item in value:
         if not isinstance(item, dict):
             continue
+        raw_route = item.get("route")
+        if not isinstance(raw_route, str):
+            continue
         try:
-            route = SupervisorRoute(item.get("route"))
+            route = SupervisorRoute(raw_route)
         except ValueError:
             continue
         reason = item.get("reason")
@@ -413,7 +416,7 @@ def _count(state: Mapping[str, Any], key: str) -> int | None:
     return value
 
 
-def _mapping(value: object) -> bool:
+def _mapping(value: object) -> TypeGuard[Mapping[str, Any]]:
     return isinstance(value, dict)
 
 

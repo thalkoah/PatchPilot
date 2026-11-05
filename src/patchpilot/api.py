@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from patchpilot import __version__
 from patchpilot.config import get_settings
 from patchpilot.db.session import create_engine, create_session_factory
+from patchpilot.logconfig import install_log_filter
 from patchpilot.readiness import database_is_ready
 from patchpilot.routes.tasks import router as tasks_router
 from patchpilot.web.routes import STATIC_DIR
@@ -18,6 +19,7 @@ from patchpilot.web.routes import router as dashboard_router
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    install_log_filter()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:

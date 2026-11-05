@@ -5,6 +5,7 @@ credential names, and `.git` never become a filesystem lookup.
 """
 
 import re
+import stat
 from pathlib import Path
 
 from patchpilot.source.errors import SourceError
@@ -118,6 +119,19 @@ def relative_parts(value: str, *, allow_root: bool) -> tuple[str, ...]:
 def canonical_checkout_path(value: str) -> str:
     """Return the relative path stored for a registered checkout."""
     return "/".join(relative_parts(value, allow_root=False))
+
+
+def is_hard_linked_file(path: Path) -> bool:
+    """True when this regular file shares its inode with another directory entry.
+
+    A hard link can name a file that also lives outside the checkout. Refusing
+    it keeps reads and writes on the directory entry the tool was given.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_nlink > 1
 
 
 def is_inside(root: Path, candidate: Path) -> bool:

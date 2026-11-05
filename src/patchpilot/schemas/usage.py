@@ -83,7 +83,13 @@ def usage_response(task_id: UUID, rows: list[ModelCall], limits: UsageLimits) ->
 
 
 def _call(row: ModelCall) -> UsageCall:
-    known = row.cost_known and row.estimated_cost_usd is not None
+    amount = row.estimated_cost_usd
+    if row.cost_known and amount is not None:
+        cost = "estimated"
+        estimated = _money(amount)
+    else:
+        cost = "unknown"
+        estimated = None
     return UsageCall(
         id=row.id,
         stage=row.stage,
@@ -92,8 +98,8 @@ def _call(row: ModelCall) -> UsageCall:
         prompt_tokens=row.prompt_tokens,
         output_tokens=row.output_tokens,
         latency_ms=row.latency_ms,
-        cost="estimated" if known else "unknown",
-        estimated_cost_usd=_money(row.estimated_cost_usd) if known else None,
+        cost=cost,
+        estimated_cost_usd=estimated,
         outcome=row.outcome,
         created_at=row.created_at,
     )

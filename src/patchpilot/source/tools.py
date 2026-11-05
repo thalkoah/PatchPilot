@@ -2,7 +2,7 @@
 
 `list_tree`, `read_text_file`, and `search_text` accept relative paths only.
 They do not follow a symlink that leaves the checkout, and they do not read
-`.git`, credential files, binaries, or files past the byte limit.
+`.git`, credential files, hard links, binaries, or files past the byte limit.
 """
 
 import os
@@ -16,6 +16,7 @@ from patchpilot.source.paths import (
     canonical_checkout_path,
     is_allowed_text_name,
     is_denied_name,
+    is_hard_linked_file,
     is_inside,
     relative_parts,
 )
@@ -286,8 +287,9 @@ def _has_control_char(name: str) -> bool:
 
 def _read_capped(path: Path, max_bytes: int) -> bytes:
     try:
-        if path.is_symlink() or not path.is_file():
-            raise SourceError("not_a_file")
+        hard_linked = is_hard_linked_file(path)
+        if path.is_symlink() or not path.is_file() or hard_linked:
+            raise SourceError("denied" if hard_linked else "not_a_file")
         size = path.lstat().st_size
     except OSError:
         raise SourceError("unreadable") from None

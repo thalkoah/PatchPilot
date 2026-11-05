@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict
 from uuid import UUID
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -181,6 +182,9 @@ class TriageState(TypedDict):
     status: WorkflowStatus
 
 
+GraphState = TriageState | dict[str, Any]
+
+
 class LeaseLost(Exception):
     """This worker no longer holds the lease, so the node must not checkpoint a success."""
 
@@ -203,6 +207,9 @@ class WorkflowContext:
     budget: TaskBudget | None = None
     models: StageModels | None = None
     github: GitHubBinding | None = None
+
+
+CompiledGraph = CompiledStateGraph[TriageState, WorkflowContext, TriageState, TriageState]
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +245,7 @@ def triage_prompt(*, title: str, description: str) -> str:
     return f"Title: {title}\nDescription:\n{description}\n"
 
 
-def thread_config(task_id: UUID) -> dict[str, Any]:
+def thread_config(task_id: UUID) -> RunnableConfig:
     """Stable LangGraph thread. The id is the task UUID and nothing else.
 
     `recursion_limit` stops a routing loop. The supervisor step cap trips first
@@ -292,7 +299,7 @@ def compile_triage_graph(
     checkpointer: BaseCheckpointSaver | Literal[False] = False,
     *,
     interrupt_after: list[str] | None = None,
-) -> CompiledStateGraph:
+) -> CompiledGraph:
     """Compile the triage graph.
 
     The default saver is off so a graph unit test can run without PostgreSQL.
@@ -353,7 +360,7 @@ def compile_triage_graph(
 
 
 async def run_triage(
-    graph: CompiledStateGraph,
+    graph: CompiledGraph,
     *,
     task_id: UUID,
     title: str,
@@ -408,7 +415,7 @@ async def run_triage(
 
 
 async def run_claimed_triage(
-    graph: CompiledStateGraph,
+    graph: CompiledGraph,
     *,
     task_id: UUID,
     title: str,
@@ -526,7 +533,7 @@ async def run_claimed_triage(
 
 
 async def invoke_triage(
-    graph: CompiledStateGraph,
+    graph: CompiledGraph,
     state: TriageState | None,
     *,
     task_id: UUID,
@@ -592,7 +599,7 @@ async def invoke_triage(
     return result
 
 
-async def read_thread_state(graph: CompiledStateGraph, task_id: UUID) -> dict[str, Any]:
+async def read_thread_state(graph: CompiledGraph, task_id: UUID) -> dict[str, Any]:
     """Load the latest checkpoint values for this task. Empty when none exist."""
     snapshot = await graph.aget_state(thread_config(task_id))
     values = snapshot.values
@@ -603,8 +610,11 @@ async def read_thread_state(graph: CompiledStateGraph, task_id: UUID) -> dict[st
 
 def route_from_supervisor(state: TriageState) -> str:
     """Follow the route the supervisor just stored. An unknown route stops."""
+    raw_route = state.get("route")
+    if not isinstance(raw_route, str):
+        return "finalize"
     try:
-        chosen = SupervisorRoute(state.get("route"))
+        chosen = SupervisorRoute(raw_route)
     except ValueError:
         return "finalize"
     return NODE_FOR_ROUTE[chosen]
@@ -1293,12 +1303,12 @@ def failure_outcome(message: str, *, stage: str = STAGE_TRIAGE) -> TriageOutcome
     )
 
 
-def outcome_from_state(state: TriageState) -> TriageOutcome:
+def outcome_from_state(state: GraphState) -> TriageOutcome:
     """Build the task record and keep the supervisor trace off `result_json`."""
     return replace(_outcome_from_state(state), routes=route_trace(state))
 
 
-def _outcome_from_state(state: TriageState) -> TriageOutcome:
+def _outcome_from_state(state: GraphState) -> TriageOutcome:
     if _INTERRUPT in state:
         return _pause_or_fail(state)
     if state.get("status") == "rejected":
@@ -1385,7 +1395,7 @@ def failure_text(exc: LLMError) -> str:
     return _message(str(exc))
 
 
-def _pause_or_fail(state: dict[str, Any]) -> TriageOutcome:
+def _pause_or_fail(state: GraphState) -> TriageOutcome:
     try:
         if _interrupt_kind(state) == "publish":
             outcome = _publish_pause_outcome(state)
@@ -1399,7 +1409,7 @@ def _pause_or_fail(state: dict[str, Any]) -> TriageOutcome:
     return replace(outcome, routes=route_trace(state))
 
 
-def _publish_pause_outcome(state: dict[str, Any]) -> TriageOutcome:
+def _publish_pause_outcome(state: GraphState) -> TriageOutcome:
     """The review is stored, and the publication interrupt is still unanswered."""
     outcome = _reviewed_outcome(state)
     if outcome.status != TaskStatus.COMPLETED:
@@ -1411,7 +1421,7 @@ def _publish_pause_outcome(state: dict[str, Any]) -> TriageOutcome:
     )
 
 
-def _paused_outcome(state: dict[str, Any]) -> TriageOutcome:
+def _paused_outcome(state: GraphState) -> TriageOutcome:
     checked = TriageResult.model_validate(state.get("triage"))
     investigation = _checked_investigation(state.get("investigation"))
     plan = _checked_plan(state.get("plan"))
@@ -1427,7 +1437,7 @@ def _paused_outcome(state: dict[str, Any]) -> TriageOutcome:
     )
 
 
-def _rejected_outcome(state: dict[str, Any]) -> TriageOutcome:
+def _rejected_outcome(state: GraphState) -> TriageOutcome:
     checked = TriageResult.model_validate(state.get("triage"))
     investigation = _checked_investigation(state.get("investigation"))
     plan = _checked_plan(state.get("plan"))
@@ -1464,7 +1474,7 @@ def _rejected_update(state: TriageState) -> dict[str, Any]:
     }
 
 
-def _reviewed_outcome(state: dict[str, Any]) -> TriageOutcome:
+def _reviewed_outcome(state: GraphState) -> TriageOutcome:
     """Build the task record from the review cycles. Policy is applied again here."""
     checked = TriageResult.model_validate(state.get("triage"))
     investigation = _checked_investigation(state.get("investigation"))
@@ -1531,7 +1541,7 @@ def _reviewed_outcome(state: dict[str, Any]) -> TriageOutcome:
 
 
 def _judge_cycles(
-    state: dict[str, Any],
+    state: GraphState,
 ) -> tuple[Any, tuple[dict[str, Any], ...], tuple[ReviewedCycle, ...]]:
     plan_state = _checked_plan(state.get("plan"))
     if plan_state is None:
@@ -1696,7 +1706,7 @@ def _store_review(body: dict[str, Any], cycle: ReviewedCycle, *, repair_count: i
     }
 
 
-def _cycle_list(state: dict[str, Any]) -> list[dict[str, Any]]:
+def _cycle_list(state: GraphState) -> list[dict[str, Any]]:
     raw = state.get("cycles")
     if raw is None:
         return []
@@ -1705,7 +1715,7 @@ def _cycle_list(state: dict[str, Any]) -> list[dict[str, Any]]:
     return list(raw)
 
 
-def _repair_count(state: dict[str, Any]) -> int:
+def _repair_count(state: GraphState) -> int:
     value = state.get("repair_count")
     if value is None:
         return 0
@@ -1727,7 +1737,7 @@ def _stored_review(value: object) -> ReviewResult | None:
 
 
 def _accepted_patch(
-    state: dict[str, Any],
+    state: GraphState,
     plan: dict[str, Any] | None,
     workspace: IsolatedWorkspace | None,
 ) -> dict[str, Any] | None:
@@ -1779,7 +1789,7 @@ def _checked_patch(value: object) -> dict[str, Any] | None:
     }
 
 
-def _accepted_tests(state: dict[str, Any], patch: dict[str, Any] | None) -> TestReport | None:
+def _accepted_tests(state: GraphState, patch: dict[str, Any] | None) -> TestReport | None:
     """Return the runner report, or None when this task did not develop."""
     report = _checked_tests(state.get("tests"))
     if patch is None:
@@ -1848,7 +1858,7 @@ def _store_patch(body: dict[str, Any], patch: dict[str, Any] | None) -> DevelopO
 
 
 def _accepted_workspace(
-    state: dict[str, Any],
+    state: GraphState,
     plan: dict[str, Any] | None,
 ) -> IsolatedWorkspace | None:
     """Return the derived workspace, or None when the plan names no edit."""
@@ -1968,7 +1978,7 @@ def _checked_publication(value: object) -> dict[str, Any] | None:
     return {**parsed, "owner": owner, "name": name}
 
 
-def _attach_publication(outcome: TriageOutcome, state: dict[str, Any]) -> TriageOutcome:
+def _attach_publication(outcome: TriageOutcome, state: GraphState) -> TriageOutcome:
     publication = state.get("publication")
     if publication is None:
         return outcome
@@ -2018,7 +2028,7 @@ def _public_publication(value: object) -> dict[str, Any]:
     return record
 
 
-def _interrupt_kind(state: dict[str, Any]) -> str:
+def _interrupt_kind(state: GraphState) -> str:
     raw = state.get(_INTERRUPT)
     if not isinstance(raw, (list, tuple)) or not raw:
         return "plan"

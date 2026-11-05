@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# No cloud API and no publication. The automatic GITHUB_TOKEN is blanked so
+# settings and the runner see no credential. Tests start their own PostgreSQL.
+env:
+  LLM_PROVIDER: fake
+  LLM_CLOUD_ENABLED: "false"
+  GITHUB_ENABLED: "false"
+  GITHUB_TOKEN: ""
+  LLM_CLOUD_API_KEY: ""
+  OPENAI_API_KEY: ""
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --group dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - run: uv run pytest
