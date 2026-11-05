@@ -47,6 +47,7 @@ from patchpilot.audit import (
     ERROR_MODEL,
     ERROR_RECOVERY_EXHAUSTED,
     MODEL_ERROR,
+    PUBLICATION_OPENED,
     RECOVERY,
     RECOVERY_EXHAUSTED,
     RECOVERY_RESUME,
@@ -59,6 +60,7 @@ from patchpilot.audit import (
     TASK_REJECTED,
     approval_requested_key,
     event_key,
+    publication_opened_key,
     repair_event_key,
     require_attempts,
     require_lease,
@@ -68,7 +70,14 @@ from patchpilot.audit import (
     task_completed_key,
     task_rejected_key,
 )
-from patchpilot.db.models import Task, TaskEvent, TaskRun, TaskStatus
+from patchpilot.db.models import (
+    APPROVAL_KIND_PLAN,
+    APPROVAL_KIND_PUBLISH,
+    Task,
+    TaskEvent,
+    TaskRun,
+    TaskStatus,
+)
 from patchpilot.llm.plan import ChangePlan
 from patchpilot.repositories.approvals import insert_pending_approval
 from patchpilot.repositories.artifacts import (
@@ -78,6 +87,7 @@ from patchpilot.repositories.artifacts import (
     persist_test_report,
 )
 from patchpilot.repositories.events import append_event
+from patchpilot.repositories.publications import PublicationStoreError, insert_publication
 from patchpilot.repositories.workspaces import insert_workspace
 from patchpilot.runner.protocol import TestReport
 from patchpilot.workspace.errors import WorkspaceStoreError
@@ -89,6 +99,8 @@ _STAGE_TRIAGE = "triage"
 _STAGE_INVESTIGATE = "investigate"
 _STAGE_PLAN = "plan"
 _STAGE_APPROVAL = "request_plan_approval"
+_STAGE_PUBLISH_APPROVAL = "request_publish_approval"
+_STAGE_PUBLISH = "publish"
 _STAGE_WORKSPACE = "prepare_workspace"
 _STAGE_DEVELOP = "develop"
 _STAGE_TEST = "test"
@@ -398,6 +410,8 @@ class JobRepository:
                 repo_id=claimed.repo_id,
                 workspace=workspace,
             )
+        if status == TaskStatus.COMPLETED:
+            await self._store_publication(claimed.id, stored)
         task.status = status
         task.stage = checked_stage
         task.result_summary = result_summary
@@ -450,13 +464,22 @@ class JobRepository:
         plan: ChangePlan,
         artifacts_root: Path | None,
         routes: tuple[dict[str, Any], ...] = (),
+        kind: str = APPROVAL_KIND_PLAN,
+        patch: DevelopOutcome | None = None,
+        tests: TestReport | None = None,
+        cycles: tuple[ReviewedCycle, ...] = (),
+        workspace: IsolatedWorkspace | None = None,
     ) -> bool:
         """Store the plan, open one approval, and release the lease.
 
         Return False when this worker no longer holds the run. The checkout is
         not written. A second pause for the same task reuses the pending row.
+        A publication pause also stores the patch, tests, and review that the
+        human is being asked to publish.
         """
         checked_stage = require_stage(stage)
+        if kind not in {APPROVAL_KIND_PLAN, APPROVAL_KIND_PUBLISH}:
+            raise ValueError("approval kind must be plan or publish")
         if not result_summary.strip():
             raise ValueError("result_summary must not be blank")
         task = await self._owned_running_task(claimed)
@@ -469,6 +492,16 @@ class JobRepository:
             plan,
             artifacts_root,
         )
+        if kind == APPROVAL_KIND_PUBLISH:
+            stored = await self._store_review_artifacts(
+                claimed,
+                stored,
+                patch=patch,
+                tests=tests,
+                cycles=cycles,
+                workspace=workspace,
+                artifacts_root=artifacts_root,
+            )
         version = stored.get("plan", {}).get("version")
         if isinstance(version, bool) or not isinstance(version, int):
             raise ArtifactStoreError
@@ -476,6 +509,7 @@ class JobRepository:
             self._session,
             task_id=task.id,
             plan_version=version,
+            kind=kind,
         )
         task.status = TaskStatus.WAITING_APPROVAL
         task.stage = checked_stage
@@ -492,6 +526,7 @@ class JobRepository:
             stored,
             waiting=True,
             approval_id=approval.id,
+            approval_kind=kind,
             routes=routes,
         )
         await self._session.commit()
@@ -591,6 +626,61 @@ class JobRepository:
         if owned is None:
             return None
         return task
+
+    async def _store_review_artifacts(
+        self,
+        claimed: ClaimedTask,
+        stored: dict[str, Any],
+        *,
+        patch: DevelopOutcome | None,
+        tests: TestReport | None,
+        cycles: tuple[ReviewedCycle, ...],
+        workspace: IsolatedWorkspace | None,
+        artifacts_root: Path | None,
+    ) -> dict[str, Any]:
+        """Persist the reviewed patch before the publication pause. The caller commits."""
+        if cycles:
+            stored = await self._with_cycles(claimed.id, stored, cycles, artifacts_root)
+        elif patch is not None:
+            stored = await self._with_patch_version(claimed.id, stored, patch, artifacts_root)
+            if tests is None:
+                raise TestReportStoreError
+            stored = await self._with_test_version(claimed.id, stored, tests, artifacts_root)
+        if workspace is not None:
+            if claimed.repo_id is None:
+                raise WorkspaceStoreError
+            await insert_workspace(
+                self._session,
+                task_id=claimed.id,
+                repo_id=claimed.repo_id,
+                workspace=workspace,
+            )
+        return stored
+
+    async def _store_publication(self, task_id: UUID, stored: dict[str, Any]) -> None:
+        """Record a draft that the graph already opened. A rejection stores nothing."""
+        publication = stored.get("publication")
+        if not isinstance(publication, dict) or publication.get("decision") != "approve":
+            return
+        try:
+            approval_id = UUID(str(publication.get("approval_id")))
+            number = publication.get("number")
+            if isinstance(number, bool) or not isinstance(number, int):
+                raise PublicationStoreError
+            await insert_publication(
+                self._session,
+                task_id=task_id,
+                approval_id=approval_id,
+                owner=str(publication.get("owner")),
+                name=str(publication.get("name")),
+                branch=str(publication.get("branch")),
+                base_branch=str(publication.get("base")),
+                head_sha=str(publication.get("head_sha")),
+                pr_number=number,
+                html_url=str(publication.get("url")),
+            )
+        except (PublicationStoreError, ValueError):
+            raise PublicationStoreError from None
 
     async def _with_plan_version(
         self,
@@ -696,6 +786,7 @@ class JobRepository:
         *,
         waiting: bool = False,
         approval_id: UUID | None = None,
+        approval_kind: str = APPROVAL_KIND_PLAN,
         terminal: TaskStatus = TaskStatus.COMPLETED,
         workspace: IsolatedWorkspace | None = None,
         routes: tuple[dict[str, Any], ...] = (),
@@ -794,16 +885,22 @@ class JobRepository:
             )
         if waiting:
             paths = plan.get("paths") if isinstance(plan, dict) else []
+            pause_stage = (
+                _STAGE_PUBLISH_APPROVAL
+                if approval_kind == APPROVAL_KIND_PUBLISH
+                else _STAGE_APPROVAL
+            )
             await emit(
-                stage=_STAGE_APPROVAL,
+                stage=pause_stage,
                 event_type=APPROVAL_REQUESTED,
                 payload={
                     "attempt": claimed.attempt,
                     "plan_version": None if plan is None else plan.get("version"),
                     "approval_id": None if approval_id is None else str(approval_id),
+                    "kind": approval_kind,
                     "paths": paths if isinstance(paths, list) else [],
                 },
-                key=approval_requested_key(task_id),
+                key=approval_requested_key(task_id, approval_kind),
                 run_id=claimed.run_id,
             )
             return
@@ -923,6 +1020,15 @@ class JobRepository:
                 run_id=None,
             )
             return
+        opened = _opened_publication(result_json)
+        if opened is not None:
+            await emit(
+                stage=_STAGE_PUBLISH,
+                event_type=PUBLICATION_OPENED,
+                payload=opened,
+                key=publication_opened_key(task_id),
+                run_id=None,
+            )
         await emit(
             stage=_STAGE_FINALIZE,
             event_type=TASK_COMPLETED,
@@ -1206,6 +1312,30 @@ class JobRepository:
             select(func.max(TaskRun.attempt)).where(TaskRun.task_id == task_id)
         )
         return int(current or 0) + 1
+
+
+def _opened_publication(result_json: dict[str, Any]) -> dict[str, Any] | None:
+    """The draft identity. The token and the diff are not event fields."""
+    publication = result_json.get("publication")
+    if not isinstance(publication, dict) or publication.get("decision") != "approve":
+        return None
+    number = publication.get("number")
+    url = publication.get("url")
+    branch = publication.get("branch")
+    owner = publication.get("owner")
+    name = publication.get("name")
+    if isinstance(number, bool) or not isinstance(number, int):
+        return None
+    if not all(isinstance(item, str) and item for item in (url, branch, owner, name)):
+        return None
+    return {
+        "owner": owner,
+        "name": name,
+        "number": number,
+        "branch": branch,
+        "url": url,
+        "draft": True,
+    }
 
 
 def _plan_payload(result_json: dict[str, Any], attempt: int) -> dict[str, Any] | None:

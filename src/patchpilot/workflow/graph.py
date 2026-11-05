@@ -10,6 +10,9 @@ forbidden can be replanned once. A plan that names a code change goes to
 call, because resume runs the node from the top. Approval continues to
 `prepare_workspace`, then `develop`, then `test`, then `review`. Policy may
 repair at most twice. Rejection, a decline, and an escalation end at `finalize`.
+When a GitHub target is configured, an accepted review pauses again for a
+second approval. Nothing is pushed before that approval. Declining publication
+finishes the local task without a pull request.
 
 The investigate node reads the registered checkout. The plan node proposes
 paths and does not write them. `prepare_workspace` clones that checkout into
@@ -68,6 +71,8 @@ from patchpilot.agents.supervisor import (
 )
 from patchpilot.artifacts import checksum, proposal_document, review_document
 from patchpilot.db.models import APPROVAL_REASON_MAX_LENGTH, TaskStatus
+from patchpilot.github.errors import GitHubError
+from patchpilot.github.publish import GitHubBinding, publish_draft
 from patchpilot.llm.budget import TaskBudget
 from patchpilot.llm.errors import LLMError
 from patchpilot.llm.investigation import InvestigationReport
@@ -104,6 +109,8 @@ STAGE_WORKSPACE = "prepare_workspace"
 STAGE_DEVELOP = "develop"
 STAGE_TEST = "test"
 STAGE_REVIEW = "review"
+STAGE_PUBLISH_APPROVAL = "request_publish_approval"
+STAGE_PUBLISH = "publish"
 STAGE_SUPERVISOR = "supervisor"
 STAGE_FINALIZE = "finalize"
 GENERIC_FAILURE = "Triage failed before a valid result was produced."
@@ -114,6 +121,7 @@ WORKSPACE_FAILURE = "The isolated workspace could not be created."
 PATCH_FAILURE = "The patch was rejected before it was applied."
 TEST_FAILURE = "The test result could not be read."
 REVIEW_FAILURE = "The review could not be completed."
+PUBLISH_FAILURE = "The draft pull request was not opened."
 RUNNER_UNAVAILABLE = "The test runner did not return a result."
 RUNNER_REJECTED = "The test runner rejected the workspace."
 ARTIFACT_FAILURE = "The plan artifact could not be stored."
@@ -130,6 +138,7 @@ _FAILURE_STAGES = frozenset(
         STAGE_DEVELOP,
         STAGE_TEST,
         STAGE_REVIEW,
+        STAGE_PUBLISH,
     }
 )
 _INTERRUPT = "__interrupt__"
@@ -155,6 +164,7 @@ class TriageState(TypedDict):
     patch: dict[str, Any] | None
     tests: dict[str, Any] | None
     review: dict[str, Any] | None
+    publication: dict[str, Any] | None
     repair_count: int
     cycles: list[dict[str, Any]]
     policy: str | None
@@ -192,6 +202,7 @@ class WorkflowContext:
     supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS
     budget: TaskBudget | None = None
     models: StageModels | None = None
+    github: GitHubBinding | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +215,7 @@ class TriageOutcome:
     result_json: dict[str, Any]
     plan: ChangePlan | None = None
     workspace: IsolatedWorkspace | None = None
+    publication: dict[str, Any] | None = None
     patch: DevelopOutcome | None = None
     tests: TestReport | None = None
     review: ReviewResult | None = None
@@ -258,6 +270,7 @@ def initial_triage_state(
         "patch": None,
         "tests": None,
         "review": None,
+        "publication": None,
         "repair_count": 0,
         "cycles": [],
         "policy": None,
@@ -299,6 +312,8 @@ def compile_triage_graph(
     builder.add_node("develop", develop_node)
     builder.add_node("test", test_node)
     builder.add_node("review", review_node)
+    builder.add_node("request_publish_approval", request_publish_approval)
+    builder.add_node("publish", publish_node)
     builder.add_node("finalize", finalize_node)
     builder.add_edge(START, "triage")
     for name in (
@@ -310,6 +325,8 @@ def compile_triage_graph(
         "develop",
         "test",
         "review",
+        "request_publish_approval",
+        "publish",
     ):
         builder.add_edge(name, "supervisor")
     builder.add_conditional_edges(
@@ -323,6 +340,8 @@ def compile_triage_graph(
             "develop": "develop",
             "test": "test",
             "review": "review",
+            "request_publish_approval": "request_publish_approval",
+            "publish": "publish",
             "finalize": "finalize",
         },
     )
@@ -352,6 +371,7 @@ async def run_triage(
     supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS,
     budget: TaskBudget | None = None,
     models: StageModels | None = None,
+    github: GitHubBinding | None = None,
 ) -> TriageOutcome:
     """Run one triage. Provider failures become a failed outcome instead of raw text."""
     state = initial_triage_state(
@@ -377,6 +397,7 @@ async def run_triage(
             supervisor_deadline_seconds=supervisor_deadline_seconds,
             budget=budget,
             models=models,
+            github=github,
         )
     except LeaseLost:
         raise
@@ -405,6 +426,7 @@ async def run_claimed_triage(
     supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS,
     budget: TaskBudget | None = None,
     models: StageModels | None = None,
+    github: GitHubBinding | None = None,
     resume_decision: dict[str, Any] | None = None,
 ) -> TriageOutcome:
     """Resume a checkpointed thread, or start one when no checkpoint exists.
@@ -437,6 +459,7 @@ async def run_claimed_triage(
                     supervisor_deadline_seconds=supervisor_deadline_seconds,
                     budget=budget,
                     models=models,
+                    github=github,
                 )
             except LeaseLost:
                 raise
@@ -444,7 +467,12 @@ async def run_claimed_triage(
                 logger.error("approval resume failed: %s", type(exc).__name__)
                 return failure_outcome(GENERIC_FAILURE)
             outcome = outcome_from_state(final)
+            resumed_kind = "plan"
+            if isinstance(resume_decision, dict) and resume_decision.get("kind") == "publish":
+                resumed_kind = "publish"
             if outcome.status == TaskStatus.WAITING_APPROVAL:
+                if outcome.stage == STAGE_PUBLISH_APPROVAL and resumed_kind != "publish":
+                    return outcome
                 logger.error("approval resume paused again task=%s", task_id)
                 return failure_outcome(APPROVAL_FAILURE, stage=STAGE_APPROVAL)
             return outcome
@@ -467,6 +495,7 @@ async def run_claimed_triage(
                     supervisor_deadline_seconds=supervisor_deadline_seconds,
                     budget=budget,
                     models=models,
+                    github=github,
                 )
             except LeaseLost:
                 raise
@@ -492,6 +521,7 @@ async def run_claimed_triage(
         supervisor_deadline_seconds=supervisor_deadline_seconds,
         budget=budget,
         models=models,
+        github=github,
     )
 
 
@@ -514,6 +544,7 @@ async def invoke_triage(
     supervisor_deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS,
     budget: TaskBudget | None = None,
     models: StageModels | None = None,
+    github: GitHubBinding | None = None,
 ) -> dict[str, Any]:
     """Run or resume one thread.
 
@@ -545,6 +576,7 @@ async def invoke_triage(
             supervisor_deadline_seconds=supervisor_deadline_seconds,
             budget=budget,
             models=models,
+            github=github,
         ),
         **options,
     )
@@ -594,7 +626,12 @@ def supervisor_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> di
         deadline = require_supervisor_deadline(runtime.context.supervisor_deadline_seconds)
     except ValueError:
         deadline = DEFAULT_SUPERVISOR_DEADLINE_SECONDS
-    decision = decide_route(state, now=now, deadline_seconds=deadline)
+    decision = decide_route(
+        state,
+        now=now,
+        deadline_seconds=deadline,
+        publish_available=runtime.context.github is not None,
+    )
     if runtime.context.supervisor_model:
         decision = with_model(
             decision,
@@ -1034,6 +1071,122 @@ def plan_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
     }
 
 
+def request_publish_approval(
+    state: TriageState,
+    runtime: Runtime[WorkflowContext],
+) -> dict[str, Any]:
+    """Pause before any push. Resume runs this function from the top.
+
+    There is no Git command and no HTTP request before `interrupt()`.
+    """
+    if runtime.context.github is None:
+        logger.error("publication rejected: not configured")
+        return _failed_update(PUBLISH_FAILURE, stage=STAGE_PUBLISH)
+    try:
+        prompt = _publish_prompt(state, runtime.context.github)
+    except (ValidationError, ValueError):
+        logger.error("publication rejected the stored review")
+        return _failed_update(PUBLISH_FAILURE, stage=STAGE_PUBLISH)
+    parsed = _parse_resume(interrupt(prompt), kind="publish")
+    if parsed is None:
+        return _failed_update(PUBLISH_FAILURE, stage=STAGE_PUBLISH)
+    recorded = {
+        **parsed,
+        "owner": runtime.context.github.repo.owner,
+        "name": runtime.context.github.repo.name,
+    }
+    if parsed["decision"] == "reject":
+        return {
+            "publication": recorded,
+            "error": None,
+            "failed_stage": None,
+            "status": "completed",
+            "phase": STAGE_PUBLISH_APPROVAL,
+        }
+    return {
+        "publication": recorded,
+        "error": None,
+        "failed_stage": None,
+        "status": "running",
+        "phase": STAGE_PUBLISH_APPROVAL,
+    }
+
+
+def publish_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str, Any]:
+    """Push the task branch and open one draft. The token stays in the context."""
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    binding = runtime.context.github
+    try:
+        decision = _checked_publication(state.get("publication"))
+        task_id = UUID(str(state.get("task_id")))
+        workspace = workspace_from_state(state.get("workspace"), task_id=task_id)
+    except (TypeError, ValueError):
+        logger.error("publication rejected the stored decision")
+        return _failed_update(PUBLISH_FAILURE, stage=STAGE_PUBLISH)
+    if (
+        binding is None
+        or workspace is None
+        or decision is None
+        or decision["decision"] != "approve"
+        or runtime.context.workspace_root is None
+    ):
+        return _failed_update(PUBLISH_FAILURE, stage=STAGE_PUBLISH)
+    if binding.repo.owner != decision["owner"] or binding.repo.name != decision["name"]:
+        logger.error("publication rejected: repository mismatch")
+        return _failed_update(PUBLISH_FAILURE, stage=STAGE_PUBLISH)
+    try:
+        worktree = require_workspace_root(runtime.context.workspace_root) / worktree_relative(
+            task_id
+        )
+    except Exception:
+        logger.error("publication rejected: unavailable")
+        return _failed_update(PUBLISH_FAILURE, stage=STAGE_PUBLISH)
+    if worktree.is_symlink() or not worktree.is_dir():
+        return _failed_update(PUBLISH_FAILURE, stage=STAGE_PUBLISH)
+    try:
+        opened = publish_draft(
+            task_id=task_id,
+            worktree=worktree,
+            repo=binding.repo,
+            token=binding.token,
+            issue_title=str(state.get("title") or ""),
+            description=str(state.get("description") or ""),
+            reasoning=_plan_reasoning(state),
+            tests_passed=_tests_passed(state),
+            tests_summary=_tests_summary(state),
+            transport=binding.transport,
+            local_remote=binding.local_remote,
+        )
+    except GitHubError as exc:
+        logger.error("publication failed: %s", exc.code)
+        return _failed_update(PUBLISH_FAILURE, stage=STAGE_PUBLISH)
+    except Exception:
+        logger.error("publication failed: rejected")
+        return _failed_update(PUBLISH_FAILURE, stage=STAGE_PUBLISH)
+    if _lease_is_lost(runtime):
+        raise LeaseLost()
+    return {
+        "publication": {
+            "decision": "approve",
+            "kind": "publish",
+            "approval_id": decision["approval_id"],
+            "owner": opened.owner,
+            "name": opened.name,
+            "branch": opened.branch,
+            "base": opened.base,
+            "number": opened.number,
+            "url": opened.url,
+            "draft": True,
+            "head_sha": opened.head_sha,
+        },
+        "error": None,
+        "failed_stage": None,
+        "status": "completed",
+        "phase": STAGE_PUBLISH,
+    }
+
+
 def finalize_node(state: TriageState) -> dict[str, Any]:
     """Re-validate before the summary becomes user-facing state."""
     if state.get("status") == "rejected":
@@ -1049,6 +1202,15 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
             return _failed_update(REVIEW_FAILURE, stage=STAGE_REVIEW)
         if reviewed:
             reason = _message(state.get("error") or state.get("result_summary"))
+            stage = state.get("failed_stage")
+            if stage == STAGE_PUBLISH:
+                return {
+                    "status": "failed",
+                    "error": reason,
+                    "result_summary": reason,
+                    "failed_stage": STAGE_PUBLISH,
+                    "phase": STAGE_PUBLISH,
+                }
             return {
                 "status": "failed",
                 "error": reason,
@@ -1144,13 +1306,22 @@ def _outcome_from_state(state: TriageState) -> TriageOutcome:
             return _rejected_outcome(state)
         except (ValidationError, ValueError):
             return failure_outcome(GENERIC_FAILURE)
+    publish_failed = state.get("failed_stage") == STAGE_PUBLISH or (
+        state.get("phase") == STAGE_PUBLISH
+        and (state.get("status") == "failed" or state.get("error"))
+    )
+    if publish_failed:
+        return failure_outcome(
+            _message(state.get("error") or state.get("result_summary")),
+            stage=STAGE_PUBLISH,
+        )
     try:
         reviewed = bool(_cycle_list(state))
     except ValueError:
         return failure_outcome(REVIEW_FAILURE, stage=STAGE_REVIEW)
     if reviewed:
         try:
-            return _reviewed_outcome(state)
+            return _attach_publication(_reviewed_outcome(state), state)
         except (ValidationError, ValueError):
             logger.error("outcome rejected the review")
             return failure_outcome(REVIEW_FAILURE, stage=STAGE_REVIEW)
@@ -1216,11 +1387,28 @@ def failure_text(exc: LLMError) -> str:
 
 def _pause_or_fail(state: dict[str, Any]) -> TriageOutcome:
     try:
-        outcome = _paused_outcome(state)
+        if _interrupt_kind(state) == "publish":
+            outcome = _publish_pause_outcome(state)
+        else:
+            outcome = _paused_outcome(state)
     except (ValidationError, ValueError):
         logger.error("approval pause rejected the stored plan")
-        outcome = failure_outcome(PLAN_FAILURE, stage=STAGE_PLAN)
+        stage = STAGE_PUBLISH if _interrupt_kind(state) == "publish" else STAGE_PLAN
+        message = PUBLISH_FAILURE if stage == STAGE_PUBLISH else PLAN_FAILURE
+        outcome = failure_outcome(message, stage=stage)
     return replace(outcome, routes=route_trace(state))
+
+
+def _publish_pause_outcome(state: dict[str, Any]) -> TriageOutcome:
+    """The review is stored, and the publication interrupt is still unanswered."""
+    outcome = _reviewed_outcome(state)
+    if outcome.status != TaskStatus.COMPLETED:
+        raise ValueError("publish pause without an accepted review")
+    return replace(
+        outcome,
+        status=TaskStatus.WAITING_APPROVAL,
+        stage=STAGE_PUBLISH_APPROVAL,
+    )
 
 
 def _paused_outcome(state: dict[str, Any]) -> TriageOutcome:
@@ -1728,6 +1916,119 @@ def _is_checked_plan(value: object) -> bool:
     return isinstance(value, dict) and isinstance(value.get("plan"), dict)
 
 
+def _publish_prompt(state: TriageState, binding: GitHubBinding) -> dict[str, Any]:
+    """What the human sees. The token is not included."""
+    task_id = state.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        raise ValueError("task id missing")
+    if _checked_approval(state.get("approval")) is None:
+        raise ValueError("publication without plan approval")
+    if not isinstance(state.get("patch"), dict) or not _tests_passed(state):
+        raise ValueError("publication without a tested patch")
+    return {
+        "kind": "publish",
+        "task_id": task_id,
+        "owner": binding.repo.owner,
+        "name": binding.repo.name,
+        "branch": f"patchpilot/{task_id}",
+    }
+
+
+def _plan_reasoning(state: TriageState) -> str:
+    plan = _checked_plan(state.get("plan"))
+    if plan is None:
+        return ""
+    statement = plan["plan"].get("problem_statement")
+    if not isinstance(statement, str):
+        return ""
+    return statement
+
+
+def _tests_passed(state: TriageState) -> bool:
+    tests = state.get("tests")
+    return isinstance(tests, dict) and tests.get("status") == "passed"
+
+
+def _tests_summary(state: TriageState) -> str:
+    tests = state.get("tests")
+    if isinstance(tests, dict) and isinstance(tests.get("status"), str):
+        return tests["status"]
+    return ""
+
+
+def _checked_publication(value: object) -> dict[str, Any] | None:
+    """Re-validate a publication decision. The repository comes from the binding."""
+    parsed = _parse_resume(value, kind="publish")
+    if parsed is None or not isinstance(value, dict):
+        return None
+    owner = value.get("owner")
+    name = value.get("name")
+    if not isinstance(owner, str) or not isinstance(name, str) or not owner or not name:
+        raise ValueError("publication repository is not valid")
+    return {**parsed, "owner": owner, "name": name}
+
+
+def _attach_publication(outcome: TriageOutcome, state: dict[str, Any]) -> TriageOutcome:
+    publication = state.get("publication")
+    if publication is None:
+        return outcome
+    record = _public_publication(publication)
+    body = dict(outcome.result_json)
+    body["publication"] = record
+    return replace(outcome, result_json=body, publication=record)
+
+
+def _public_publication(value: object) -> dict[str, Any]:
+    """The stored record. Keys that could carry a secret are dropped."""
+    checked = _checked_publication(value)
+    if checked is None or not isinstance(value, dict):
+        raise ValueError("publication decision is not valid")
+    record: dict[str, Any] = {
+        "decision": checked["decision"],
+        "kind": "publish",
+        "approval_id": checked["approval_id"],
+        "owner": checked["owner"],
+        "name": checked["name"],
+    }
+    if checked.get("reason"):
+        record["reason"] = checked["reason"]
+    if checked["decision"] != "approve":
+        return record
+    number = value.get("number")
+    url = value.get("url")
+    branch = value.get("branch")
+    base = value.get("base")
+    head_sha = value.get("head_sha")
+    if value.get("draft") is not True:
+        raise ValueError("publication is not a draft")
+    if isinstance(number, bool) or not isinstance(number, int):
+        raise ValueError("publication number is not valid")
+    if not all(isinstance(item, str) and item for item in (url, branch, base, head_sha)):
+        raise ValueError("publication address is not valid")
+    record.update(
+        {
+            "number": number,
+            "url": url,
+            "branch": branch,
+            "base": base,
+            "head_sha": head_sha,
+            "draft": True,
+        }
+    )
+    return record
+
+
+def _interrupt_kind(state: dict[str, Any]) -> str:
+    raw = state.get(_INTERRUPT)
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return "plan"
+    item = raw[0]
+    value = item.get("value") if isinstance(item, dict) else getattr(item, "value", None)
+    if isinstance(value, dict) and value.get("kind") == "publish":
+        return "publish"
+    return "plan"
+
+
 def _approval_prompt(state: TriageState) -> dict[str, Any]:
     plan = _checked_plan(state.get("plan"))
     if plan is None or not _plan_requests_changes(plan):
@@ -1742,8 +2043,10 @@ def _approval_prompt(state: TriageState) -> dict[str, Any]:
     }
 
 
-def _parse_resume(value: object) -> dict[str, Any] | None:
+def _parse_resume(value: object, *, kind: str = "plan") -> dict[str, Any] | None:
     if not isinstance(value, dict):
+        return None
+    if value.get("kind", "plan") != kind:
         return None
     decision = value.get("decision")
     if decision not in {"approve", "reject"}:
@@ -1764,7 +2067,12 @@ def _parse_resume(value: object) -> dict[str, Any] | None:
             reason = None
         elif len(reason) > APPROVAL_REASON_MAX_LENGTH:
             return None
-    return {"decision": decision, "approval_id": approval_id, "reason": reason}
+    return {
+        "decision": decision,
+        "approval_id": approval_id,
+        "reason": reason,
+        "kind": kind,
+    }
 
 
 def _checked_approval(value: object) -> dict[str, Any] | None:

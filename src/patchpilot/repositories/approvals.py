@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from patchpilot.audit import APPROVAL_DECIDED, approval_decided_key
 from patchpilot.db.models import (
+    APPROVAL_KIND_PLAN,
+    APPROVAL_KIND_PUBLISH,
     APPROVAL_REASON_MAX_LENGTH,
     Approval,
     ApprovalStatus,
@@ -18,8 +20,9 @@ from patchpilot.db.models import (
 )
 from patchpilot.repositories.events import append_event
 
-# The graph node that called interrupt(). Kept in sync with workflow.graph.STAGE_APPROVAL.
-_APPROVAL_STAGE = "request_plan_approval"
+# Kept in sync with workflow.graph stage names. The kind selects which node resumes.
+_PLAN_STAGE = "request_plan_approval"
+_PUBLISH_STAGE = "request_publish_approval"
 
 
 class ApprovalNotFound(Exception):
@@ -37,6 +40,7 @@ class ApprovalView:
     id: UUID
     task_id: UUID
     status: ApprovalStatus
+    kind: str
     plan_version: int
     reason: str | None
     created_at: datetime
@@ -59,7 +63,21 @@ class ApprovalRepository:
         return list(await self._session.scalars(statement))
 
     async def resume_value(self, task_id: UUID) -> dict[str, Any] | None:
-        """The decision a worker passes to ``Command(resume=...)``, or None while pending."""
+        """The decision a worker passes to ``Command(resume=...)``, or None while pending.
+
+        A pending publication approval hides the earlier plan decision. Resuming
+        the publication interrupt with the plan decision would publish nothing,
+        but it also must not be treated as the publication answer.
+        """
+        pending = await self._session.scalar(
+            select(Approval.id).where(
+                Approval.task_id == task_id,
+                Approval.status == ApprovalStatus.PENDING,
+                Approval.kind == APPROVAL_KIND_PUBLISH,
+            )
+        )
+        if pending is not None:
+            return None
         row = await self._session.scalar(
             select(Approval)
             .where(
@@ -76,6 +94,7 @@ class ApprovalRepository:
             "decision": decision,
             "approval_id": str(row.id),
             "reason": row.reason,
+            "kind": row.kind,
         }
 
     async def decide(
@@ -120,6 +139,7 @@ class ApprovalRepository:
             "decision": decision,
             "approval_id": str(approval.id),
             "plan_version": approval.plan_version,
+            "kind": approval.kind,
         }
         if cleaned is not None:
             payload["reason"] = cleaned
@@ -127,10 +147,10 @@ class ApprovalRepository:
             self._session,
             task_id=task.id,
             run_id=None,
-            stage=_APPROVAL_STAGE,
+            stage=_PUBLISH_STAGE if approval.kind == APPROVAL_KIND_PUBLISH else _PLAN_STAGE,
             event_type=APPROVAL_DECIDED,
             payload=payload,
-            idempotency_key=approval_decided_key(task.id),
+            idempotency_key=approval_decided_key(task.id, approval.kind),
             ordinal=0,
         )
         await self._session.commit()
@@ -142,8 +162,11 @@ async def insert_pending_approval(
     *,
     task_id: UUID,
     plan_version: int,
+    kind: str = APPROVAL_KIND_PLAN,
 ) -> Approval:
     """Insert the open request, or return the one already stored. The caller commits."""
+    if kind not in {APPROVAL_KIND_PLAN, APPROVAL_KIND_PUBLISH}:
+        raise ValueError("approval kind must be plan or publish")
     existing = await session.scalar(
         select(Approval).where(
             Approval.task_id == task_id,
@@ -156,6 +179,7 @@ async def insert_pending_approval(
         id=uuid4(),
         task_id=task_id,
         status=ApprovalStatus.PENDING,
+        kind=kind,
         plan_version=plan_version,
     )
     session.add(row)
@@ -189,6 +213,7 @@ def _view(row: Approval) -> ApprovalView:
         id=row.id,
         task_id=row.task_id,
         status=row.status,
+        kind=row.kind,
         plan_version=row.plan_version,
         reason=row.reason,
         created_at=row.created_at,

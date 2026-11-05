@@ -877,3 +877,47 @@ The injection token was not in the HTML or Markdown report. The recovery case lo
 ### Next task
 
 Task 19 — Optional, approval-gated GitHub draft PR.
+
+## Task 19 — Optional, approval-gated GitHub draft PR
+
+Status: complete (2026-11-05).
+
+Publication is off unless `GITHUB_ENABLED=true`, a worker token is set, the registered repository records `github.owner` and `github.name`, and that `owner/name` is listed in `GITHUB_ALLOWED_REPOS`. The API and the runner do not receive the token. The HTTP client talks only to `https://api.github.com` and has no merge method.
+
+After a plan is accepted and tests pass, the graph pauses at a second interrupt, `request_publish_approval`, before any git push or GitHub request. Approval pushes only `patchpilot/<task-id>` and opens one draft pull request. The body includes the issue, the review reasoning, a compare link, the test result, and a machine-generated disclosure. An existing open draft for that head is reused. Rejection stores the decision, does not call GitHub, and leaves no publication row.
+
+### Evidence
+
+`.venv/bin/pytest` — 287 passed in 45.89s.
+
+`.venv/bin/ruff check .` — all checks passed.
+
+`.venv/bin/ruff format --check .` — 171 files already formatted.
+
+`tests/test_github.py` covers an unlisted repository, a missing token, a refused push of `main`, HTTP 401, a connection error, one POST for a duplicate open, a rejected publication with zero HTTP calls and zero remote refs, and an approved publication that pauses with zero calls, then pushes one task branch and opens draft number 7. A repeated approve does not queue another run. A conflicting reject returns 409. The source checkout is unchanged, and the token is absent from the pull-request text and from git config.
+
+A disposable API on `127.0.0.1:8765` rendered `/tasks/beb67048-b4aa-4b26-ab65-e0ed52fe83bd` while publication was pending. The page said nothing had been pushed, offered Approve publication and Reject publication, and said there was no pull request. Typing `Do not publish.` and choosing Reject publication reloaded the page as `Publication · Rejected · plan version 1 · Do not publish.` `GET /api/v1/tasks/beb67048-b4aa-4b26-ab65-e0ed52fe83bd/publication` returned HTTP 404, `{"detail":"Publication not found"}`. GitHub was disabled and no worker was running, so the task went back to `queued` after the decision was stored. The temporary server and database were removed. Compose was not rebuilt.
+
+### Changed files
+
+- `src/patchpilot/github/` — allowlist, draft client, task-branch push, and publication
+- `src/patchpilot/workflow/graph.py`, `src/patchpilot/agents/supervisor.py`, `src/patchpilot/worker.py` — second approval and publish node
+- `src/patchpilot/repositories/approvals.py`, `src/patchpilot/repositories/jobs.py`, `src/patchpilot/repositories/publications.py`
+- `src/patchpilot/db/models.py`, `alembic/versions/20261105_0008_publications.py`
+- `src/patchpilot/config.py`, `src/patchpilot/routes/tasks.py`, `src/patchpilot/schemas/`
+- `src/patchpilot/source/` — optional `--github owner/name` on registration
+- `src/patchpilot/web/present.py`, `src/patchpilot/web/templates/task.html`
+- `compose.yaml`, `.env.example`, `README.md`
+- `tests/test_github.py` and the workflow, supervisor, config, dashboard, checkpoint, and Compose tests
+
+### Limitations
+
+- No request was sent to `api.github.com`. The HTTP tests use a mock transport, and the push test uses a local bare repository.
+- A live draft still requires the operator to set the worker token, the allowlist, and `registration.github` for a repository they own. Those settings are not in `.env`.
+- Rejecting publication in the browser stored the decision and queued a resume. Completing the task locally still needs the worker. This check did not start one.
+- The client cannot merge. A response that is not a draft, or whose URL does not match the allowed repository, is rejected.
+- `docker compose` was not executed. The Compose containers that were already running do not include this code.
+
+### Next task
+
+Task 20 — Security review, documentation and reproducible demo.

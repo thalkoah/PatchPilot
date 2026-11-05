@@ -25,13 +25,18 @@ def main(argv: list[str] | None = None) -> int:
     register = commands.add_parser("register", help="register a checkout under REPOSITORY_ROOT")
     register.add_argument("--name", required=True, help="display name stored with the checkout")
     register.add_argument("--path", required=True, help="path relative to REPOSITORY_ROOT")
+    register.add_argument(
+        "--github",
+        default=None,
+        help="optional owner/name of an allowlisted GitHub test repository",
+    )
 
     commands.add_parser("list", help="list registered checkouts")
 
     args = parser.parse_args(argv)
     try:
         if args.command == "register":
-            return asyncio.run(_register(args.name, args.path))
+            return asyncio.run(_register(args.name, args.path, args.github))
         return asyncio.run(_list())
     except SourceError as exc:
         print(exc.code, file=sys.stderr)
@@ -44,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
-async def _register(display_name: str, relative_path: str) -> int:
+async def _register(display_name: str, relative_path: str, github: str | None) -> int:
     settings = get_settings()
     root = _require_root(settings.repository_root)
     engine = create_engine(settings)
@@ -56,6 +61,7 @@ async def _register(display_name: str, relative_path: str) -> int:
                 repository_root=root,
                 relative_path=relative_path,
                 display_name=display_name,
+                github=github,
             )
     finally:
         await engine.dispose()

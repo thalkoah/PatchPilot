@@ -292,6 +292,41 @@ def test_waiting_approval_posts_to_the_decisions_api(
     assert missing_write.status_code == 404
 
 
+def test_publication_approval_says_nothing_is_pushed(
+    postgres_database_url: str,
+    clean_tasks: None,
+    monkeypatch,
+):
+    with client(postgres_database_url, monkeypatch) as test_client:
+        created = post_task(test_client, title="Publish?", description="A patch is ready.")
+        approval_id = uuid4()
+        with psycopg.connect(postgres_database_url, autocommit=True) as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'waiting_approval'::task_status,
+                    stage = 'request_publish_approval'
+                WHERE id = %s
+                """,
+                (created["id"],),
+            )
+            connection.execute(
+                """
+                INSERT INTO approvals (id, task_id, status, kind, plan_version)
+                VALUES (%s, %s, 'pending'::approval_status, 'publish', 1)
+                """,
+                (approval_id, created["id"]),
+            )
+        page = test_client.get(f"/tasks/{created['id']}")
+
+    assert page.status_code == 200
+    assert "Nothing has been pushed" in page.text
+    assert "Approve publication" in page.text
+    assert "Reject publication" in page.text
+    assert "No pull request." in page.text
+    assert f'data-approval-id="{approval_id}"' in page.text
+
+
 def test_finished_task_shows_evidence_diff_tests_review_and_usage(
     postgres_database_url: str,
     clean_tasks: None,

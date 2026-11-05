@@ -74,6 +74,12 @@ services:
       TASK_MAX_RUNTIME_SECONDS: ${TASK_MAX_RUNTIME_SECONDS:-900}
       TASK_MAX_PARALLELISM: ${TASK_MAX_PARALLELISM:-1}
       TASK_MAX_REPAIRS: ${TASK_MAX_REPAIRS:-2}
+      # Publication stays off. The token is read only by this service, and only
+      # when GITHUB_ENABLED is true. The API and the runner do not receive it.
+      GITHUB_ENABLED: ${GITHUB_ENABLED:-false}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_API_BASE: ${GITHUB_API_BASE:-https://api.github.com}
+      GITHUB_ALLOWED_REPOS: ${GITHUB_ALLOWED_REPOS:-}
       # Checkouts registered under this directory. The host path is
       # REPOSITORY_ROOT_HOST. The worker sees only /repositories, read-only.
       REPOSITORY_ROOT: /repositories

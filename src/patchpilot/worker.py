@@ -40,8 +40,10 @@ from patchpilot.config import (
     Settings,
     get_settings,
 )
-from patchpilot.db.models import TaskStatus
+from patchpilot.db.models import APPROVAL_KIND_PUBLISH, TaskStatus
 from patchpilot.db.session import create_engine, create_session_factory
+from patchpilot.github.names import parse_allowed_repos
+from patchpilot.github.publish import GitHubBinding, GitHubOptions, binding_for
 from patchpilot.leases import LeaseKeeper
 from patchpilot.llm.budget import TaskBudget
 from patchpilot.llm.local_gate import LocalGate
@@ -64,6 +66,7 @@ from patchpilot.workflow.graph import (
     REPOSITORY_UNAVAILABLE,
     STAGE_DEVELOP,
     STAGE_PLAN,
+    STAGE_PUBLISH_APPROVAL,
     STAGE_TEST,
     STAGE_TRIAGE,
     STAGE_WORKSPACE,
@@ -102,6 +105,7 @@ async def process_one(
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     supervisor_model: bool = False,
     usage: UsageControl | None = None,
+    github: GitHubOptions | None = None,
 ) -> bool:
     """Claim and finish one task. Return False when there is nothing to do.
 
@@ -143,6 +147,7 @@ async def process_one(
         max_tool_calls=max_tool_calls,
         supervisor_model=supervisor_model,
         usage=usage,
+        github=github,
     )
     return True
 
@@ -164,6 +169,7 @@ async def process_task(
     max_tool_calls: int = DEFAULT_INVESTIGATOR_MAX_TOOL_CALLS,
     supervisor_model: bool = False,
     usage: UsageControl | None = None,
+    github: GitHubOptions | None = None,
 ) -> bool:
     """Triage one task when it is still queued. Return False if another worker owns it."""
     compiled = graph if graph is not None else compile_triage_graph()
@@ -192,6 +198,7 @@ async def process_task(
         max_tool_calls=max_tool_calls,
         supervisor_model=supervisor_model,
         usage=usage,
+        github=github,
     )
     return True
 
@@ -335,6 +342,7 @@ async def _poll(
                 max_tool_calls=settings.investigator_max_tool_calls,
                 supervisor_model=settings.supervisor_model,
                 usage=usage,
+                github=github_options(settings),
             )
         except Exception as exc:
             logger.error("worker iteration failed: %s", type(exc).__name__)
@@ -360,10 +368,12 @@ async def _finish(
     max_tool_calls: int,
     supervisor_model: bool = False,
     usage: UsageControl | None = None,
+    github: GitHubOptions | None = None,
 ) -> None:
     logger.info("claimed task=%s", claimed.id)
     budget, models = await _bind_models(session_factory, claimed.id, usage)
     tools, repository_error = await _open_tools(session_factory, claimed, repository_root)
+    github_binding = await _github_binding(session_factory, claimed, github)
     resume_decision = await _load_resume_decision(session_factory, claimed.id)
     keeper = None
     if database_url is not None:
@@ -394,6 +404,7 @@ async def _finish(
                 resume_decision=resume_decision,
                 budget=budget,
                 models=models,
+                github=github_binding,
             )
         except LeaseLost:
             logger.warning("lease lost task=%s", claimed.id)
@@ -523,6 +534,11 @@ async def _pause(
                 plan=outcome.plan,
                 artifacts_root=artifacts_root,
                 routes=outcome.routes,
+                kind=(APPROVAL_KIND_PUBLISH if outcome.stage == STAGE_PUBLISH_APPROVAL else "plan"),
+                patch=outcome.patch,
+                tests=outcome.tests,
+                cycles=outcome.cycles,
+                workspace=outcome.workspace,
             )
     except ArtifactStoreError:
         logger.error("plan artifact failed task=%s", claimed.id)
@@ -583,6 +599,31 @@ async def _store_model_calls(
             await ModelCallRepository(session).insert_many(records)
     except Exception:
         logger.error("model call record failed task=%s", task_id)
+
+
+def github_options(settings: Settings) -> GitHubOptions | None:
+    """Publication settings for the worker. A missing token leaves publication off."""
+    if not settings.github_enabled or settings.github_token is None:
+        return None
+    return GitHubOptions(
+        token=settings.github_token,
+        allowed=parse_allowed_repos(settings.github_allowed_repos),
+    )
+
+
+async def _github_binding(
+    session_factory: async_sessionmaker[AsyncSession],
+    claimed: ClaimedTask,
+    options: GitHubOptions | None,
+) -> GitHubBinding | None:
+    """The allowlisted repository for this task, or None when publication is off."""
+    if options is None or claimed.repo_id is None:
+        return None
+    async with session_factory() as session:
+        row = await RepoRepository(session).get(claimed.repo_id)
+    if row is None or not row.enabled:
+        return None
+    return binding_for(row.registration, options)
 
 
 async def _load_resume_decision(

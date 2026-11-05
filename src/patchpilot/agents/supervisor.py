@@ -44,6 +44,10 @@ PATCH_REASON = "A patch was applied in the private worktree."
 TEST_REASON = "A test report is stored."
 REPAIR_REASON = "Policy requested a repair."
 ACCEPT_REASON = "Policy accepted the patch."
+PUBLISH_READY_REASON = "Policy accepted the patch and publication is configured."
+PUBLICATION_APPROVED_REASON = "Publication was approved."
+PUBLICATION_DECLINED_REASON = "Publication was declined."
+PUBLISHED_REASON = "A draft pull request was opened."
 ESCALATE_REASON = "Policy did not accept the patch."
 STAGE_FAILED = "The stage failed."
 STEP_LIMIT_REASON = "The supervisor step limit was reached."
@@ -71,6 +75,8 @@ NODE_FOR_ROUTE = {
     SupervisorRoute.TEST: "test",
     SupervisorRoute.REVIEW: "review",
     SupervisorRoute.REPAIR: "develop",
+    SupervisorRoute.REQUEST_PUBLISH_APPROVAL: "request_publish_approval",
+    SupervisorRoute.PUBLISH: "publish",
     SupervisorRoute.FINALIZE: "finalize",
     SupervisorRoute.ESCALATE: "finalize",
 }
@@ -90,6 +96,7 @@ def decide_route(
     *,
     now: float | None = None,
     deadline_seconds: float = DEFAULT_SUPERVISOR_DEADLINE_SECONDS,
+    publish_available: bool = False,
 ) -> SupervisorDecision:
     """Choose the next route from the stage that just finished."""
     try:
@@ -140,7 +147,13 @@ def decide_route(
             return _one(SupervisorRoute.REVIEW, TEST_REASON)
         return _one(SupervisorRoute.FINALIZE, TEST_MISSING)
     if phase == "review":
-        return _after_review(state)
+        return _after_review(state, publish_available=publish_available)
+    if phase == "request_publish_approval":
+        return _after_publish_approval(state)
+    if phase == "publish":
+        if _publication_opened(state):
+            return _one(SupervisorRoute.FINALIZE, PUBLISHED_REASON)
+        return _one(SupervisorRoute.ESCALATE, STAGE_FAILED)
     return _one(SupervisorRoute.ESCALATE, UNRECOGNIZED_REASON)
 
 
@@ -259,7 +272,11 @@ def _after_plan(state: Mapping[str, Any]) -> SupervisorDecision:
     return _one(SupervisorRoute.FINALIZE, DECLINE_REASON)
 
 
-def _after_review(state: Mapping[str, Any]) -> SupervisorDecision:
+def _after_review(
+    state: Mapping[str, Any],
+    *,
+    publish_available: bool = False,
+) -> SupervisorDecision:
     count = _count(state, "repair_count")
     if (
         state.get("policy") == PolicyAction.REPAIR.value
@@ -277,8 +294,39 @@ def _after_review(state: Mapping[str, Any]) -> SupervisorDecision:
         and state.get("status") == "completed"
         and not state.get("error")
     ):
+        if publish_available:
+            return _one(SupervisorRoute.REQUEST_PUBLISH_APPROVAL, PUBLISH_READY_REASON)
         return _one(SupervisorRoute.FINALIZE, ACCEPT_REASON)
     return _one(SupervisorRoute.ESCALATE, ESCALATE_REASON)
+
+
+def _after_publish_approval(state: Mapping[str, Any]) -> SupervisorDecision:
+    decision = _publication_decision(state)
+    if decision == "approve" and state.get("status") == "running":
+        return _one(SupervisorRoute.PUBLISH, PUBLICATION_APPROVED_REASON)
+    if decision == "reject" and state.get("status") == "completed":
+        return _one(SupervisorRoute.FINALIZE, PUBLICATION_DECLINED_REASON)
+    return _one(SupervisorRoute.ESCALATE, STAGE_FAILED)
+
+
+def _publication_decision(state: Mapping[str, Any]) -> str:
+    publication = state.get("publication")
+    if not isinstance(publication, dict):
+        return ""
+    decision = publication.get("decision")
+    if decision not in {"approve", "reject"}:
+        return ""
+    if publication.get("kind") not in {None, "publish"}:
+        return ""
+    return str(decision)
+
+
+def _publication_opened(state: Mapping[str, Any]) -> bool:
+    publication = state.get("publication")
+    if not isinstance(publication, dict) or publication.get("decision") != "approve":
+        return False
+    number = publication.get("number")
+    return isinstance(number, int) and not isinstance(number, bool) and number > 0
 
 
 def _past_deadline(

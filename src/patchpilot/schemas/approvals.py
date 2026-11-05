@@ -27,6 +27,7 @@ class ApprovalResponse(BaseModel):
     id: UUID
     task_id: UUID
     status: ApprovalStatus
+    kind: Literal["plan", "publish"]
     plan_version: int
     reason: str | None
     created_at: datetime

@@ -179,6 +179,37 @@ class Settings(LLMSettings):
         le=MAX_RUNNER_WAIT_SECONDS,
     )
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    # Publication stays off until this is true, a token is set, and the
+    # repository is on the allowlist. The API and the runner do not read these.
+    github_enabled: bool = False
+    github_token: SecretStr | None = None
+    github_api_base: str = "https://api.github.com"
+    github_allowed_repos: str = ""
+
+    @field_validator("github_token", mode="before")
+    @classmethod
+    def blank_github_token_is_absent(cls, value: object) -> object:
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
+
+    @field_validator("github_api_base")
+    @classmethod
+    def github_api_is_the_public_host(cls, value: str) -> str:
+        if value != "https://api.github.com":
+            raise ValueError("github_api_base must be https://api.github.com")
+        return value
+
+    @field_validator("github_allowed_repos")
+    @classmethod
+    def github_allowlist_is_owner_name(cls, value: str) -> str:
+        from patchpilot.github.names import parse_allowed_repos
+
+        try:
+            parse_allowed_repos(value)
+        except ValueError:
+            raise ValueError("github_allowed_repos must be owner/name pairs") from None
+        return value
 
     @field_validator("database_url")
     @classmethod

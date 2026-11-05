@@ -310,11 +310,15 @@ class Artifact(Base):
 
 
 class ApprovalStatus(enum.StrEnum):
-    """One human decision on a plan. Pending rows are the only open requests."""
+    """One human decision. Pending rows are the only open requests."""
 
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
+
+
+APPROVAL_KIND_PLAN = "plan"
+APPROVAL_KIND_PUBLISH = "publish"
 
 
 approval_status_type = ENUM(
@@ -326,10 +330,14 @@ approval_status_type = ENUM(
 
 
 class Approval(Base):
-    """A request to apply a stored plan. The graph pauses until this row is decided."""
+    """A request to apply a plan, or to publish a reviewed patch."""
 
     __tablename__ = "approvals"
     __table_args__ = (
+        CheckConstraint(
+            "kind IN ('plan', 'publish')",
+            name="ck_approvals_kind",
+        ),
         CheckConstraint(
             "plan_version >= 1 AND plan_version <= 1000",
             name="ck_approvals_plan_version",
@@ -361,6 +369,12 @@ class Approval(Base):
         nullable=False,
     )
     status: Mapped[ApprovalStatus] = mapped_column(approval_status_type, nullable=False)
+    kind: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default=APPROVAL_KIND_PLAN,
+        server_default=text("'plan'"),
+    )
     plan_version: Mapped[int] = mapped_column(Integer, nullable=False)
     reason: Mapped[str | None] = mapped_column(
         String(APPROVAL_REASON_MAX_LENGTH),
@@ -510,3 +524,75 @@ class ModelCall(Base):
 
     def __repr__(self) -> str:
         return f"ModelCall(task_id={self.task_id!s}, stage={self.stage}, outcome={self.outcome})"
+
+
+class Publication(Base):
+    """One draft pull request. The row cannot represent a merged request."""
+
+    __tablename__ = "publications"
+    __table_args__ = (
+        UniqueConstraint("task_id", name="uq_publications_task_id"),
+        CheckConstraint(
+            "owner ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$'",
+            name="ck_publications_owner",
+        ),
+        CheckConstraint(
+            "name ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$'",
+            name="ck_publications_name",
+        ),
+        CheckConstraint(
+            "branch = 'patchpilot/' || task_id::text",
+            name="ck_publications_branch",
+        ),
+        CheckConstraint(
+            "base_branch ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$' "
+            "AND base_branch !~ '\\.\\.' "
+            "AND base_branch <> branch",
+            name="ck_publications_base_branch",
+        ),
+        CheckConstraint("head_sha ~ '^[0-9a-f]{40}$'", name="ck_publications_head_sha"),
+        CheckConstraint(
+            "pr_number >= 1 AND pr_number <= 1000000000",
+            name="ck_publications_pr_number",
+        ),
+        CheckConstraint("draft IS TRUE", name="ck_publications_draft"),
+        CheckConstraint(
+            "html_url = 'https://github.com/' || owner || '/' || name || '/pull/' "
+            "|| pr_number::text",
+            name="ck_publications_html_url",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PgUUID(as_uuid=True), primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("tasks.id", name="fk_publications_task_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    approval_id: Mapped[UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("approvals.id", name="fk_publications_approval_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    owner: Mapped[str] = mapped_column(String(100), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    branch: Mapped[str] = mapped_column(String(80), nullable=False)
+    base_branch: Mapped[str] = mapped_column(String(100), nullable=False)
+    head_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    html_url: Mapped[str] = mapped_column(String(300), nullable=False)
+    draft: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("true"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return f"Publication(task_id={self.task_id!s}, pr_number={self.pr_number})"

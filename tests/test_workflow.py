@@ -129,6 +129,8 @@ def test_triage_graph_plans_only_after_investigation():
         ("develop", "supervisor"),
         ("test", "supervisor"),
         ("review", "supervisor"),
+        ("request_publish_approval", "supervisor"),
+        ("publish", "supervisor"),
         ("supervisor", "investigate"),
         ("supervisor", "plan"),
         ("supervisor", "request_plan_approval"),
@@ -136,6 +138,8 @@ def test_triage_graph_plans_only_after_investigation():
         ("supervisor", "develop"),
         ("supervisor", "test"),
         ("supervisor", "review"),
+        ("supervisor", "request_publish_approval"),
+        ("supervisor", "publish"),
         ("supervisor", "finalize"),
         ("finalize", "__end__"),
     }

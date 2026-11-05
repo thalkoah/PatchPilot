@@ -22,6 +22,7 @@ from patchpilot.dependencies import (
     get_artifact_repository,
     get_event_repository,
     get_model_call_repository,
+    get_publication_repository,
     get_task_repository,
 )
 from patchpilot.repositories.approvals import (
@@ -32,11 +33,13 @@ from patchpilot.repositories.approvals import (
 from patchpilot.repositories.artifacts import ArtifactRepository
 from patchpilot.repositories.events import EventRepository
 from patchpilot.repositories.model_calls import ModelCallRepository
+from patchpilot.repositories.publications import PublicationRepository
 from patchpilot.repositories.tasks import TaskRepository, UnregisteredRepositoryError
 from patchpilot.schemas.approvals import ApprovalList, ApprovalResponse, DecisionCreate
 from patchpilot.schemas.events import EventList, EventResponse
 from patchpilot.schemas.patches import PatchResponse
 from patchpilot.schemas.plans import PlanResponse
+from patchpilot.schemas.publications import PublicationResponse
 from patchpilot.schemas.reviews import ReviewResponse
 from patchpilot.schemas.tasks import (
     DEFAULT_PAGE_LIMIT,
@@ -56,6 +59,7 @@ EventRepositoryDep = Annotated[EventRepository, Depends(get_event_repository)]
 ArtifactRepositoryDep = Annotated[ArtifactRepository, Depends(get_artifact_repository)]
 ApprovalRepositoryDep = Annotated[ApprovalRepository, Depends(get_approval_repository)]
 ModelCallRepositoryDep = Annotated[ModelCallRepository, Depends(get_model_call_repository)]
+PublicationRepositoryDep = Annotated[PublicationRepository, Depends(get_publication_repository)]
 
 
 @router.post("", status_code=201, response_model=TaskResponse)
@@ -312,6 +316,22 @@ def _patch_paths(diff: str) -> list[str]:
         if left == right and left and left not in paths:
             paths.append(left)
     return paths
+
+
+@router.get("/{task_id}/publication", response_model=PublicationResponse)
+async def get_task_publication(
+    task_id: UUID,
+    repository: RepositoryDep,
+    publications: PublicationRepositoryDep,
+) -> PublicationResponse:
+    """Return the draft pull request recorded for this task. No token is included."""
+    task = await repository.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    row = await publications.get_for_task(task_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Publication not found")
+    return PublicationResponse.model_validate(row)
 
 
 @router.get("/{task_id}/approvals", response_model=ApprovalList)

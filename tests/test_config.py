@@ -235,6 +235,30 @@ def test_investigator_budget_defaults_to_six_and_stays_bounded():
         )
 
 
+def test_github_publication_is_off_until_it_is_configured():
+    settings = Settings(
+        database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+        _env_file=None,
+    )
+
+    assert settings.github_enabled is False
+    assert settings.github_token is None
+    assert settings.github_api_base == "https://api.github.com"
+    assert settings.github_allowed_repos == ""
+    with pytest.raises(ValidationError):
+        Settings(
+            database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+            github_api_base="https://example.invalid",
+            _env_file=None,
+        )
+    with pytest.raises(ValidationError):
+        Settings(
+            database_url="postgresql://patchpilot:patchpilot_dev@localhost/patchpilot",
+            github_allowed_repos="https://github.com/octocat/demo",
+            _env_file=None,
+        )
+
+
 def test_settings_reject_timeout_below_one_second():
     with pytest.raises(ValidationError):
         Settings(

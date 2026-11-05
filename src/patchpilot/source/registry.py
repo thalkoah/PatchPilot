@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from patchpilot.db.models import DISPLAY_NAME_MAX_LENGTH, Repository
+from patchpilot.github.names import parse_slug
 from patchpilot.repositories.repos import RepoRepository
 from patchpilot.source.errors import SourceError
 from patchpilot.source.paths import canonical_checkout_path, is_inside
@@ -23,16 +24,28 @@ async def register_checkout(
     repository_root: Path,
     relative_path: str,
     display_name: str,
+    github: str | None = None,
 ) -> Repository:
-    """Insert or refresh one enabled checkout. The same path keeps its id."""
+    """Insert or refresh one enabled checkout. The same path keeps its id.
+
+    `github` is an optional `owner/name` for a repository the operator owns.
+    It is not a remote URL and it is not read from the checkout.
+    """
     name = _display_name(display_name)
     canonical = canonical_checkout_path(relative_path)
     checkout = _checkout_directory(repository_root, canonical)
     head = _read_head(checkout / ".git")
+    registration: dict[str, object] = {"head": head}
+    if github is not None:
+        try:
+            owner, repo_name = parse_slug(github)
+        except ValueError:
+            raise SourceError("invalid_name") from None
+        registration["github"] = {"owner": owner, "name": repo_name}
     return await repository.save(
         display_name=name,
         canonical_path=canonical,
-        registration={"head": head},
+        registration=registration,
     )
 
 

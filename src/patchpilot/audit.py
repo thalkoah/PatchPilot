@@ -28,6 +28,7 @@ RETRY = "retry"
 RECOVERY = "recovery"
 REPAIR = "repair"
 ROUTE = "route"
+PUBLICATION_OPENED = "publication_opened"
 
 EVENT_TYPES = frozenset(
     {
@@ -42,6 +43,7 @@ EVENT_TYPES = frozenset(
         RECOVERY,
         REPAIR,
         ROUTE,
+        PUBLICATION_OPENED,
     }
 )
 
@@ -137,8 +139,10 @@ def task_rejected_key(task_id: UUID) -> str:
     return _task_key(task_id, "task_rejected")
 
 
-def approval_requested_key(task_id: UUID) -> str:
-    """One pause row per task. Parking again after a crash does not insert another."""
+def approval_requested_key(task_id: UUID, kind: str = "plan") -> str:
+    """One pause row per approval kind. Parking again does not insert another."""
+    if kind == "publish":
+        return _task_key(task_id, "approval_requested:publish")
     return _task_key(task_id, "approval_requested")
 
 
@@ -158,9 +162,16 @@ def repair_event_key(task_id: UUID, repair_index: int) -> str:
     return _task_key(task_id, f"repair:{repair_index}")
 
 
-def approval_decided_key(task_id: UUID) -> str:
-    """One decision row per task. A repeated submit does not insert another."""
+def approval_decided_key(task_id: UUID, kind: str = "plan") -> str:
+    """One decision row per approval kind. A repeated submit does not insert another."""
+    if kind == "publish":
+        return _task_key(task_id, "approval_decided:publish")
     return _task_key(task_id, "approval_decided")
+
+
+def publication_opened_key(task_id: UUID) -> str:
+    """One draft-opening row per task. A retry does not insert another."""
+    return _task_key(task_id, "publication_opened")
 
 
 def _task_key(task_id: UUID, name: str) -> str:

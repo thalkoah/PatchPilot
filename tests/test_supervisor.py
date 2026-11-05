@@ -231,8 +231,55 @@ def test_route_names_map_to_existing_nodes():
     assert route_from_supervisor({"route": "investigate_more"}) == "investigate"
     assert route_from_supervisor({"route": "replan"}) == "plan"
     assert route_from_supervisor({"route": "escalate"}) == "finalize"
+    assert (
+        route_from_supervisor({"route": "request_publish_approval"}) == "request_publish_approval"
+    )
+    assert route_from_supervisor({"route": "publish"}) == "publish"
     assert route_from_supervisor({"route": "not-a-route"}) == "finalize"
     assert thread_config(uuid4())["recursion_limit"] == GRAPH_RECURSION_LIMIT
+
+
+def test_publication_is_a_second_gate_and_stays_off_by_default():
+    accepted = {
+        "phase": "review",
+        "status": "completed",
+        "policy": PolicyAction.ACCEPT.value,
+    }
+
+    ordinary = decide_route(accepted)
+    publish = decide_route(accepted, publish_available=True)
+    declined = decide_route(
+        {
+            "phase": "request_publish_approval",
+            "status": "completed",
+            "publication": {"decision": "reject", "kind": "publish"},
+        }
+    )
+    approved = decide_route(
+        {
+            "phase": "request_publish_approval",
+            "status": "running",
+            "publication": {"decision": "approve", "kind": "publish"},
+        }
+    )
+    opened = decide_route(
+        {
+            "phase": "publish",
+            "status": "completed",
+            "publication": {"decision": "approve", "number": 4},
+        }
+    )
+
+    assert ordinary.route is SupervisorRoute.FINALIZE
+    assert ordinary.reason == ACCEPT_REASON
+    assert SupervisorRoute.PUBLISH not in ordinary.allowed
+    assert publish.route is SupervisorRoute.REQUEST_PUBLISH_APPROVAL
+    assert SupervisorRoute.PUBLISH not in publish.allowed
+    assert declined.route is SupervisorRoute.FINALIZE
+    assert approved.route is SupervisorRoute.PUBLISH
+    assert opened.route is SupervisorRoute.FINALIZE
+    ignored = apply_recommendation(ordinary, SupervisorRoute.PUBLISH)
+    assert ignored.route is SupervisorRoute.FINALIZE
 
 
 def test_a_resumed_develop_node_still_routes_to_tests():

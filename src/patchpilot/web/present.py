@@ -33,6 +33,8 @@ STAGE_LABELS = {
     "develop": "Develop",
     "test": "Test",
     "review": "Review",
+    "request_publish_approval": "Publication approval",
+    "publish": "Publication",
     "finalize": "Finalize",
     "supervisor": "Supervisor",
 }
@@ -48,6 +50,7 @@ EVENT_LABELS = {
     "recovery": "Recovery",
     "repair": "Repair",
     "route": "Route",
+    "publication_opened": "Draft pull request opened",
 }
 _KIND_LABELS = {"existing": "Existing file", "new_test": "New test"}
 
@@ -137,9 +140,20 @@ class PlanView:
 class ApprovalView:
     id: str
     status_label: str
+    kind: str
+    kind_label: str
     plan_version: int
     reason: str
     pending: bool
+
+
+@dataclass(frozen=True)
+class PublicationView:
+    number: int
+    url: str
+    branch: str
+    owner: str
+    name: str
 
 
 @dataclass(frozen=True)
@@ -229,6 +243,7 @@ class TaskPage:
     plan_hint: PlanHint | None
     approvals: tuple[ApprovalView, ...]
     pending: ApprovalView | None
+    publication: PublicationView | None
     patch: PatchView | None
     tests: TestView | None
     review: ReviewView | None
@@ -378,6 +393,7 @@ def task_page(loaded: LoadedTask, markers: tuple[str, ...]) -> TaskPage:
         plan_hint=None if loaded.plan is not None else _plan_hint(task.result_json, markers),
         approvals=approvals,
         pending=pending,
+        publication=_publication(task.result_json),
         patch=_patch(loaded.patch, markers),
         tests=_tests(loaded.tests, markers),
         review=_review(loaded.review, loaded.review_policy, loaded.repair_count, markers),
@@ -432,12 +448,47 @@ def _detail_text(value: object) -> str:
 def _approval(row: Approval, markers: tuple[str, ...]) -> ApprovalView:
     status = _value(row.status)
     reason = "" if row.reason is None else redact_text(row.reason, markers)
+    kind = row.kind if row.kind in {"plan", "publish"} else "plan"
     return ApprovalView(
         id=str(row.id),
         status_label=status.replace("_", " ").capitalize(),
+        kind=kind,
+        kind_label="Publication" if kind == "publish" else "Plan",
         plan_version=row.plan_version,
         reason=reason,
         pending=status == "pending",
+    )
+
+
+def _publication(result: object) -> PublicationView | None:
+    """A draft link only when the stored URL matches the recorded repository."""
+    if not isinstance(result, dict):
+        return None
+    raw = result.get("publication")
+    if (
+        not isinstance(raw, dict)
+        or raw.get("decision") != "approve"
+        or raw.get("draft") is not True
+    ):
+        return None
+    owner = raw.get("owner")
+    name = raw.get("name")
+    branch = raw.get("branch")
+    url = raw.get("url")
+    number = raw.get("number")
+    if not all(isinstance(item, str) and item for item in (owner, name, branch, url)):
+        return None
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        return None
+    expected = f"https://github.com/{owner}/{name}/pull/{number}"
+    if url != expected or not str(branch).startswith("patchpilot/"):
+        return None
+    return PublicationView(
+        number=number,
+        url=expected,
+        branch=str(branch),
+        owner=str(owner),
+        name=str(name),
     )
 
 

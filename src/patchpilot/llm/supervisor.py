@@ -21,6 +21,8 @@ class SupervisorRoute(StrEnum):
     TEST = "test"
     REVIEW = "review"
     REPAIR = "repair"
+    REQUEST_PUBLISH_APPROVAL = "request_publish_approval"
+    PUBLISH = "publish"
     FINALIZE = "finalize"
     ESCALATE = "escalate"
 
