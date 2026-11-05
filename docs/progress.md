@@ -829,3 +829,51 @@ The running Compose stack was left as it was. It does not include this dashboard
 ### Next task
 
 Task 18 — Evaluation harness and benchmark report.
+
+## Task 18 — Evaluation harness and benchmark report
+
+Status: complete (2026-11-05).
+
+`uv run python -m patchpilot.benchmark --provider fake` runs 15 curated issues through the worker and writes `report.json`, `report.md`, and `report.html`. The issues cover a successful discount fix, one repair that then passes, triage with no repository, an ambiguous report, an unclear report, missing evidence, a named file that is not in the tree, tests that keep failing, a rejected approval, invalid plan JSON, invalid patch JSON, a hostile source comment, a bogus citation, an unsafe path request, and a lease expiry that a second claim recovers.
+
+FakeProvider is the only model. Fixture-only faults are appended to the model prompt and are not part of the stored issue text. `--provider ollama` is a separate opt-in that sends the same issue texts to the configured local model and skips those fixture-only faults. The CLI does not offer a cloud provider. The report states that the scores do not represent industry benchmark quality.
+
+The harness records classification, whether stored citations were read, a plan proxy (`can_proceed`, dropped paths, and safe surviving paths), patch apply rate, test pass rate, policy violations, retries, latency, and reported tokens. A policy check fails if a registered checkout changes or if a dropped path, the injection marker, or the fixture token is stored. The unsafe-path case stops at approval because the fixture patch names files the filter removed.
+
+### Evidence
+
+`.venv/bin/pytest` — 276 passed in 37.27s.
+
+`.venv/bin/ruff check .` — all checks passed.
+
+`.venv/bin/ruff format --check .` — 160 files already formatted.
+
+`.venv/bin/python -m patchpilot.benchmark --provider fake --database-url <disposable PostgreSQL> --output benchmark-results` exited 0. `uv run --no-sync python -m patchpilot.benchmark --provider fake` with the same arguments also exited 0. Both runs reported:
+
+`classification=15/15 evidence=11/11 plan=11/11 patch=4/5 tests=3/4 policy_violations=0 retries=4 invalid_outputs=2`
+
+Reported tokens were prompt 2280 and output 1140, marked partial because the two invalid-JSON calls do not report usage. Latency was 7893 ms and 7870 ms. The command printed: `These scores do not represent industry benchmark quality.`
+
+The injection token was not in the HTML or Markdown report. The recovery case logged `lease lost` and then completed.
+
+### Changed files
+
+- `src/patchpilot/benchmark/` — dataset, worker run, scoring, and JSON/Markdown/HTML reports
+- `tests/test_benchmark.py`
+- `.gitignore` — `benchmark-results/`
+- `README.md`, `docs/progress.md`
+
+### Limitations
+
+- The scores measure this repository's fixtures. They do not represent industry benchmark quality and are not comparable to SWE-bench.
+- Several faults exist only in FakeProvider: invalid JSON, a patch that leaves tests failing, and one forced repair. A live model is not asked to reproduce them.
+- Fake token counts are the fixture values 20 and 10 per successful call, not a tokenizer measurement. Calls that raise report no tokens, so the total is partial.
+- Latency is wall-clock time. The two runs above differed by 23 ms. It is not a pass/fail target.
+- Planning quality is a proxy. It does not rate the plan's prose.
+- The recovery case stalls the first model call and expires the lease. It does not kill a container.
+- Host Ollama was not run. The ollama command is implemented and untested against a live model.
+- `docker compose` was not executed for this task.
+
+### Next task
+
+Task 19 — Optional, approval-gated GitHub draft PR.

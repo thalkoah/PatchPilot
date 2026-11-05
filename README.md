@@ -241,6 +241,24 @@ Ollama listens on `127.0.0.1:11434` unless `OLLAMA_HOST` says otherwise. Packets
 
 Keep port 11434 off the LAN and off the public internet. `OLLAMA_HOST=0.0.0.0:11434` accepts connections on every interface. On Fedora, leave 11434 closed in firewalld, or bind Ollama to the Compose bridge address only. PatchPilot sends no credentials to Ollama. Anyone who can open a TCP connection can use the model. Compose does not publish port 11434.
 
+## Benchmark
+
+The offline harness runs 15 curated issues through the worker and writes `report.json`, `report.md`, and `report.html`. `--provider fake` uses fixtures only. It does not call Ollama or a cloud API. `DATABASE_URL` must point at a migrated application database. The command creates the LangGraph checkpoint tables itself.
+
+```bash
+uv run python -m patchpilot.benchmark --provider fake --database-url "$DATABASE_URL"
+```
+
+Reports land in `benchmark-results/`. The scores are regression measurements for this repository. They do not represent industry benchmark quality.
+
+An explicit local comparison uses the same issue texts and skips faults that only the fixtures can force:
+
+```bash
+uv run python -m patchpilot.benchmark --provider ollama --database-url "$DATABASE_URL"
+```
+
+That command needs Ollama on the configured base URL. It is not part of `uv run pytest`.
+
 ## Tests and lint
 
 ```bash

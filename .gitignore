@@ -30,6 +30,9 @@ wheels/
 *.egg-info/
 .installed.cfg
 
+# Generated benchmark reports. The harness writes these; they are not source.
+benchmark-results/
+
 # Test and coverage output
 .coverage
 .coverage.*
