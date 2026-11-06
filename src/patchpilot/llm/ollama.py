@@ -18,9 +18,9 @@ from patchpilot.llm.errors import (
     LLMTransportError,
 )
 from patchpilot.llm.limits import (
-    MAX_HTTP_BODY_BYTES,
     MAX_LLM_RETRIES,
     MAX_LLM_TIMEOUT_SECONDS,
+    MAX_OLLAMA_HTTP_BODY_BYTES,
     normalize_model_name,
     normalize_ollama_base_url,
 )
@@ -46,6 +46,9 @@ class OllamaProvider:
     Other transport failures fail on the first attempt. Exception messages
     omit response bodies. Tool calling is advertised only when requested,
     because support depends on the model.
+
+    Structured calls set `think` to false. A thinking model otherwise returns a
+    long trace beside the JSON object, and that trace is not the object.
     """
 
     def __init__(
@@ -159,6 +162,9 @@ class OllamaProvider:
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
+            # The schema object is the whole answer. A thinking trace is
+            # discarded, and it can be larger than the body cap.
+            "think": False,
             "format": schema_document,
             "options": {"temperature": options.temperature},
         }
@@ -179,7 +185,7 @@ class OllamaProvider:
             raise LLMTransientError(f"Ollama returned HTTP {response.status_code}")
         if response.status_code != 200:
             raise LLMTransportError(f"Ollama returned HTTP {response.status_code}")
-        if len(response.content) > MAX_HTTP_BODY_BYTES:
+        if len(response.content) > MAX_OLLAMA_HTTP_BODY_BYTES:
             raise LLMResponseError("Ollama response was not a JSON object")
 
         payload: Any = None

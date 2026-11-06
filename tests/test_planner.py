@@ -11,7 +11,7 @@ from tests.database import open_session_factory
 from tests.workflow_support import compiled_worker_graph
 
 from patchpilot.agents.plan_paths import modification_is_allowed
-from patchpilot.agents.planner import accept_plan
+from patchpilot.agents.planner import PlannerAgent, accept_plan
 from patchpilot.api import create_app
 from patchpilot.config import get_settings
 from patchpilot.db.models import TaskStatus
@@ -126,6 +126,141 @@ def test_missing_evidence_overrides_a_plan_that_wants_to_proceed(tmp_path: Path)
     assert accepted.can_proceed is False
     assert accepted.modifications == []
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_a_declined_draft_proceeds_when_it_names_a_cited_python_file(tmp_path: Path):
+    source = tmp_path / "app.py"
+    source.write_text("title = 'Demo service'\n", encoding="utf-8")
+    draft = ChangePlan(
+        problem_statement="The service title needs to be changed.",
+        assumptions=[],
+        modifications=[],
+        test_strategy="Update the string literal in app.py and verify the change.",
+        risks=[],
+        confidence=0.8,
+        can_proceed=False,
+    )
+    report = InvestigationReport(
+        summary="The title is set in app.py.",
+        evidence=[EvidenceCitation(relative_path="app.py", start_line=1, end_line=1)],
+    )
+
+    accepted, rejected = accept_plan(
+        draft,
+        triage=_triage(needs_clarification=False),
+        report=report,
+        checkout=tmp_path,
+    )
+
+    assert rejected == 0
+    assert accepted.can_proceed is True
+    assert [(item.relative_path, item.kind) for item in accepted.modifications] == [
+        ("app.py", ModificationKind.EXISTING)
+    ]
+    assert accepted.problem_statement == draft.problem_statement
+    assert accepted.test_strategy == draft.test_strategy
+    assert source.read_text(encoding="utf-8") == "title = 'Demo service'\n"
+
+
+def test_an_ambiguous_draft_declines_without_naming_the_cited_file(tmp_path: Path):
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    report = InvestigationReport(
+        summary="A line was read.",
+        evidence=[EvidenceCitation(relative_path="app.py", start_line=1, end_line=1)],
+    )
+
+    accepted, rejected = accept_plan(
+        AMBIGUOUS_PLAN,
+        triage=_triage(needs_clarification=False),
+        report=report,
+        checkout=tmp_path,
+    )
+
+    assert rejected == 0
+    assert accepted.can_proceed is False
+    assert accepted.modifications == []
+
+
+def test_clarification_declines_even_when_the_draft_names_the_cited_file(tmp_path: Path):
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    draft = ChangePlan(
+        problem_statement="Change app.py.",
+        assumptions=[],
+        modifications=[],
+        test_strategy="Update app.py.",
+        risks=[],
+        confidence=0.4,
+        can_proceed=False,
+    )
+    report = InvestigationReport(
+        summary="The handler is in app.py.",
+        evidence=[EvidenceCitation(relative_path="app.py", start_line=1, end_line=1)],
+    )
+
+    accepted, rejected = accept_plan(
+        draft,
+        triage=_triage(needs_clarification=True),
+        report=report,
+        checkout=tmp_path,
+    )
+
+    assert rejected == 0
+    assert accepted.can_proceed is False
+    assert accepted.modifications == []
+
+
+def test_a_named_readme_citation_does_not_become_a_change(tmp_path: Path):
+    (tmp_path / "README.md").write_text("# Demo service\n", encoding="utf-8")
+    draft = ChangePlan(
+        problem_statement="Change the title in README.md.",
+        assumptions=[],
+        modifications=[],
+        test_strategy="Update README.md.",
+        risks=[],
+        confidence=0.6,
+        can_proceed=False,
+    )
+    report = InvestigationReport(
+        summary="The title is in README.md.",
+        evidence=[EvidenceCitation(relative_path="README.md", start_line=1, end_line=1)],
+    )
+
+    accepted, rejected = accept_plan(
+        draft,
+        triage=_triage(needs_clarification=False),
+        report=report,
+        checkout=tmp_path,
+    )
+
+    assert rejected == 0
+    assert accepted.can_proceed is False
+    assert accepted.modifications == []
+
+
+def test_planner_prompt_treats_one_cited_python_file_as_enough(tmp_path: Path):
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    provider = _PromptRecorder()
+    report = InvestigationReport(
+        summary="The investigator kept only lines it had read.",
+        evidence=[EvidenceCitation(relative_path="app.py", start_line=1, end_line=1)],
+        unanswered_questions=[
+            "Citations were omitted because those lines were not read.",
+            "Where is the new name implemented?",
+        ],
+    )
+
+    PlannerAgent(provider, tmp_path).run(
+        title="Change the service title",
+        description='Change "Demo service" to "Test service".',
+        triage=_triage(needs_clarification=False),
+        report=report,
+    )
+
+    prompt = provider.prompt
+    assert "Set can_proceed true" in prompt
+    assert "does not cancel a line that was read" in prompt
+    assert "app.py:1" in prompt
+    assert "Where is the new name implemented?" in prompt
 
 
 def test_clarification_and_symlinks_cannot_become_a_change(tmp_path: Path):
@@ -495,6 +630,26 @@ def _plan_for(relative_path: str, kind: ModificationKind, *, proceed: bool) -> C
         confidence=0.8,
         can_proceed=proceed,
     )
+
+
+class _PromptRecorder:
+    def __init__(self) -> None:
+        self.prompt = ""
+
+    def generate_structured(self, prompt: str, schema: type, options: object = None) -> ChangePlan:
+        self.prompt = prompt
+        return ChangePlan(
+            problem_statement="Update the title.",
+            assumptions=[],
+            modifications=[],
+            test_strategy="Run pytest.",
+            risks=[],
+            confidence=0.5,
+            can_proceed=False,
+        )
+
+    def close(self) -> None:
+        return None
 
 
 def _triage(*, needs_clarification: bool) -> TriageResult:

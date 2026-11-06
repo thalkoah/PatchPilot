@@ -238,13 +238,15 @@ def _git(action: str, args: list[str]) -> str:
     command = [git, *args[1:]]
     try:
         with tempfile.TemporaryDirectory(prefix="patchpilot-git-") as home:
+            config_path = Path(home) / "gitconfig"
+            _write_safe_config(config_path, _trusted_directories(args))
             completed = subprocess.run(
                 command,
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=_GIT_TIMEOUT_SECONDS,
-                env=_git_env(home),
+                env=_git_env(home, config_path),
             )
     except (OSError, subprocess.TimeoutExpired):
         logger.error("git %s failed", action)
@@ -269,14 +271,53 @@ def _git_config(*directories: Path) -> list[str]:
     return config
 
 
-def _git_env(home: str) -> dict[str, str]:
+def _trusted_directories(args: list[str]) -> list[str]:
+    """Paths from `safe.directory`, plus a real `.git` directory under each.
+
+    `git clone` asks upload-pack to read the source. That child does not inherit
+    `-c`, and it checks ownership of `<checkout>/.git`. The global config file is
+    what the child reads. A wildcard is never trusted.
+    """
+    trusted: list[str] = []
+    prefix = "safe.directory="
+    for arg in args:
+        if not arg.startswith(prefix):
+            continue
+        _remember_directory(trusted, arg[len(prefix) :])
+        git_dir = Path(arg[len(prefix) :]) / ".git"
+        if git_dir.is_dir() and not git_dir.is_symlink():
+            _remember_directory(trusted, _path_arg(git_dir))
+    return trusted
+
+
+def _remember_directory(trusted: list[str], text: str) -> None:
+    if text == "*" or text.startswith("-") or "\n" in text or "\x00" in text:
+        raise WorkspaceError("invalid_source")
+    if text not in trusted:
+        trusted.append(text)
+
+
+def _write_safe_config(path: Path, directories: list[str]) -> None:
+    lines = ["[safe]"]
+    for directory in directories:
+        lines.append(f"\tdirectory = {_quote_config(directory)}")
+    text = "\n".join(lines) + "\n" if directories else ""
+    path.write_text(text, encoding="utf-8")
+
+
+def _quote_config(text: str) -> str:
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _git_env(home: str, config_path: Path) -> dict[str, str]:
     return {
         "PATH": os.environ.get("PATH", ""),
         "HOME": home,
         "LC_ALL": "C",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_GLOBAL": str(config_path),
         "GIT_OPTIONAL_LOCKS": "0",
         "GIT_ALLOW_PROTOCOL": "file",
     }

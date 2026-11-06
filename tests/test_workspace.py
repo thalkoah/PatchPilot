@@ -15,6 +15,7 @@ from patchpilot.repositories.repos import RepoRepository
 from patchpilot.repositories.tasks import TaskRepository
 from patchpilot.repositories.workspaces import insert_workspace
 from patchpilot.workflow.graph import route_after_approval
+from patchpilot.workspace import git as workspace_git
 from patchpilot.workspace.errors import WorkspaceError, WorkspaceStoreError
 from patchpilot.workspace.git import prepare_isolated_workspace, remove_isolated_workspace
 from patchpilot.workspace.layout import (
@@ -92,6 +93,30 @@ def test_a_second_prepare_reuses_the_worktree(tmp_path: Path):
 
     assert second == first
     assert (worktree / "app.py").read_text(encoding="utf-8") == "kept\n"
+    assert git_snapshot(source) == before
+    assert not (source / ".git" / "worktrees").exists()
+
+
+def test_a_checkout_owned_by_another_user_can_be_cloned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = _git_repo(tmp_path / "src")
+    before = git_snapshot(source)
+    root = tmp_path / "workspaces"
+    root.mkdir()
+    original = workspace_git._git_env
+
+    def assume_other_owner(home: str, config_path: Path) -> dict[str, str]:
+        env = original(home, config_path)
+        env["GIT_TEST_ASSUME_DIFFERENT_OWNER"] = "1"
+        return env
+
+    monkeypatch.setattr(workspace_git, "_git_env", assume_other_owner)
+
+    layout = prepare_isolated_workspace(source=source, workspace_root=root, task_id=uuid4())
+
+    assert layout.base_sha == _head(source)
     assert git_snapshot(source) == before
     assert not (source / ".git" / "worktrees").exists()
 

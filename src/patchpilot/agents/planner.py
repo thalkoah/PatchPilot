@@ -1,8 +1,10 @@
 """Planner agent. It proposes a change and does not write the checkout.
 
-A plan can proceed only when the investigation cited at least one line, triage
-does not need clarification, and every surviving path is an existing `.py` file
-or a permitted new test path. Anything else is stored as a decline.
+A plan can proceed when triage does not need clarification and a cited existing
+`.py` file survives. A draft that names such a file proceeds even when the model
+set `can_proceed` false. A draft that does not name one proceeds only when the
+model asked to, the investigation cited a line, and a permitted path remains.
+Anything else is stored as a decline.
 """
 
 from collections.abc import Callable
@@ -14,7 +16,7 @@ from patchpilot.agents.errors import StopForLease
 from patchpilot.agents.plan_paths import modification_is_allowed
 from patchpilot.llm.investigation import InvestigationReport
 from patchpilot.llm.limits import MAX_PROMPT_CHARS
-from patchpilot.llm.plan import ChangePlan, ProposedModification
+from patchpilot.llm.plan import ChangePlan, ModificationKind, ProposedModification
 from patchpilot.llm.provider import LLMProvider
 from patchpilot.llm.triage import TriageResult
 
@@ -23,6 +25,8 @@ _DECLINED = "The planner declined because the evidence does not support a change
 _KEPT_PATHS = "The planner kept only paths that are permitted in this repository."
 _NO_TESTS = "No test change is proposed until the failure is reproducible."
 _KEEP_TESTS = "Run the repository tests that cover the cited files."
+_CITED_EDIT = "Edit the cited lines."
+_MAX_MODIFICATIONS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,10 +103,26 @@ def accept_plan(
             kept.append(modification)
         else:
             rejected.append(path)
-    evidence_ok = bool(report.evidence) and not triage.needs_clarification
-    can_proceed = bool(plan.can_proceed and evidence_ok and kept)
-    if not can_proceed:
-        kept = []
+    named = [path for path in _cited_python_files(report, checkout) if _draft_names(plan, path)]
+    if named and not triage.needs_clarification:
+        present = {item.relative_path for item in kept}
+        for path in named:
+            if path in present or len(kept) >= _MAX_MODIFICATIONS:
+                continue
+            kept.append(
+                ProposedModification(
+                    relative_path=path,
+                    kind=ModificationKind.EXISTING,
+                    summary=_CITED_EDIT,
+                )
+            )
+            present.add(path)
+        can_proceed = True
+    else:
+        evidence_ok = bool(report.evidence) and not triage.needs_clarification
+        can_proceed = bool(plan.can_proceed and evidence_ok and kept)
+        if not can_proceed:
+            kept = []
     statement = _clean(
         plan.problem_statement,
         rejected,
@@ -143,8 +163,13 @@ def _prompt(
     questions = "\n".join(report.unanswered_questions) or "none"
     prompt = (
         "Plan a minimal change from the investigation. Do not write files or include a diff.\n"
-        "Set can_proceed false when the evidence is not enough to support a change.\n"
-        'Use kind "existing" for a .py file that is already in the checkout.\n'
+        "Set can_proceed true when Needs clarification is false and at least one evidence "
+        "line names an existing .py file. Add a modification for each such file with kind "
+        '"existing".\n'
+        "An unanswered question, a dropped citation, or a non-Python path does not cancel "
+        "a line that was read.\n"
+        "Set can_proceed false when Needs clarification is true or no evidence line names "
+        "a .py file that can be edited.\n"
         'Use kind "new_test" for a new tests/test_*.py file under an existing tests directory.\n'
         "Do not propose any other path.\n\n"
         f"Title: {title.strip()}\n"
@@ -158,6 +183,26 @@ def _prompt(
         f"Unanswered questions:\n{questions}\n"
     )
     return prompt[:MAX_PROMPT_CHARS]
+
+
+def _cited_python_files(report: InvestigationReport, checkout: Path) -> list[str]:
+    """Evidence paths that may be edited as existing Python files, in report order."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for item in report.evidence:
+        path = item.relative_path
+        if path in seen:
+            continue
+        seen.add(path)
+        if modification_is_allowed(checkout, path, ModificationKind.EXISTING):
+            found.append(path)
+    return found
+
+
+def _draft_names(plan: ChangePlan, path: str) -> bool:
+    """True when the statement, assumptions, test strategy, or risks contain this path."""
+    pieces = (plan.problem_statement, plan.test_strategy, *plan.assumptions, *plan.risks)
+    return any(path in piece for piece in pieces)
 
 
 def _clean(text: str, rejected: list[str], *, fallback: str) -> str:

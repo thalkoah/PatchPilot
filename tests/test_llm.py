@@ -17,6 +17,7 @@ from patchpilot.llm.fake import (
     NEEDS_CLARIFICATION_TRIAGE,
     FakeProvider,
 )
+from patchpilot.llm.limits import MAX_OLLAMA_HTTP_BODY_BYTES
 from patchpilot.llm.ollama import OllamaProvider
 from patchpilot.llm.provider import GenerateOptions
 from patchpilot.llm.triage import TriageResult
@@ -274,9 +275,10 @@ def test_ollama_posts_a_schema_constrained_chat_request_and_validates_it():
     assert len(seen) == 1
     assert str(seen[0].url) == "http://ollama.test:11434/api/chat"
     body = json.loads(seen[0].content)
-    assert set(body) == {"model", "messages", "stream", "format", "options"}
+    assert set(body) == {"model", "messages", "stream", "think", "format", "options"}
     assert body["model"] == "gemma4:12b"
     assert body["stream"] is False
+    assert body["think"] is False
     assert body["format"] == TriageResult.model_json_schema()
     assert body["options"] == {"temperature": 0.0}
     assert body["messages"][1] == {"role": "user", "content": "The save button fails."}
@@ -417,8 +419,33 @@ def test_non_json_and_non_text_bodies_fail_without_their_contents():
     assert caught.value.__context__ is None
 
 
+def test_thinking_trace_does_not_hide_a_valid_object():
+    content = GENERIC_BUG_TRIAGE.model_dump_json()
+    thinking = "trace " * 4_000
+    response = httpx2.Response(
+        200,
+        json={
+            "model": "qwen3.5:4b",
+            "message": {"role": "assistant", "content": content, "thinking": thinking},
+            "done": True,
+        },
+    )
+    assert len(response.content) > 12_288
+    provider, seen, client = scripted_provider([response], max_retries=0)
+
+    try:
+        result = provider.generate_structured("The save button fails.", TriageResult)
+    finally:
+        provider.close()
+        client.close()
+
+    assert result == GENERIC_BUG_TRIAGE
+    assert len(seen) == 1
+    assert "trace" not in result.model_dump_json()
+
+
 def test_oversized_response_is_rejected_before_it_is_parsed():
-    huge = "y" * 20_000
+    huge = "y" * (MAX_OLLAMA_HTTP_BODY_BYTES + 1)
     provider, _seen, client = scripted_provider(
         [httpx2.Response(200, content=huge.encode())],
         max_retries=0,
