@@ -40,6 +40,9 @@ REJECTED_REASON = "The plan was rejected."
 NOT_APPROVED_REASON = "The plan was not approved."
 APPROVED_REASON = "The plan was approved."
 WORKSPACE_REASON = "The private worktree is ready."
+BASELINE_REASON = "The unmodified worktree has not been tested."
+BASELINE_READY_REASON = "The baseline test report is stored."
+BASELINE_MISSING = "The baseline test report is missing."
 PATCH_REASON = "A patch was applied in the private worktree."
 TEST_REASON = "A test report is stored."
 REPAIR_REASON = "Policy requested a repair."
@@ -136,8 +139,14 @@ def decide_route(
         return _one(SupervisorRoute.FINALIZE, NOT_APPROVED_REASON)
     if phase == "prepare_workspace":
         if _mapping(state.get("workspace")):
+            if not _mapping(state.get("baseline_tests")):
+                return _one(SupervisorRoute.TEST, BASELINE_REASON)
             return _one(SupervisorRoute.DEVELOP, WORKSPACE_REASON)
         return _one(SupervisorRoute.FINALIZE, WORKSPACE_MISSING)
+    if phase == "baseline":
+        if _mapping(state.get("baseline_tests")):
+            return _one(SupervisorRoute.DEVELOP, BASELINE_READY_REASON)
+        return _one(SupervisorRoute.FINALIZE, BASELINE_MISSING)
     if phase == "develop":
         if _mapping(state.get("patch")):
             return _one(SupervisorRoute.TEST, PATCH_REASON)

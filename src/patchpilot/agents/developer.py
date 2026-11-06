@@ -71,23 +71,32 @@ class DeveloperAgent:
         repair_count: int = 0,
         tests: TestReport | None = None,
     ) -> DevelopOutcome:
-        self._check_lease()
-        proposal = self._provider.generate_structured(
-            _prompt(
-                title=title,
-                description=description,
-                plan=plan,
-                report=report,
-                worktree=self._worktree,
-                review=review,
-                repair_count=repair_count,
-                tests=tests,
-            ),
-            PatchProposal,
-        )
-        self._check_lease()
-        applied = apply_patch(worktree=self._worktree, proposal=proposal, plan=plan)
-        return DevelopOutcome(proposal=proposal, applied=applied)
+        refused = False
+        while True:
+            self._check_lease()
+            proposal = self._provider.generate_structured(
+                _prompt(
+                    title=title,
+                    description=description,
+                    plan=plan,
+                    report=report,
+                    worktree=self._worktree,
+                    review=review,
+                    repair_count=repair_count,
+                    tests=tests,
+                    syntax_refused=refused,
+                ),
+                PatchProposal,
+            )
+            self._check_lease()
+            try:
+                applied = apply_patch(worktree=self._worktree, proposal=proposal, plan=plan)
+            except PatchError as exc:
+                if exc.code != "syntax" or refused:
+                    raise
+                refused = True
+                continue
+            return DevelopOutcome(proposal=proposal, applied=applied)
 
     def _check_lease(self) -> None:
         if self._lease_lost is not None and self._lease_lost():
@@ -104,6 +113,7 @@ def _prompt(
     review: ReviewResult | None,
     repair_count: int,
     tests: TestReport | None,
+    syntax_refused: bool = False,
 ) -> str:
     text = description.strip()
     if len(text) > _DESCRIPTION_CHARS:
@@ -117,8 +127,10 @@ def _prompt(
         )
     else:
         instruction = "Write a patch for the approved plan.\n"
+    refused = "The previous edit was not valid Python.\n" if syntax_refused else ""
     prompt = (
         f"{instruction}"
+        f"{refused}"
         "Do not run tests or a shell.\n"
         "Return file edits, or one unified diff, and no other paths.\n"
         "For an existing file, set expected_sha256 to the SHA256 shown below.\n"

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urlencode
 
+from patchpilot.agents.review_policy import failure_identities
 from patchpilot.audit import bound_payload
 from patchpilot.db.models import Approval, Task, TaskEvent, TaskStatus
 from patchpilot.llm.investigation import InvestigationReport
@@ -175,6 +176,7 @@ class TestView:
     stdout: str
     stderr: str
     output_truncated: bool
+    unchanged_failure: str
 
 
 @dataclass(frozen=True)
@@ -395,7 +397,7 @@ def task_page(loaded: LoadedTask, markers: tuple[str, ...]) -> TaskPage:
         pending=pending,
         publication=_publication(task.result_json),
         patch=_patch(loaded.patch, markers),
-        tests=_tests(loaded.tests, markers),
+        tests=_tests(loaded.tests, loaded.task.result_json, markers),
         review=_review(loaded.review, loaded.review_policy, loaded.repair_count, markers),
         usage=_usage(loaded.usage),
         events=events,
@@ -615,7 +617,11 @@ def _patch(loaded: LoadedPatch | None, markers: tuple[str, ...]) -> PatchView | 
     )
 
 
-def _tests(loaded: LoadedTest | None, markers: tuple[str, ...]) -> TestView | None:
+def _tests(
+    loaded: LoadedTest | None,
+    result: object,
+    markers: tuple[str, ...],
+) -> TestView | None:
     if loaded is None:
         return None
     report = loaded.report
@@ -628,7 +634,23 @@ def _tests(loaded: LoadedTest | None, markers: tuple[str, ...]) -> TestView | No
         stdout=redact_text(report.stdout, markers),
         stderr=redact_text(report.stderr, markers),
         output_truncated=report.output_truncated,
+        unchanged_failure=redact_text(_unchanged_failure(report.stdout, result), markers),
     )
+
+
+def _unchanged_failure(stdout: str, result: object) -> str:
+    """Name baseline identities when the patched log repeats them and nothing else."""
+    if not isinstance(result, dict):
+        return ""
+    raw = result.get("baseline_failures")
+    if not isinstance(raw, list):
+        return ""
+    known = {item for item in raw if isinstance(item, str) and item.strip()}
+    current = failure_identities(stdout)
+    if not current or not known or any(item not in known for item in current):
+        return ""
+    shown = ", ".join(current)
+    return f"This failure was already on the unmodified worktree: {shown}."
 
 
 def _review(

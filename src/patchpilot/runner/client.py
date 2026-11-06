@@ -40,6 +40,13 @@ def test_job_id(task_id: UUID, repair_count: int) -> UUID:
     return uuid5(_ATTEMPT_NAMESPACE, f"{task_id}:{repair_count}")
 
 
+def baseline_job_id(task_id: UUID) -> UUID:
+    """Job id for the unmodified worktree. A patched pass does not reuse it."""
+    if not isinstance(task_id, UUID):
+        raise RunnerRejected
+    return uuid5(_ATTEMPT_NAMESPACE, f"{task_id}:baseline")
+
+
 def collect_test_report(
     *,
     worktree: Path,

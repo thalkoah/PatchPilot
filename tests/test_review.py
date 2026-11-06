@@ -15,6 +15,7 @@ from tests.workflow_support import compiled_worker_graph
 from patchpilot.agents.developer import DeveloperAgent
 from patchpilot.agents.limits import require_repair_budget
 from patchpilot.agents.review_policy import (
+    BASELINE_ACCEPT_REASON,
     CRITICAL_REASON,
     PATCH_POLICY_REASON,
     REPAIR_LIMIT_REASON,
@@ -22,6 +23,8 @@ from patchpilot.agents.review_policy import (
     PolicyAction,
     applied_diff_is_allowed,
     decide_review,
+    failure_identities,
+    has_new_failure,
 )
 from patchpilot.agents.reviewer import ReviewerAgent
 from patchpilot.api import create_app
@@ -34,6 +37,7 @@ from patchpilot.llm.plan import ChangePlan, ModificationKind, ProposedModificati
 from patchpilot.llm.review import FindingSeverity, ReviewAction, ReviewFinding, ReviewResult
 from patchpilot.llm.triage import Classification, Severity, TriageResult
 from patchpilot.patching.errors import PatchError
+from patchpilot.runner.client import baseline_job_id
 from patchpilot.runner.client import test_job_id as _job_id
 from patchpilot.runner.protocol import TestReport as _TestReport
 from patchpilot.runner.protocol import TestStatus as _TestStatus
@@ -46,6 +50,7 @@ from patchpilot.workflow.graph import (
     STAGE_REVIEW,
     STAGE_TRIAGE,
     _failed_update,
+    _tests_passed,
     finalize_node,
     outcome_from_state,
 )
@@ -194,6 +199,130 @@ def test_reviewer_drops_an_invented_path_and_does_not_edit():
     assert "Do not edit files" in provider.calls[0].prompt
     assert "diff --git a/src/demo_service/discounts.py" in provider.calls[0].prompt
     assert "Tests status: passed" in provider.calls[0].prompt
+    assert "Baseline failures: none" in provider.calls[0].prompt
+
+
+_KNOWN_FAILURE = (
+    "./tests/test_unknown_tier.py:16: assert 500 == 422\n"
+    "FAILED tests/test_unknown_tier.py::test_unknown_tier_is_a_validation_error\n"
+)
+_KNOWN_IDENTITY = "FAILED tests/test_unknown_tier.py::test_unknown_tier_is_a_validation_error"
+
+
+def test_failure_identities_distinguish_a_new_failure_from_the_baseline():
+    assert failure_identities(_KNOWN_FAILURE) == (_KNOWN_IDENTITY,)
+    same = {
+        "baseline_stdout": _KNOWN_FAILURE,
+        "patched_stdout": _KNOWN_FAILURE,
+        "patched_passed": False,
+        "patched_timed_out": False,
+        "patched_truncated": False,
+    }
+    assert has_new_failure(**same) is False
+    collected = "___________________ ERROR collecting tests/test_baseline.py ____________________\n"
+    assert has_new_failure(**{**same, "patched_stdout": collected}) is True
+    second = (
+        _KNOWN_FAILURE + "FAILED tests/test_baseline.py::test_known_tiers_return_their_discount\n"
+    )
+    assert has_new_failure(**{**same, "patched_stdout": second}) is True
+    truncated = has_new_failure(
+        **{**same, "patched_stdout": "1 failed\n", "patched_truncated": True}
+    )
+    assert truncated is True
+    assert has_new_failure(**{**same, "patched_timed_out": True}) is True
+    assert has_new_failure(**{**same, "patched_passed": True}) is False
+    task_id = uuid4()
+    patched_ids = {_job_id(task_id, 0), _job_id(task_id, 1), _job_id(task_id, 2)}
+    assert baseline_job_id(task_id) not in patched_ids
+
+
+def test_policy_accepts_a_baseline_failure_and_still_repairs_other_requests():
+    diff = (
+        "diff --git a/src/demo_service/app.py b/src/demo_service/app.py\n"
+        "--- a/src/demo_service/app.py\n"
+        "+++ b/src/demo_service/app.py\n"
+        "@@ -1 +1 @@\n"
+        '-app = FastAPI(title="Demo service")\n'
+        '+app = FastAPI(title="Test service")\n'
+    )
+    accepted = decide_review(
+        review=ReviewResult(
+            summary="The unknown tier still returns 500.",
+            action=ReviewAction.REPAIR,
+            findings=[
+                ReviewFinding(
+                    summary="The unknown tier test still fails.",
+                    severity=FindingSeverity.HIGH,
+                    evidence="tests/test_unknown_tier.py:16",
+                )
+            ],
+        ),
+        tests_passed=False,
+        patch_allowed=True,
+        repair_count=0,
+        no_new_failures=True,
+        baseline_output=_KNOWN_FAILURE,
+        diff=diff,
+    )
+    assert accepted.action is PolicyAction.ACCEPT
+    assert accepted.reason == BASELINE_ACCEPT_REASON
+
+    cited = decide_review(
+        review=ReviewResult(
+            summary="The title line is still wrong.",
+            action=ReviewAction.REPAIR,
+            findings=[
+                ReviewFinding(
+                    summary="The title line is still wrong.",
+                    severity=FindingSeverity.HIGH,
+                    evidence="src/demo_service/app.py:7",
+                )
+            ],
+        ),
+        tests_passed=False,
+        patch_allowed=True,
+        repair_count=0,
+        no_new_failures=True,
+        baseline_output=_KNOWN_FAILURE + "src/demo_service/app.py:7\n",
+        diff=diff + "+src/demo_service/app.py:7\n",
+    )
+    assert cited.action is PolicyAction.REPAIR
+
+    green = decide_review(
+        review=ReviewResult(
+            summary="The patch still needs another revision.",
+            action=ReviewAction.REPAIR,
+            findings=[
+                ReviewFinding(
+                    summary="The reviewer requested another revision.",
+                    severity=FindingSeverity.MEDIUM,
+                    evidence="src/demo_service/discounts.py",
+                )
+            ],
+        ),
+        tests_passed=True,
+        patch_allowed=True,
+        repair_count=0,
+        no_new_failures=True,
+        baseline_output=_KNOWN_FAILURE,
+        diff=diff,
+    )
+    assert green.action is PolicyAction.REPAIR
+
+    empty = decide_review(
+        review=ReviewResult(
+            summary="The suite still returns HTTP 500.",
+            action=ReviewAction.REPAIR,
+            findings=[],
+        ),
+        tests_passed=False,
+        patch_allowed=True,
+        repair_count=0,
+        no_new_failures=True,
+        baseline_output=_KNOWN_FAILURE,
+        diff=diff,
+    )
+    assert empty.action is PolicyAction.REPAIR
 
 
 def test_repair_prompt_names_the_previous_attempt_and_the_failure(tmp_path: Path):
@@ -284,6 +413,52 @@ def test_empty_repair_keeps_the_patch_and_the_review():
     assert outcome.tests.status is _TestStatus.FAILED
     assert len(outcome.repairs) == 2
     assert outcome.result_json["triage"]["summary"] == triage["summary"]
+
+
+def test_a_preexisting_failure_accepts_the_rename():
+    task_id = uuid4()
+    diff = _diff("Test service")
+    state = _reviewed_state(
+        task_id,
+        [
+            _cycle(
+                task_id,
+                0,
+                passed=False,
+                action=ReviewAction.REPAIR,
+                diff=diff,
+                evidence="tests/test_unknown_tier.py:16",
+                stdout=_KNOWN_FAILURE,
+            )
+        ],
+        diff=diff,
+        status="completed",
+    )
+    state["baseline_tests"] = _TestReport(
+        job_id=baseline_job_id(task_id),
+        status=_TestStatus.FAILED,
+        exit_code=1,
+        timed_out=False,
+        duration_ms=20,
+        stdout=_KNOWN_FAILURE,
+    ).model_dump(mode="json")
+
+    outcome = outcome_from_state(state)
+
+    assert outcome.status is TaskStatus.COMPLETED
+    assert outcome.stage == STAGE_FINALIZE
+    assert outcome.policy == PolicyAction.ACCEPT.value
+    assert outcome.repairs == ()
+    assert outcome.tests is not None
+    assert outcome.tests.status is _TestStatus.FAILED
+    assert outcome.review is not None
+    assert outcome.review.action is ReviewAction.REPAIR
+    assert _tests_passed(state) is True
+    assert outcome.result_json["baseline_failures"] == [_KNOWN_IDENTITY]
+    assert outcome.result_summary == (
+        "Rename the service title. Unchanged failure: "
+        "FAILED tests/test_unknown_tier.py::test_unknown_tier_is_a_validation_error."
+    )
 
 
 def test_accepted_review_and_an_exhausted_limit_still_finish():
@@ -411,6 +586,8 @@ def _cycle(
     passed: bool,
     action: ReviewAction,
     diff: str,
+    evidence: str = "assert 500 == 422",
+    stdout: str | None = None,
 ) -> dict[str, object]:
     from uuid import UUID
 
@@ -426,7 +603,7 @@ def _cycle(
             ReviewFinding(
                 summary="The suite still returns HTTP 500.",
                 severity=FindingSeverity.HIGH,
-                evidence="assert 500 == 422",
+                evidence=evidence,
             )
         ],
     )
@@ -436,7 +613,7 @@ def _cycle(
         exit_code=0 if passed else 1,
         timed_out=False,
         duration_ms=20,
-        stdout="passed\n" if passed else "assert 500 == 422\n",
+        stdout="passed\n" if passed else (stdout or "assert 500 == 422\n"),
     )
     return {
         "summary": proposal.summary,

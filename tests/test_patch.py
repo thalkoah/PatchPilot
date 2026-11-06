@@ -4,14 +4,20 @@ import hashlib
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID, uuid4
 
 import pytest
 
+from patchpilot.agents.developer import DeveloperAgent
+from patchpilot.llm.investigation import InvestigationReport
 from patchpilot.llm.patch import FileEdit, PatchProposal
 from patchpilot.llm.plan import ChangePlan, ModificationKind, ProposedModification
 from patchpilot.patching.apply import apply_patch
 from patchpilot.patching.errors import PatchError
+from patchpilot.workflow.graph import SYNTAX_PATCH, WorkflowContext, develop_node
 from patchpilot.workspace.git import prepare_isolated_workspace
+from patchpilot.workspace.layout import branch_name, clone_relative, worktree_relative
 
 SUMMARY = "Replace the constant and add a regression test."
 
@@ -140,6 +146,109 @@ def test_a_malformed_diff_is_refused(tmp_path: Path):
     assert (worktree / "src/app.py").read_bytes() == original
 
 
+def test_unparsed_python_is_refused_and_the_worktree_is_restored(tmp_path: Path):
+    original = (
+        '"""HTTP wrapper around the discount rules. It does not catch an unknown tier."""\n'
+        "\n"
+        "VALUE = 1\n"
+    )
+    _source, worktree = _worktree(tmp_path, app_text=original)
+    bare = (
+        "HTTP wrapper around the discount rules. It does not catch an unknown tier.\n\nVALUE = 1\n"
+    )
+    structured = _edit_proposal(worktree, "src/app.py", bare)
+    unified = PatchProposal(
+        summary=SUMMARY,
+        unified_diff=(
+            "diff --git a/src/app.py b/src/app.py\n"
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            '-"""HTTP wrapper around the discount rules. '
+            'It does not catch an unknown tier."""\n'
+            "+HTTP wrapper around the discount rules. "
+            "It does not catch an unknown tier.\n"
+            " \n"
+            " VALUE = 1\n"
+        ),
+    )
+
+    for proposal in (structured, unified):
+        with pytest.raises(PatchError) as caught:
+            apply_patch(worktree=worktree, proposal=proposal, plan=_plan())
+        assert caught.value.code == "syntax"
+        assert (worktree / "src/app.py").read_text(encoding="utf-8") == original
+
+
+def test_developer_retries_once_when_the_edit_does_not_parse(tmp_path: Path):
+    _source, worktree = _worktree(tmp_path)
+    original = (worktree / "src/app.py").read_text(encoding="utf-8")
+    bad = _edit_proposal(worktree, "src/app.py", "HTTP wrapper around the discount rules.\n")
+    good = _edit_proposal(worktree, "src/app.py", "VALUE = 2\n")
+    provider = _Proposals(bad, good)
+
+    outcome = DeveloperAgent(provider, worktree).run(
+        title="rename the service",
+        description="Change the constant.",
+        plan=_plan(),
+        report=_report(),
+    )
+
+    assert (worktree / "src/app.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert outcome.proposal is good
+    assert "The previous edit was not valid Python." not in provider.prompts[0]
+    assert "The previous edit was not valid Python." in provider.prompts[1]
+    assert original.strip() in provider.prompts[1]
+
+
+def test_a_second_unparsed_edit_fails_develop(tmp_path: Path):
+    _source, worktree = _worktree(tmp_path)
+    task_id = UUID(worktree.parent.name)
+    bad = _edit_proposal(worktree, "src/app.py", "HTTP wrapper around the discount rules.\n")
+    provider = _Proposals(bad, bad)
+    state = {
+        "task_id": str(task_id),
+        "title": "rename the service",
+        "description": "Change the constant.",
+        "plan": {"plan": _plan().model_dump(mode="json"), "rejected_paths": 0},
+        "investigation": {
+            "report": _report().model_dump(mode="json"),
+            "tool_calls": 1,
+            "rejected_citations": 0,
+        },
+        "approval": {
+            "kind": "plan",
+            "decision": "approve",
+            "approval_id": str(uuid4()),
+        },
+        "workspace": {
+            "base_sha": "a" * 40,
+            "branch": branch_name(task_id),
+            "clone_path": clone_relative(task_id),
+            "worktree_path": worktree_relative(task_id),
+        },
+        "repair_count": 0,
+    }
+
+    update = develop_node(
+        state,  # type: ignore[arg-type]
+        SimpleNamespace(
+            context=WorkflowContext(
+                provider=provider,
+                workspace_root=worktree.parent.parent,
+            )
+        ),
+    )
+
+    assert update["status"] == "failed"
+    assert update["failed_stage"] == "develop"
+    assert update["error"] == SYNTAX_PATCH
+    assert update["result_summary"] == SYNTAX_PATCH
+    assert (worktree / "src/app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert len(provider.prompts) == 2
+    assert "The previous edit was not valid Python." in provider.prompts[1]
+
+
 def test_a_base_mismatch_is_refused(tmp_path: Path):
     _source, worktree = _worktree(tmp_path)
     original = (worktree / "src/app.py").read_bytes()
@@ -221,6 +330,34 @@ def _plan() -> ChangePlan:
     )
 
 
+class _Proposals:
+    def __init__(self, *proposals: PatchProposal) -> None:
+        self._proposals = list(proposals)
+        self.prompts: list[str] = []
+
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: type[object],
+        options: object = None,
+    ) -> PatchProposal:
+        self.prompts.append(prompt)
+        return self._proposals.pop(0)
+
+    def close(self) -> None:
+        return None
+
+
+def _report() -> InvestigationReport:
+    return InvestigationReport(
+        summary="The constant is in app.py.",
+        hypotheses=[],
+        evidence=[],
+        probable_files=["src/app.py"],
+        unanswered_questions=[],
+    )
+
+
 def _edit_proposal(worktree: Path, relative: str, content: str) -> PatchProposal:
     payload = (worktree / relative).read_bytes()
     return PatchProposal(
@@ -235,11 +372,11 @@ def _edit_proposal(worktree: Path, relative: str, content: str) -> PatchProposal
     )
 
 
-def _worktree(tmp_path: Path) -> tuple[Path, Path]:
+def _worktree(tmp_path: Path, *, app_text: str = "VALUE = 1\n") -> tuple[Path, Path]:
     source = tmp_path / "source"
     source.mkdir()
     (source / "src").mkdir()
-    (source / "src/app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (source / "src/app.py").write_text(app_text, encoding="utf-8")
     (source / "src/other.py").write_text("VALUE = 0\n", encoding="utf-8")
     (source / "tests").mkdir()
     (source / "tests/test_app.py").write_text(

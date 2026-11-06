@@ -8,8 +8,10 @@ Incomplete evidence can investigate once more. A plan whose paths are all
 forbidden can be replanned once. A plan that names a code change goes to
 `request_plan_approval`, which calls `interrupt()` and does no I/O before that
 call, because resume runs the node from the top. Approval continues to
-`prepare_workspace`, then `develop`, then `test`, then `review`. Policy may
-repair at most twice. Rejection, a decline, and an escalation end at `finalize`.
+`prepare_workspace`, then one baseline test of the unmodified worktree, then
+`develop`, then `test`, then `review`. Policy may repair at most twice. A
+patched suite that only repeats baseline failures can be accepted. Rejection,
+a decline, and an escalation end at `finalize`.
 When a GitHub target is configured, an accepted review pauses again for a
 second approval. Nothing is pushed before that approval. Declining publication
 finishes the local task without a pull request.
@@ -61,6 +63,8 @@ from patchpilot.agents.review_policy import (
     PolicyAction,
     applied_diff_is_allowed,
     decide_review,
+    failure_identities,
+    has_new_failure,
 )
 from patchpilot.agents.reviewer import ReviewedCycle, ReviewerAgent
 from patchpilot.agents.supervisor import (
@@ -86,7 +90,7 @@ from patchpilot.llm.supervisor import SupervisorRoute
 from patchpilot.llm.triage import TriageResult
 from patchpilot.patching.apply import MAX_DIFF_BYTES, AppliedPatch
 from patchpilot.patching.errors import PatchError
-from patchpilot.runner.client import collect_test_report, test_job_id
+from patchpilot.runner.client import baseline_job_id, collect_test_report, test_job_id
 from patchpilot.runner.errors import RunnerRejected, RunnerUnavailable
 from patchpilot.runner.limits import DEFAULT_RUNNER_WAIT_SECONDS
 from patchpilot.runner.protocol import TestReport, TestStatus
@@ -109,6 +113,7 @@ STAGE_APPROVAL = "request_plan_approval"
 STAGE_WORKSPACE = "prepare_workspace"
 STAGE_DEVELOP = "develop"
 STAGE_TEST = "test"
+STAGE_BASELINE = "baseline"
 STAGE_REVIEW = "review"
 STAGE_PUBLISH_APPROVAL = "request_publish_approval"
 STAGE_PUBLISH = "publish"
@@ -120,6 +125,7 @@ PLAN_FAILURE = "Planning failed before a valid change plan was produced."
 APPROVAL_FAILURE = "Approval resume did not continue the workflow."
 WORKSPACE_FAILURE = "The isolated workspace could not be created."
 PATCH_FAILURE = "The patch was rejected before it was applied."
+SYNTAX_PATCH = "The patch is not valid Python."
 EMPTY_PATCH = "The repair did not change any approved file."
 TEST_FAILURE = "The test result could not be read."
 REVIEW_FAILURE = "The review could not be completed."
@@ -164,6 +170,7 @@ class TriageState(TypedDict):
     approval: dict[str, Any] | None
     workspace: dict[str, Any] | None
     patch: dict[str, Any] | None
+    baseline_tests: dict[str, Any] | None
     tests: dict[str, Any] | None
     review: dict[str, Any] | None
     publication: dict[str, Any] | None
@@ -276,6 +283,7 @@ def initial_triage_state(
         "approval": None,
         "workspace": None,
         "patch": None,
+        "baseline_tests": None,
         "tests": None,
         "review": None,
         "publication": None,
@@ -832,7 +840,12 @@ def develop_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[
         raise LeaseLost() from None
     except PatchError as exc:
         logger.error("patch rejected: %s", exc.code)
-        message = EMPTY_PATCH if exc.code == "empty" else PATCH_FAILURE
+        if exc.code == "empty":
+            message = EMPTY_PATCH
+        elif exc.code == "syntax":
+            message = SYNTAX_PATCH
+        else:
+            message = PATCH_FAILURE
         return _failed_update(message, stage=STAGE_DEVELOP)
     except LLMError as exc:
         return _failed_update(failure_text(exc), stage=STAGE_DEVELOP)
@@ -862,7 +875,6 @@ def test_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
         task_id = UUID(str(state.get("task_id")))
         workspace = workspace_from_state(state.get("workspace"), task_id=task_id)
         repair_count = _repair_count(state)
-        job_id = test_job_id(task_id, repair_count)
     except (TypeError, ValueError, RunnerRejected):
         logger.error("tests rejected the workspace")
         return _failed_update(RUNNER_REJECTED, stage=STAGE_TEST)
@@ -870,8 +882,16 @@ def test_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
         patch_ready = _checked_patch(state.get("patch")) is not None
     except ValueError:
         return _failed_update(TEST_FAILURE, stage=STAGE_TEST)
-    if workspace is None or not patch_ready:
+    if workspace is None:
         return _failed_update(TEST_FAILURE, stage=STAGE_TEST)
+    try:
+        if patch_ready:
+            job_id = test_job_id(task_id, repair_count)
+        else:
+            job_id = baseline_job_id(task_id)
+    except (TypeError, ValueError, RunnerRejected):
+        logger.error("tests rejected the workspace")
+        return _failed_update(RUNNER_REJECTED, stage=STAGE_TEST)
     try:
         worktree = require_workspace_root(context.workspace_root) / worktree_relative(task_id)
     except Exception:
@@ -903,8 +923,17 @@ def test_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[str
         return _failed_update(RUNNER_REJECTED, stage=STAGE_TEST)
     if _lease_is_lost(runtime):
         raise LeaseLost()
+    stored = report.model_dump(mode="json")
+    if not patch_ready:
+        return {
+            "baseline_tests": stored,
+            "error": None,
+            "failed_stage": None,
+            "status": "completed",
+            "phase": STAGE_BASELINE,
+        }
     return {
-        "tests": report.model_dump(mode="json"),
+        "tests": stored,
         "error": None,
         "failed_stage": None,
         "status": "completed",
@@ -940,6 +969,11 @@ def review_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[s
             stage=STAGE_REVIEW,
         )
     try:
+        baseline_line, no_new_failures, baseline_output = _baseline_context(state, tests)
+    except ValueError:
+        logger.error("review rejected the baseline report")
+        return _failed_update(REVIEW_FAILURE, stage=STAGE_REVIEW)
+    try:
         verdict = ReviewerAgent(
             _provider(context, STAGE_REVIEW),
             lease_lost=context.lease_lost,
@@ -951,6 +985,7 @@ def review_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[s
             diff=patch["diff"],
             tests=tests,
             repair_count=repair_count,
+            baseline_failures=baseline_line,
         )
     except StopForLease:
         raise LeaseLost() from None
@@ -968,6 +1003,9 @@ def review_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[s
             patch_allowed=True,
             repair_count=repair_count,
             max_repairs=budget,
+            no_new_failures=no_new_failures,
+            baseline_output=baseline_output,
+            diff=patch["diff"],
         )
     except ValueError:
         logger.error("review policy rejected the verdict")
@@ -1292,7 +1330,10 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
     if plan is not None:
         summary = str(plan["plan"]["problem_statement"])
     if patch is not None:
-        summary = patch["summary"]
+        summary = _completed_summary(
+            str(patch["summary"]),
+            _unchanged_failure_identities(state),
+        )
     return {
         "status": "completed",
         "error": None,
@@ -1513,16 +1554,19 @@ def _reviewed_outcome(state: GraphState) -> TriageOutcome:
     stored_tests = _store_tests(body, last.tests)
     _store_review(body, last, repair_count=len(repairs))
     body["repairs"] = [{"index": item["index"], "reason": item["reason"]} for item in repairs]
+    identities = _unchanged_failure_identities(state, last.tests)
     accepted_finish = (
         decision.action is PolicyAction.ACCEPT
         and state.get("status") == "completed"
         and not state.get("error")
     )
     if accepted_finish:
+        if identities:
+            body["baseline_failures"] = list(identities)
         return TriageOutcome(
             status=TaskStatus.COMPLETED,
             stage=STAGE_FINALIZE,
-            result_summary=last.applied.summary,
+            result_summary=_completed_summary(last.applied.summary, identities),
             result_json=body,
             plan=accepted,
             workspace=workspace,
@@ -1579,11 +1623,16 @@ def _judge_cycles(
     final = None
     for index, item in enumerate(raw_cycles):
         proposal, applied, tests, review = _cycle_parts(item, plan, task_id, index)
+        diff_text = applied.diff.decode("utf-8")
+        _line, no_new_failures, baseline_output = _baseline_context(state, tests)
         decision = decide_review(
             review=review,
             tests_passed=tests.status is TestStatus.PASSED,
-            patch_allowed=applied_diff_is_allowed(applied.diff.decode("utf-8"), plan),
+            patch_allowed=applied_diff_is_allowed(diff_text, plan),
             repair_count=index,
+            no_new_failures=no_new_failures,
+            baseline_output=baseline_output,
+            diff=diff_text,
         )
         cycle = ReviewedCycle(
             proposal=proposal,
@@ -1848,6 +1897,40 @@ def _checked_tests(value: object) -> TestReport | None:
         raise ValueError("test report is not valid") from None
 
 
+def _unchanged_failure_identities(
+    state: GraphState,
+    tests: TestReport | None = None,
+) -> tuple[str, ...]:
+    """Pytest identities in the patched report that the baseline already had."""
+    report = tests
+    if report is None:
+        try:
+            report = _checked_tests(state.get("tests"))
+        except ValueError:
+            return ()
+    if report is None or report.status is TestStatus.PASSED or report.timed_out:
+        return ()
+    try:
+        baseline = _checked_tests(state.get("baseline_tests"))
+    except ValueError:
+        return ()
+    if baseline is None:
+        return ()
+    current = failure_identities(report.stdout)
+    known = set(failure_identities(baseline.stdout))
+    if not current or any(item not in known for item in current):
+        return ()
+    return current
+
+
+def _completed_summary(summary: str, identities: tuple[str, ...]) -> str:
+    """Name a red suite that matches the unmodified worktree."""
+    if not identities:
+        return summary
+    note = "Unchanged failure: " + ", ".join(identities) + "."
+    return _message(f"{summary} {note}")
+
+
 def _store_tests(body: dict[str, Any], report: TestReport | None) -> TestReport | None:
     """Record the outcome on the task. Captured output stays in the artifact."""
     if report is None:
@@ -1979,8 +2062,41 @@ def _plan_reasoning(state: TriageState) -> str:
 
 
 def _tests_passed(state: TriageState) -> bool:
+    """True when the patched suite passed, or it added no baseline failure."""
     tests = state.get("tests")
-    return isinstance(tests, dict) and tests.get("status") == "passed"
+    if not isinstance(tests, dict):
+        return False
+    if tests.get("status") == "passed":
+        return True
+    try:
+        report = _checked_tests(tests)
+    except ValueError:
+        return False
+    if report is None:
+        return False
+    try:
+        _line, no_new_failures, _output = _baseline_context(state, report)
+    except ValueError:
+        return False
+    return no_new_failures
+
+
+def _baseline_context(state: GraphState, tests: TestReport) -> tuple[str, bool, str]:
+    """The prompt line, whether the patch added no failure, and the baseline text."""
+    baseline = _checked_tests(state.get("baseline_tests"))
+    if baseline is None:
+        return "none", False, ""
+    identities = failure_identities(baseline.stdout)
+    line = ", ".join(identities) if identities else "none"
+    output = f"{baseline.stdout}\n{baseline.stderr}"
+    introduced = has_new_failure(
+        baseline_stdout=baseline.stdout,
+        patched_stdout=tests.stdout,
+        patched_passed=tests.status is TestStatus.PASSED,
+        patched_timed_out=tests.timed_out,
+        patched_truncated=tests.output_truncated,
+    )
+    return line, not introduced, output
 
 
 def _tests_summary(state: TriageState) -> str:
@@ -2178,7 +2294,7 @@ def _interrupted_repair(state: GraphState) -> bool:
 def _failed_update(message: str, *, stage: str = STAGE_TRIAGE) -> dict[str, Any]:
     text = _message(message)
     failed = stage if stage in _FAILURE_STAGES else STAGE_TRIAGE
-    update = {
+    update: dict[str, Any] = {
         "status": "failed",
         "error": text,
         "result_summary": text,

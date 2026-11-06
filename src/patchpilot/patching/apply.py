@@ -1,10 +1,12 @@
 """Apply one validated patch inside a private worktree.
 
 The tool checks the approved plan, canonical paths, and the current file bytes.
-It runs `git apply --check` before `git apply`. It does not start a shell, and
-it does not run the project tests. A refusal leaves the worktree as it was.
+It runs `git apply --check` before `git apply`. A changed Python file that does
+not parse is rolled back. It does not start a shell, and it does not run the
+project tests. A refusal leaves the worktree as it was.
 """
 
+import ast
 import difflib
 import hashlib
 import logging
@@ -63,6 +65,7 @@ def apply_patch(*, worktree: Path, proposal: PatchProposal, plan: ChangePlan) ->
     if len(diff.encode("utf-8")) > MAX_DIFF_BYTES:
         raise PatchError("oversized")
     paths = [item.path for item in files]
+    _reject_structured_python(files)
     baseline = _snapshot(root)
     applied = False
     try:
@@ -70,6 +73,7 @@ def apply_patch(*, worktree: Path, proposal: PatchProposal, plan: ChangePlan) ->
         apply_diff(root, diff)
         applied = True
         _confirm(root, files, baseline)
+        _reject_applied_python(root, files)
         recorded = _record(root, paths)
     except PatchError:
         if applied:
@@ -252,6 +256,36 @@ def _render_file(path: str, before: bytes | None, after: bytes) -> str:
     if old is None:
         header += "new file mode 100644\n"
     return header + body
+
+
+def _reject_structured_python(files: list[_File]) -> None:
+    """Refuse a full-file edit whose replacement is not valid Python."""
+    for item in files:
+        if item.after is None or not item.path.endswith(".py"):
+            continue
+        _require_python(item.after)
+
+
+def _reject_applied_python(root: Path, files: list[_File]) -> None:
+    """Refuse a unified diff that left a changed Python file unable to parse."""
+    for item in files:
+        if item.after is not None or not item.path.endswith(".py"):
+            continue
+        payload = _read_current(root, item.path)
+        if payload is None:
+            raise PatchError("apply_failed")
+        _require_python(payload)
+
+
+def _require_python(payload: bytes) -> None:
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise PatchError("binary") from None
+    try:
+        ast.parse(text)
+    except SyntaxError:
+        raise PatchError("syntax") from None
 
 
 def _confirm(root: Path, files: list[_File], baseline: dict[str, str]) -> None:

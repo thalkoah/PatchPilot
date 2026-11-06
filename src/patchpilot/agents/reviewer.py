@@ -61,6 +61,7 @@ class ReviewerAgent:
         diff: str,
         tests: TestReport,
         repair_count: int,
+        baseline_failures: str = "",
     ) -> ReviewResult:
         self._check_lease()
         draft = self._provider.generate_structured(
@@ -72,6 +73,7 @@ class ReviewerAgent:
                 diff=diff,
                 tests=tests,
                 repair_count=repair_count,
+                baseline_failures=baseline_failures,
             ),
             ReviewResult,
         )
@@ -122,6 +124,7 @@ def _prompt(
     diff: str,
     tests: TestReport,
     repair_count: int,
+    baseline_failures: str,
 ) -> str:
     text = description.strip()
     if len(text) > _DESCRIPTION_CHARS:
@@ -140,6 +143,7 @@ def _prompt(
         f"Evidence:\n{citations}\n\n"
         f"Tests status: {tests.status.value}\n"
         f"Tests exit code: {tests.exit_code}\n"
+        f"Baseline failures: {baseline_failures.strip() or 'none'}\n"
         f"Repair count: {repair_count}\n\n"
         f"Diff:\n{shown}\n\n"
         f"Test output:\n{tests.stdout[:_OUTPUT_CHARS]}\n"

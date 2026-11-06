@@ -173,6 +173,7 @@
     <h2>Tests</h2>
     {% if page.tests %}
     <p>{{ page.tests.status_label }} · exit {{ page.tests.exit_code }} · {{ page.tests.duration_ms }} ms</p>
+    {% if page.tests.unchanged_failure %}<p>{{ page.tests.unchanged_failure }}</p>{% endif %}
     {% if page.tests.output_truncated %}<p>Output was truncated.</p>{% endif %}
     <h3>stdout</h3>
     <pre>{{ page.tests.stdout }}</pre>

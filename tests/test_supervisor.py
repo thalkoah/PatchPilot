@@ -15,6 +15,8 @@ from patchpilot.agents.review_policy import PolicyAction
 from patchpilot.agents.supervisor import (
     ABSENT_REPO,
     ACCEPT_REASON,
+    BASELINE_READY_REASON,
+    BASELINE_REASON,
     DEADLINE_REASON,
     DECLINE_REASON,
     INVESTIGATE_MORE_REASON,
@@ -131,6 +133,29 @@ def test_routes_cover_the_outcomes_the_graph_must_distinguish():
     assert "person" in escalate.reason
     assert finalize.route is SupervisorRoute.FINALIZE
     assert finalize.reason == ACCEPT_REASON
+
+
+def test_workspace_runs_the_baseline_before_develop():
+    waiting = decide_route(
+        {
+            "phase": "prepare_workspace",
+            "status": "completed",
+            "workspace": {"ready": True},
+        }
+    )
+    ready = decide_route(
+        {
+            "phase": "baseline",
+            "status": "completed",
+            "workspace": {"ready": True},
+            "baseline_tests": {"status": "failed"},
+        }
+    )
+
+    assert waiting.route is SupervisorRoute.TEST
+    assert waiting.reason == BASELINE_REASON
+    assert ready.route is SupervisorRoute.DEVELOP
+    assert ready.reason == BASELINE_READY_REASON
 
 
 def test_a_declined_plan_finalizes_and_a_second_invalid_plan_does_too():

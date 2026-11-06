@@ -366,6 +366,75 @@ def test_finished_task_shows_evidence_diff_tests_review_and_usage(
     assert f"/api/v1/tasks/{task_id}/usage" in page.text
 
 
+def test_a_completed_rename_names_the_unchanged_failure(
+    postgres_database_url: str,
+    clean_tasks: None,
+    monkeypatch,
+    tmp_path: Path,
+):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    identity = "FAILED tests/test_unknown_tier.py::test_unknown_tier_is_a_validation_error"
+    stdout = (
+        "./tests/test_unknown_tier.py:16: assert 500 == 422\n"
+        "FAILED tests/test_unknown_tier.py::test_unknown_tier_is_a_validation_error\n"
+    )
+    with client(postgres_database_url, monkeypatch) as test_client:
+        created = post_task(
+            test_client,
+            title="rename the service",
+            description="Change the title.",
+        )
+        task_id = UUID(str(created["id"]))
+        report = StoredTestReport(
+            job_id=uuid4(),
+            status=StoredTestStatus.FAILED,
+            exit_code=1,
+            timed_out=False,
+            duration_ms=2216,
+            stdout=stdout,
+            stderr="",
+        )
+
+        async def _run() -> None:
+            engine, factory = open_session_factory(postgres_database_url)
+            try:
+                async with factory() as session:
+                    await persist_test_report(session, root, task_id, report)
+                    await session.commit()
+            finally:
+                await engine.dispose()
+
+        asyncio.run(_run())
+        with psycopg.connect(postgres_database_url, autocommit=True) as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'completed'::task_status,
+                    stage = 'finalize',
+                    result_summary = %s,
+                    result_json = %s::jsonb
+                WHERE id = %s
+                """,
+                (
+                    f"Rename the service title. Unchanged failure: {identity}.",
+                    json.dumps({"baseline_failures": [identity]}),
+                    task_id,
+                ),
+            )
+        monkeypatch.setenv("ARTIFACTS_ROOT", str(root))
+        get_settings.cache_clear()
+        page = test_client.get(f"/tasks/{task_id}")
+
+    assert page.status_code == 200
+    assert "assert 500 == 422" in page.text
+    assert (
+        "This failure was already on the unmodified worktree: "
+        "FAILED tests/test_unknown_tier.py::test_unknown_tier_is_a_validation_error."
+    ) in page.text
+    assert f"Unchanged failure: {identity}." in page.text
+
+
 def _insert_event(
     database_url: str,
     task_id: object,
