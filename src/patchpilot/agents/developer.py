@@ -21,11 +21,13 @@ from patchpilot.llm.review import ReviewResult
 from patchpilot.patching.apply import AppliedPatch, apply_patch
 from patchpilot.patching.errors import PatchError
 from patchpilot.patching.policy import path_is_writable
+from patchpilot.runner.protocol import TestReport
 from patchpilot.source.errors import SourceError
 from patchpilot.source.paths import relative_parts
 
 _DESCRIPTION_CHARS = 4_000
 _FILE_CHARS = 8_000
+_OUTPUT_CHARS = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +69,7 @@ class DeveloperAgent:
         report: InvestigationReport,
         review: ReviewResult | None = None,
         repair_count: int = 0,
+        tests: TestReport | None = None,
     ) -> DevelopOutcome:
         self._check_lease()
         proposal = self._provider.generate_structured(
@@ -78,6 +81,7 @@ class DeveloperAgent:
                 worktree=self._worktree,
                 review=review,
                 repair_count=repair_count,
+                tests=tests,
             ),
             PatchProposal,
         )
@@ -99,13 +103,23 @@ def _prompt(
     worktree: Path,
     review: ReviewResult | None,
     repair_count: int,
+    tests: TestReport | None,
 ) -> str:
     text = description.strip()
     if len(text) > _DESCRIPTION_CHARS:
         text = text[:_DESCRIPTION_CHARS]
     paths = "\n".join(f"- {item.relative_path} ({item.kind.value})" for item in plan.modifications)
+    if repair_count > 0:
+        instruction = (
+            "Revise the previous patch. The files below are the previous attempt.\n"
+            "An unchanged file is rejected.\n"
+            "The next edit must stay on the approved paths.\n"
+        )
+    else:
+        instruction = "Write a patch for the approved plan.\n"
     prompt = (
-        "Write a patch for the approved plan. Do not run tests or a shell.\n"
+        f"{instruction}"
+        "Do not run tests or a shell.\n"
         "Return file edits, or one unified diff, and no other paths.\n"
         "For an existing file, set expected_sha256 to the SHA256 shown below.\n"
         "For a new file, set expected_sha256 to an empty string.\n\n"
@@ -115,7 +129,8 @@ def _prompt(
         f"Approved paths:\n{paths or 'none'}\n"
         f"Evidence:\n{_evidence(report)}\n\n"
         f"Repair count: {repair_count}\n"
-        f"{_review_block(review)}\n\n"
+        f"{_review_block(review)}\n"
+        f"{_repair_details(review, tests) if repair_count > 0 else ''}\n"
         f"{_file_blocks(worktree, plan)}"
     )
     return prompt[:MAX_PROMPT_CHARS]
@@ -125,6 +140,20 @@ def _review_block(review: ReviewResult | None) -> str:
     if review is None:
         return "Reviewer action: none"
     return f"Reviewer action: {review.action.value}\nReviewer summary: {review.summary}"
+
+
+def _repair_details(review: ReviewResult | None, tests: TestReport | None) -> str:
+    """Findings and the failing output. A repair that ignores both can echo the file."""
+    if review is None or not review.findings:
+        findings = "none"
+    else:
+        findings = "\n".join(f"- {item.severity.value}: {item.summary}" for item in review.findings)
+    excerpt = "none"
+    if tests is not None:
+        captured = tests.stdout.strip() or tests.stderr.strip()
+        if captured:
+            excerpt = captured[:_OUTPUT_CHARS]
+    return f"Findings:\n{findings}\nTest output:\n{excerpt}\n"
 
 
 def _evidence(report: InvestigationReport) -> str:

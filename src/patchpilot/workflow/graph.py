@@ -120,6 +120,7 @@ PLAN_FAILURE = "Planning failed before a valid change plan was produced."
 APPROVAL_FAILURE = "Approval resume did not continue the workflow."
 WORKSPACE_FAILURE = "The isolated workspace could not be created."
 PATCH_FAILURE = "The patch was rejected before it was applied."
+EMPTY_PATCH = "The repair did not change any approved file."
 TEST_FAILURE = "The test result could not be read."
 REVIEW_FAILURE = "The review could not be completed."
 PUBLISH_FAILURE = "The draft pull request was not opened."
@@ -808,6 +809,7 @@ def develop_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[
         try:
             repair_count = _repair_count(state)
             prior_review = _stored_review(state.get("review"))
+            prior_tests = _checked_tests(state.get("tests")) if repair_count > 0 else None
         except ValueError:
             logger.error("patch rejected the review state")
             return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
@@ -824,12 +826,14 @@ def develop_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[
             report=report,
             review=prior_review,
             repair_count=repair_count,
+            tests=prior_tests,
         )
     except StopForLease:
         raise LeaseLost() from None
     except PatchError as exc:
         logger.error("patch rejected: %s", exc.code)
-        return _failed_update(PATCH_FAILURE, stage=STAGE_DEVELOP)
+        message = EMPTY_PATCH if exc.code == "empty" else PATCH_FAILURE
+        return _failed_update(message, stage=STAGE_DEVELOP)
     except LLMError as exc:
         return _failed_update(failure_text(exc), stage=STAGE_DEVELOP)
     except Exception as exc:
@@ -1221,6 +1225,15 @@ def finalize_node(state: TriageState) -> dict[str, Any]:
                     "failed_stage": STAGE_PUBLISH,
                     "phase": STAGE_PUBLISH,
                 }
+            if stage in {STAGE_DEVELOP, STAGE_TEST}:
+                return {
+                    "status": "failed",
+                    "error": reason,
+                    "result_summary": reason,
+                    "failed_stage": stage,
+                    "phase": stage,
+                    "policy": PolicyAction.FAIL.value,
+                }
             return {
                 "status": "failed",
                 "error": reason,
@@ -1521,12 +1534,19 @@ def _reviewed_outcome(state: GraphState) -> TriageOutcome:
             repairs=repairs,
             cycles=cycles,
         )
-    reason = decision.reason if decision.action is PolicyAction.FAIL else REVIEW_FAILURE
-    reason = _message(reason)
+    if decision.action is PolicyAction.REPAIR:
+        stage = state.get("failed_stage")
+        if stage not in {STAGE_DEVELOP, STAGE_TEST}:
+            raise ValueError("review stopped while a repair was still allowed")
+        reason = _message(state.get("error") or state.get("result_summary"))
+    else:
+        stage = STAGE_REVIEW
+        reason = decision.reason if decision.action is PolicyAction.FAIL else REVIEW_FAILURE
+        reason = _message(reason)
     body["error"] = reason
     return TriageOutcome(
         status=TaskStatus.FAILED,
-        stage=STAGE_REVIEW,
+        stage=stage,
         result_summary=reason,
         result_json=body,
         plan=accepted,
@@ -1581,8 +1601,12 @@ def _judge_cycles(
             repairs.append({"index": index + 1, "reason": decision.reason})
         else:
             final = decision
-    if final is None or final.action is PolicyAction.REPAIR:
+    if final is None:
         raise ValueError("review stopped while a repair was still allowed")
+    if final.action is PolicyAction.REPAIR:
+        if not _interrupted_repair(state):
+            raise ValueError("review stopped while a repair was still allowed")
+        repairs.append({"index": len(built), "reason": final.reason})
     current = _checked_patch(state.get("patch"))
     if current is None or current["diff"] != built[-1].applied.diff.decode("utf-8"):
         raise ValueError("the stored patch does not match the review")
@@ -2144,17 +2168,26 @@ def _checked_plan(value: object) -> dict[str, Any] | None:
     return {"plan": plan.model_dump(mode="json"), "rejected_paths": rejected}
 
 
+def _interrupted_repair(state: GraphState) -> bool:
+    """True when develop or test failed after the last review still asked for a repair."""
+    if state.get("status") != "failed":
+        return False
+    return state.get("failed_stage") in {STAGE_DEVELOP, STAGE_TEST}
+
+
 def _failed_update(message: str, *, stage: str = STAGE_TRIAGE) -> dict[str, Any]:
     text = _message(message)
     failed = stage if stage in _FAILURE_STAGES else STAGE_TRIAGE
-    return {
+    update = {
         "status": "failed",
         "error": text,
         "result_summary": text,
         "failed_stage": failed,
         "phase": failed,
-        "triage": None,
     }
+    if failed == STAGE_TRIAGE:
+        update["triage"] = None
+    return update
 
 
 def _message(value: object) -> str:
