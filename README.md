@@ -10,6 +10,18 @@ Local-first, human-supervised software maintenance. PostgreSQL stores bug-report
 
 The API is published only on `127.0.0.1:8000`. Database credentials in `.env.example` and the Compose defaults are development examples. Copy `.env.example` to `.env` to override them. `.env` is gitignored.
 
+## First run
+
+On Fedora or macOS, one script installs what is missing and starts the stack. It is safe to run again. An existing `.env` is kept, the demo checkout is initialized only once, a model that is already present is not pulled again, and Compose leaves a running stack in place.
+
+```bash
+./scripts/bootstrap.sh
+```
+
+The script reads `LLM_MODEL` and `LLM_STAGE_MODELS` from `.env` (or the defaults in `src/patchpilot/config.py` when `.env` is new) and pulls each distinct Ollama model those settings name. Changing the model list does not require editing the script. `--skip-models` skips that download. `--no-start` prepares the machine and does not run Compose. `--skip-system` does not install operating-system packages.
+
+The dashboard is <http://127.0.0.1:8000/> when the script finishes.
+
 ## Run the stack
 
 ```bash
@@ -247,6 +259,8 @@ extra_hosts:
 Ollama listens on `127.0.0.1:11434` unless `OLLAMA_HOST` says otherwise. Packets that arrive on the bridge address do not reach a loopback socket. Serving the worker means Ollama has to listen on the bridge address, or on every interface.
 
 Keep port 11434 off the LAN and off the public internet. `OLLAMA_HOST=0.0.0.0:11434` accepts connections on every interface. On Fedora, leave 11434 closed in firewalld, or bind Ollama to the Compose bridge address only. PatchPilot sends no credentials to Ollama. Anyone who can open a TCP connection can use the model. Compose does not publish port 11434.
+
+`scripts/bootstrap.sh` sets that `OLLAMA_HOST` for the Ollama service when it starts the stack on Linux or Podman, and it does not open 11434 in firewalld. Docker Desktop can already reach a loopback Ollama through `host.docker.internal`, so the script leaves that bind alone.
 
 ## Benchmark
 
