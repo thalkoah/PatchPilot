@@ -354,7 +354,7 @@ def test_cloud_and_github_stay_off_without_explicit_settings(monkeypatch: pytest
     ):
         monkeypatch.delenv(name, raising=False)
     settings = LLMSettings(_env_file=None)
-    assert settings.llm_provider == "fake"
+    assert settings.llm_provider == "ollama"
     assert settings.llm_cloud_enabled is False
     with pytest.raises(ValidationError):
         LLMSettings(_env_file=None, llm_provider="openai")

@@ -34,10 +34,11 @@ def test_settings_reject_missing_database_url(monkeypatch):
         Settings(_env_file=None)
 
 
-def test_llm_settings_default_to_the_offline_provider(monkeypatch):
+def test_llm_settings_default_to_the_local_models(monkeypatch):
     for name in (
         "LLM_PROVIDER",
         "LLM_MODEL",
+        "LLM_STAGE_MODELS",
         "OLLAMA_BASE_URL",
         "LLM_TIMEOUT_SECONDS",
         "LLM_MAX_RETRIES",
@@ -49,8 +50,16 @@ def test_llm_settings_default_to_the_offline_provider(monkeypatch):
         _env_file=None,
     )
 
-    assert settings.llm_provider == "fake"
-    assert settings.llm_model == "gemma4:12b"
+    assert settings.llm_provider == "ollama"
+    assert settings.llm_model == "qwen2.5-coder:7b"
+    assert settings.llm_stage_models == (
+        "triage=ollama:qwen3.5:4b,"
+        "investigate=ollama:qwen2.5-coder:7b,"
+        "plan=ollama:qwen3.5:4b,"
+        "develop=ollama:qwen2.5-coder:7b,"
+        "review=ollama:qwen2.5-coder:7b,"
+        "supervisor=ollama:qwen3.5:4b"
+    )
     assert settings.ollama_base_url == "http://127.0.0.1:11434"
     assert settings.llm_timeout_seconds == 180
     assert settings.llm_max_retries == 2
@@ -93,6 +102,7 @@ def test_llm_settings_load_without_a_database(monkeypatch):
     for name in (
         "LLM_PROVIDER",
         "LLM_MODEL",
+        "LLM_STAGE_MODELS",
         "OLLAMA_BASE_URL",
         "LLM_TIMEOUT_SECONDS",
         "LLM_MAX_RETRIES",
@@ -101,8 +111,8 @@ def test_llm_settings_load_without_a_database(monkeypatch):
 
     settings = LLMSettings(_env_file=None)
 
-    assert settings.llm_provider == "fake"
-    assert settings.llm_model == "gemma4:12b"
+    assert settings.llm_provider == "ollama"
+    assert settings.llm_model == "qwen2.5-coder:7b"
 
 
 def test_llm_provider_name_is_case_insensitive():

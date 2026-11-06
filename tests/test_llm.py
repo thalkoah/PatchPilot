@@ -486,7 +486,8 @@ def test_check_llm_script_rejects_a_credentialed_base_url_without_echoing_it(mon
 def test_check_llm_script_runs_offline_without_a_database(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "fake")
+    monkeypatch.setenv("LLM_STAGE_MODELS", "")
     get_settings.cache_clear()
 
     assert main([]) == 0

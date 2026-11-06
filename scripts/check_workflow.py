@@ -4,7 +4,7 @@
 `--api-url` posts to a running API and waits for the worker process.
 `--once` inserts a row and triages that task in this process. Use `--once`
 only when no other worker is polling the same database. The default provider
-is fake and stays offline.
+is the worker's local Ollama. Set LLM_PROVIDER=fake to stay offline.
 """
 
 import argparse

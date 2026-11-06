@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Print one schema-valid TriageResult.
 
-The default provider is fake and stays offline. Point LLM_PROVIDER at ollama
-for a manual smoke test against a local Ollama server. A failed response
-exits non-zero and the message does not include model text.
+The default is the worker's local Ollama model. Pass --provider fake to stay
+offline. A failed response exits non-zero and the message does not include
+model text.
 """
 
 import argparse

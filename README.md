@@ -190,13 +190,14 @@ uv run python scripts/check_workflow.py --once
 Manual Ollama, still in-process. Point `DATABASE_URL` at a database the host can reach. The Compose database port is not published; use `--api-url` for the stack.
 
 ```bash
-LLM_PROVIDER=ollama LLM_MODEL=gemma4:12b \
+LLM_PROVIDER=ollama LLM_MODEL=qwen2.5-coder:7b \
+  LLM_STAGE_MODELS='triage=ollama:qwen3.5:4b,investigate=ollama:qwen2.5-coder:7b,plan=ollama:qwen3.5:4b,develop=ollama:qwen2.5-coder:7b,review=ollama:qwen2.5-coder:7b,supervisor=ollama:qwen3.5:4b' \
   OLLAMA_BASE_URL=http://127.0.0.1:11434 \
   DATABASE_URL=postgresql://patchpilot:patchpilot_dev@127.0.0.1:5432/patchpilot \
   uv run python scripts/check_workflow.py --once
 ```
 
-When the Compose worker itself uses Ollama, set `LLM_PROVIDER=ollama` and read the binding warning below. Wait longer for that poll:
+The Compose worker uses those models unless you override them. Read the binding warning below. Wait longer for that poll:
 
 ```bash
 uv run python scripts/check_workflow.py --api-url http://127.0.0.1:8000 --timeout 600
@@ -206,9 +207,9 @@ uv run python scripts/check_workflow.py --api-url http://127.0.0.1:8000 --timeou
 
 `generate_structured(prompt, schema, options)` is the model call. `TriageResult` carries classification, severity, a short summary, acceptance criteria, confidence, and `needs_clarification`. `FakeProvider` returns deterministic fixtures. `OllamaProvider` posts to Ollama `/api/chat` with `stream` false and the JSON schema in `format`. Pydantic validates every response. Invalid JSON and timeouts retry at most `LLM_MAX_RETRIES` extra times (0–3, default 2). The next failure raises `LLMResponseError` or `LLMTimeoutError`. Those messages omit the model text.
 
-`LLM_PROVIDER` defaults to `fake`. Leave that value for pytest and CI.
+The worker defaults to local Ollama. `triage`, `plan`, and `supervisor` use `qwen3.5:4b`. `investigate`, `develop`, and `review` use `qwen2.5-coder:7b`. pytest and CI set `LLM_PROVIDER=fake` and leave `LLM_STAGE_MODELS` empty, which keeps those runs offline.
 
-Each stage can name its own provider and model with `LLM_STAGE_MODELS` (`triage=ollama:gemma4:12b`). An empty value uses `LLM_PROVIDER` and `LLM_MODEL` for triage, investigate, plan, develop, review, and supervisor. A stage runs only when that model advertises the capability the stage needs. Current stages need `structured_output`. Native tool calling is separate and stays off for Ollama unless `OLLAMA_TOOL_CALLING=true`.
+Each stage can name its own provider and model with `LLM_STAGE_MODELS` (`triage=ollama:qwen3.5:4b`). An empty value uses `LLM_PROVIDER` and `LLM_MODEL` for triage, investigate, plan, develop, review, and supervisor. A stage runs only when that model advertises the capability the stage needs. Current stages need `structured_output`. Native tool calling is separate and stays off for Ollama unless `OLLAMA_TOOL_CALLING=true`.
 
 An OpenAI-compatible cloud API is off unless `LLM_CLOUD_ENABLED=true` and a base URL, API key, and capability list are set. The worker is the only service that receives the key. Building the router does not open a cloud client for a stage that still uses `fake` or Ollama. Invalid JSON, timeouts, and HTTP 408, 429, 502, 503, and 504 wait `LLM_RETRY_BACKOFF_SECONDS` between attempts. HTTP 500 and connection failures are not retried. Two invalid outputs for the same stage and model open a circuit, and the next call does not reach the provider.
 
@@ -217,7 +218,7 @@ A task stops when it exceeds its model-call, tool-call, reported-token, runtime,
 Offline check:
 
 ```bash
-uv run python scripts/check_llm.py
+uv run python scripts/check_llm.py --provider fake
 ```
 
 `LLM_TIMEOUT_SECONDS` defaults to 180 seconds per attempt. A cold local model can use most of that. Raise it when a larger model still times out. The ceiling is 600 seconds, and `LLM_MAX_RETRIES` stays between 0 and 3.
@@ -225,7 +226,7 @@ uv run python scripts/check_llm.py
 Manual Ollama on the host, using a model you already have:
 
 ```bash
-LLM_PROVIDER=ollama LLM_MODEL=gemma4:12b \
+LLM_PROVIDER=ollama LLM_MODEL=qwen3.5:4b \
   OLLAMA_BASE_URL=http://127.0.0.1:11434 \
   uv run python scripts/check_llm.py
 ```
@@ -234,7 +235,7 @@ The script prints one schema-valid `TriageResult` as JSON.
 
 ### Ollama from Compose on Fedora
 
-The worker service adds the host gateway and leaves the provider on `fake` until you opt in:
+The worker service adds the host gateway and calls the per-stage Ollama models above. Set `LLM_PROVIDER=fake` and `LLM_STAGE_MODELS` empty to run the stack offline:
 
 ```yaml
 extra_hosts:

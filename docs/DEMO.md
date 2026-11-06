@@ -2,7 +2,7 @@
 
 This walkthrough uses the deterministic `fake` provider. It does not call Ollama or a cloud API. The sample project is `examples/demo_service`. An unknown customer tier still returns HTTP 500. The intended response is HTTP 422.
 
-Leave `LLM_PROVIDER=fake`, `LLM_CLOUD_ENABLED=false`, and `GITHUB_ENABLED=false`.
+The Compose worker otherwise uses local Ollama. For this walkthrough set `LLM_PROVIDER=fake`, `LLM_STAGE_MODELS` empty, `LLM_CLOUD_ENABLED=false`, and `GITHUB_ENABLED=false`.
 
 ## 0:00 — Start the stack
 

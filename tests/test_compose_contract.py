@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from patchpilot.config import DEFAULT_LLM_MODEL, DEFAULT_STAGE_MODELS
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -51,7 +53,9 @@ def test_worker_reaches_host_ollama_only_through_the_documented_gateway():
     assert "OLLAMA_BASE_URL" not in api
     assert "LLM_PROVIDER" not in api
     assert "host.docker.internal:host-gateway" in worker
-    assert "LLM_PROVIDER: ${LLM_PROVIDER:-fake}" in worker
+    assert "LLM_PROVIDER: ${LLM_PROVIDER:-ollama}" in worker
+    assert f"LLM_MODEL: ${{LLM_MODEL:-{DEFAULT_LLM_MODEL}}}" in worker
+    assert f"LLM_STAGE_MODELS: ${{LLM_STAGE_MODELS:-{DEFAULT_STAGE_MODELS}}}" in worker
     assert "WORKER_IDLE_SLEEP_SECONDS: ${WORKER_IDLE_SLEEP_SECONDS:-2}" in worker
     assert "WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-30}" in worker
     assert "WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-3}" in worker
@@ -179,7 +183,9 @@ def test_env_example_is_present_and_env_is_ignored():
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
 
     assert "DATABASE_URL=" in example
-    assert "LLM_PROVIDER=fake" in example
+    assert "LLM_PROVIDER=ollama" in example
+    assert f"LLM_MODEL={DEFAULT_LLM_MODEL}" in example
+    assert f"LLM_STAGE_MODELS={DEFAULT_STAGE_MODELS}" in example
     assert "LLM_CLOUD_ENABLED=false" in example
     assert "GITHUB_ENABLED=false" in example
     assert "TASK_MAX_PARALLELISM=1" in example

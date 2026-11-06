@@ -38,6 +38,18 @@ from patchpilot.runner.limits import (
 
 DEFAULT_WORKER_LEASE_SECONDS = 30.0
 DEFAULT_WORKER_MAX_ATTEMPTS = 3
+# Fits an 8 GB GPU with an 8k context. Larger tags such as gemma4:12b do not.
+DEFAULT_LLM_MODEL = "qwen2.5-coder:7b"
+# triage, plan, and supervisor are short classifications. investigate, develop,
+# and review read or write code. An empty LLM_STAGE_MODELS uses LLM_MODEL for all.
+DEFAULT_STAGE_MODELS = (
+    "triage=ollama:qwen3.5:4b,"
+    "investigate=ollama:qwen2.5-coder:7b,"
+    "plan=ollama:qwen3.5:4b,"
+    "develop=ollama:qwen2.5-coder:7b,"
+    "review=ollama:qwen2.5-coder:7b,"
+    "supervisor=ollama:qwen3.5:4b"
+)
 
 
 class LLMSettings(BaseSettings):
@@ -49,15 +61,15 @@ class LLMSettings(BaseSettings):
         extra="ignore",
     )
 
-    llm_provider: Literal["fake", "ollama", "openai"] = "fake"
-    llm_model: str = "gemma4:12b"
+    llm_provider: Literal["fake", "ollama", "openai"] = "ollama"
+    llm_model: str = DEFAULT_LLM_MODEL
     ollama_base_url: str = "http://127.0.0.1:11434"
     llm_timeout_seconds: float = Field(default=180.0, gt=0, le=MAX_LLM_TIMEOUT_SECONDS)
     llm_max_retries: int = Field(default=2, ge=0, le=MAX_LLM_RETRIES)
     llm_retry_backoff_seconds: float = Field(default=0.5, ge=0, le=8)
     # Blank uses llm_provider and llm_model for every stage.
-    # Example: triage=ollama:gemma4:12b,review=openai:gpt-4.1-mini
-    llm_stage_models: str = ""
+    # Example: triage=ollama:qwen3.5:4b,develop=ollama:qwen2.5-coder:7b
+    llm_stage_models: str = DEFAULT_STAGE_MODELS
     ollama_tool_calling: bool = False
     # Cloud stays off until this is true and a base URL, key, and capability are set.
     llm_cloud_enabled: bool = False

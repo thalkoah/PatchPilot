@@ -64,13 +64,13 @@ services:
       SUPERVISOR_MODEL: ${SUPERVISOR_MODEL:-false}
       ARTIFACTS_ROOT: /artifacts
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
-      LLM_MODEL: ${LLM_MODEL:-gemma4:12b}
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5-coder:7b}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-180}
       LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
       LLM_RETRY_BACKOFF_SECONDS: ${LLM_RETRY_BACKOFF_SECONDS:-0.5}
-      LLM_STAGE_MODELS: ${LLM_STAGE_MODELS:-}
+      LLM_STAGE_MODELS: ${LLM_STAGE_MODELS:-triage=ollama:qwen3.5:4b,investigate=ollama:qwen2.5-coder:7b,plan=ollama:qwen3.5:4b,develop=ollama:qwen2.5-coder:7b,review=ollama:qwen2.5-coder:7b,supervisor=ollama:qwen3.5:4b}
       OLLAMA_TOOL_CALLING: ${OLLAMA_TOOL_CALLING:-false}
       # Cloud stays off. A key is read only by this service, and only when enabled.
       LLM_CLOUD_ENABLED: ${LLM_CLOUD_ENABLED:-false}

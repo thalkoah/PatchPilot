@@ -83,8 +83,12 @@ def _run(meter: CallMeter, provider: FakeProvider, *, local: bool = False) -> ob
     )
 
 
-def test_stage_routes_default_to_the_configured_provider():
-    settings = _settings()
+def test_an_empty_stage_list_uses_one_provider():
+    settings = _settings(
+        llm_provider="fake",
+        llm_model="qwen2.5-coder:7b",
+        llm_stage_models="",
+    )
     choices = parse_stage_models(
         "",
         default_provider=settings.llm_provider,
@@ -101,7 +105,11 @@ def test_stage_routes_default_to_the_configured_provider():
         "supervisor",
     }
     assert all(choice.provider == "fake" for choice in choices.values())
-    overridden = _settings(llm_stage_models="triage=fake:fixture-model")
+    overridden = _settings(
+        llm_provider="fake",
+        llm_model="qwen2.5-coder:7b",
+        llm_stage_models="triage=fake:fixture-model",
+    )
     routed = parse_stage_models(
         overridden.llm_stage_models,
         default_provider=overridden.llm_provider,
@@ -109,7 +117,25 @@ def test_stage_routes_default_to_the_configured_provider():
         capabilities_for=lambda name: provider_capabilities(overridden, name),
     )
     assert routed["triage"].model == "fixture-model"
-    assert routed["plan"].model == "gemma4:12b"
+    assert routed["plan"].model == "qwen2.5-coder:7b"
+
+
+def test_default_stage_models_assign_the_local_primaries(monkeypatch: pytest.MonkeyPatch):
+    for name in ("LLM_PROVIDER", "LLM_MODEL", "LLM_STAGE_MODELS"):
+        monkeypatch.delenv(name, raising=False)
+    settings = _settings()
+    router = build_router(settings)
+    try:
+        assert router.uses_local is True
+        assert router.choices["triage"].model == "qwen3.5:4b"
+        assert router.choices["plan"].model == "qwen3.5:4b"
+        assert router.choices["supervisor"].model == "qwen3.5:4b"
+        assert router.choices["investigate"].model == "qwen2.5-coder:7b"
+        assert router.choices["develop"].model == "qwen2.5-coder:7b"
+        assert router.choices["review"].model == "qwen2.5-coder:7b"
+        assert all(choice.provider == "ollama" for choice in router.choices.values())
+    finally:
+        router.close()
 
 
 def test_cloud_provider_is_rejected_until_it_is_enabled():
@@ -131,7 +157,7 @@ def test_fake_router_does_not_construct_a_cloud_client(monkeypatch: pytest.Monke
         raise AssertionError("cloud client")
 
     monkeypatch.setattr("patchpilot.llm.openai_compatible.httpx2.Client", boom)
-    router = build_router(_settings())
+    router = build_router(_settings(llm_provider="fake", llm_stage_models=""))
     try:
         assert router.choices["develop"].provider == "fake"
         assert router.uses_local is False
@@ -552,7 +578,7 @@ async def test_usage_endpoint_lists_a_fake_triage_call(
     assert created.status_code == 201, created.text
     task_id = created.json()["id"]
 
-    settings = _settings()
+    settings = _settings(llm_provider="fake", llm_stage_models="")
     router = build_router(settings)
     usage = UsageControl(
         router=router,
@@ -588,7 +614,7 @@ async def test_usage_endpoint_lists_a_fake_triage_call(
     call = body["calls"][0]
     assert call["stage"] == "triage"
     assert call["provider"] == "fake"
-    assert call["model"] == "gemma4:12b"
+    assert call["model"] == "qwen2.5-coder:7b"
     assert call["outcome"] == "success"
     assert call["cost"] == "unknown"
     assert call["estimated_cost_usd"] is None

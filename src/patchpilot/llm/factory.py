@@ -1,4 +1,4 @@
-"""Select the provider named by settings. The default is the offline fake."""
+"""Select the provider named by settings. The default settings use local Ollama."""
 
 from patchpilot.config import LLMSettings
 from patchpilot.llm.errors import LLMPermanentError
