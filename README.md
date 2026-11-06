@@ -111,7 +111,7 @@ REPOSITORY_ROOT="$PWD/examples" uv run python -m patchpilot.source register \
 uv run python -m patchpilot.source list
 ```
 
-Compose mounts `${REPOSITORY_ROOT_HOST:-./examples}` on `/repositories` in the worker only, with `:ro`. The worker process sees `REPOSITORY_ROOT=/repositories`. The API container does not receive that mount. After the worker image contains this command, the same registration can run inside it:
+Compose mounts `${REPOSITORY_ROOT_HOST:-./examples}` on `/repositories` in the worker only, with `:ro,Z`. The `Z` option applies a private SELinux label so an enforcing Fedora worker can read the checkout. Without it, registration raises `PermissionError` on `/repositories/demo_service/.git/HEAD`. The worker process sees `REPOSITORY_ROOT=/repositories`. The API container does not receive that mount. After the worker image contains this command, the same registration can run inside it:
 
 ```bash
 docker compose exec worker python -m patchpilot.source register \

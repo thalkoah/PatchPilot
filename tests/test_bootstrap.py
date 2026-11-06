@@ -40,3 +40,6 @@ def test_bootstrap_discovers_models_instead_of_naming_them():
     assert "gemma" not in text.casefold()
     assert "fedora" in text.casefold()
     assert "Darwin" in text
+    assert "NoNewPrivs" in text
+    assert 'up -d' in text
+    assert "API is already ready" in text

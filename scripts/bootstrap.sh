@@ -458,15 +458,28 @@ register_demo() {
   die "could not register examples/demo_service"
 }
 
+refuse_no_new_privs() {
+  local flag=
+  [[ -r /proc/self/status ]] || return 0
+  flag=$(sed -n 's/^NoNewPrivs:[[:space:]]*//p' /proc/self/status)
+  [[ $flag == 1 ]] || return 0
+  die "this shell has no_new_privs set, so SELinux denies nnp_transition and Podman cannot run. Start ./scripts/bootstrap.sh from a normal terminal."
+}
+
 start_stack() {
   [[ $START -eq 1 ]] || return 0
+  refuse_no_new_privs
   if [[ $SKIP_MODELS -eq 1 && ${#MODELS[@]} -gt 0 ]]; then
     echo "warning: the current settings call Ollama, and --skip-models left those models unpulled." >&2
   fi
   choose_compose
   allow_compose_to_reach_ollama
+  # Always apply the project. A ready API used to skip this, so a volume
+  # change such as the SELinux :Z label never reached the running worker.
   if api_is_ready; then
     echo "API is already ready: $READY_BODY"
+    echo "applying Compose (${COMPOSE[*]})"
+    "${COMPOSE[@]}" up -d
   else
     echo "starting Compose (${COMPOSE[*]})"
     "${COMPOSE[@]}" up --build -d

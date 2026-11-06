@@ -97,7 +97,7 @@ def test_worker_mounts_registered_sources_read_only():
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
 
     assert "REPOSITORY_ROOT: /repositories" in worker
-    assert "${REPOSITORY_ROOT_HOST:-./examples}:/repositories:ro" in worker
+    assert "${REPOSITORY_ROOT_HOST:-./examples}:/repositories:ro,Z" in worker
     assert "/repositories" not in api
     assert "python -m patchpilot.source" in readme
     assert ":ro" in readme
