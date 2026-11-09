@@ -21,6 +21,7 @@ from patchpilot.agents.supervisor import (
     DECLINE_REASON,
     INVESTIGATE_MORE_REASON,
     INVESTIGATE_REASON,
+    NO_PYTHON_REASON,
     MODEL_OUTPUT_REJECTED,
     MODEL_REJECTED,
     MODEL_SELECTED,
@@ -133,6 +134,50 @@ def test_routes_cover_the_outcomes_the_graph_must_distinguish():
     assert "person" in escalate.reason
     assert finalize.route is SupervisorRoute.FINALIZE
     assert finalize.reason == ACCEPT_REASON
+
+
+def test_documentation_evidence_investigates_once_more_then_plans():
+    readme = _investigation(1)
+    report = dict(readme["report"])
+    report["evidence"] = [
+        EvidenceCitation(relative_path="README.md", start_line=1, end_line=41).model_dump(
+            mode="json"
+        )
+    ]
+    readme = {**readme, "report": report}
+    python_file = _investigation(1)
+
+    docs_only = decide_route(
+        {
+            "phase": "investigate",
+            "status": "completed",
+            "investigation_count": 1,
+            "investigation": readme,
+        }
+    )
+    again = decide_route(
+        {
+            "phase": "investigate",
+            "status": "completed",
+            "investigation_count": 2,
+            "investigation": readme,
+        }
+    )
+    named = decide_route(
+        {
+            "phase": "investigate",
+            "status": "completed",
+            "investigation_count": 1,
+            "investigation": python_file,
+        }
+    )
+
+    assert docs_only.route is SupervisorRoute.INVESTIGATE_MORE
+    assert docs_only.reason == NO_PYTHON_REASON
+    assert again.route is SupervisorRoute.PLAN
+    assert again.reason == PLAN_REASON
+    assert named.route is SupervisorRoute.PLAN
+    assert named.reason == PLAN_REASON
 
 
 def test_workspace_runs_the_baseline_before_develop():

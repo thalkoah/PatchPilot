@@ -94,12 +94,13 @@ function bindDecisionForm() {
 function lastEventId() {
   const items = document.querySelectorAll("#timeline [data-event-id]");
   if (items.length === 0) return "";
-  return items[items.length - 1].getAttribute("data-event-id") || "";
+  return items[0].getAttribute("data-event-id") || "";
 }
 
 function appendEvents(snapshot) {
   const timeline = document.querySelector("#timeline");
   if (!timeline) return;
+  const spinner = document.querySelector("#timeline-spinner");
   snapshot.querySelectorAll("[data-event-id]").forEach((item) => {
     const id = item.getAttribute("data-event-id");
     if (!id || document.querySelector(`[data-event-id="${CSS.escape(id)}"]`)) {
@@ -107,7 +108,10 @@ function appendEvents(snapshot) {
     }
     const empty = document.querySelector("#timeline-empty");
     if (empty) empty.remove();
-    timeline.append(item);
+    const index = item.querySelector(".event-index");
+    if (index) index.textContent = String(timeline.querySelectorAll(".event-card").length + 1);
+    const newest = spinner ? spinner.nextSibling : timeline.firstChild;
+    timeline.insertBefore(item, newest);
   });
 }
 

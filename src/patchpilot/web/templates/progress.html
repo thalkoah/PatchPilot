@@ -1,5 +1,7 @@
 <div data-progress data-status="{{ status }}" data-stage="{{ stage }}" data-summary="{{ summary }}">
   {% for event in events %}
+  {% with event_number="" %}
   {% include "event.html" %}
+  {% endwith %}
   {% endfor %}
 </div>

@@ -4,7 +4,7 @@ import re
 from urllib.parse import urlsplit
 
 MAX_LLM_RETRIES = 3
-MAX_LLM_TIMEOUT_SECONDS = 600.0
+MAX_LLM_TIMEOUT_SECONDS = 1800.0
 MAX_PROMPT_CHARS = 32_000
 MAX_MODEL_CONTENT_CHARS = 8_192
 # Envelope around one structured object. Cloud responses stay inside this.

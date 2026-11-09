@@ -67,7 +67,7 @@ services:
       LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
       LLM_MODEL: ${LLM_MODEL:-qwen2.5-coder:7b}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-180}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-1800}
       LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
       LLM_RETRY_BACKOFF_SECONDS: ${LLM_RETRY_BACKOFF_SECONDS:-0.5}
       LLM_STAGE_MODELS: ${LLM_STAGE_MODELS:-triage=ollama:qwen3.5:4b,investigate=ollama:qwen2.5-coder:7b,plan=ollama:qwen3.5:4b,develop=ollama:qwen2.5-coder:7b,review=ollama:qwen2.5-coder:7b,supervisor=ollama:qwen3.5:4b}

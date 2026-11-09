@@ -183,7 +183,7 @@ def test_missing_evidence_fixture_cites_nothing():
 
     assert outcome.report == MISSING_EVIDENCE_REPORT
     assert outcome.rejected_citations == 0
-    assert outcome.tool_calls == 2
+    assert outcome.tool_calls == 1
     assert "discounts.py" not in outcome.report.model_dump_json()
 
 
@@ -246,7 +246,7 @@ def test_tool_budget_stops_further_reads(tmp_path: Path):
     )
 
     assert provider.schemas == ["InvestigatorStep", "InvestigationReport"]
-    assert provider.last.count("OBSERVATION list_tree ") == 1
+    assert provider.last.count("OBSERVATION list_tree ") == 2
     assert BOGUS_PATH not in outcome.report.model_dump_json()
     assert outcome.tool_calls == 2
 
@@ -272,7 +272,7 @@ def test_a_cited_file_is_read_when_the_budget_remains(tmp_path: Path):
     )
 
     assert provider.schemas == ["InvestigatorStep"]
-    assert charged == 1
+    assert charged == 2
     assert outcome.tool_calls == 1
     assert [item.citation for item in outcome.report.evidence] == ["app.py:1"]
     assert outcome.rejected_citations == 0
@@ -479,6 +479,150 @@ def test_parent_directory_read_is_denied_and_cannot_be_cited(tmp_path: Path):
     assert provider.saw_denial is True
 
 
+def test_a_prefixed_citation_is_stored_as_the_file_that_was_read():
+    ledger = EvidenceLedger()
+    ledger.record_read("app/main.py", 4)
+    ledger.record_alias("examples/minitask/app/main.py", "app/main.py")
+    citation = EvidenceCitation(
+        relative_path="examples/minitask/app/main.py",
+        start_line=1,
+        end_line=1,
+    )
+    report = InvestigationReport(
+        summary="The board is rendered from examples/minitask/app/main.py.",
+        hypotheses=[Hypothesis(statement="Line 1 builds the columns.", citations=[citation])],
+        evidence=[citation],
+        probable_files=["examples/minitask/app/main.py"],
+        unanswered_questions=[],
+    )
+
+    accepted, rejected = accept_report(report, ledger)
+
+    assert rejected == 0
+    assert [item.citation for item in accepted.evidence] == ["app/main.py:1"]
+    assert accepted.probable_files == ["app/main.py"]
+    assert accepted.hypotheses[0].citations[0].relative_path == "app/main.py"
+    assert accepted.summary == "The board is rendered from examples/minitask/app/main.py."
+
+
+def test_the_root_listing_lets_a_host_prefix_read_the_checkout_file(tmp_path: Path):
+    checkout = tmp_path / "minitask"
+    app = checkout / "app"
+    app.mkdir(parents=True)
+    (app / "main.py").write_text("def render_board() -> None:\n    return None\n", encoding="utf-8")
+    provider = _OneTool(ToolName.READ_TEXT_FILE, "examples/minitask/app/main.py")
+
+    outcome = InvestigatorAgent(provider, RepositoryTools(checkout), max_tool_calls=2).run(
+        title="Add task counters",
+        description="Modify the MiniTask application in `examples/minitask/`.",
+        triage=_triage(),
+    )
+
+    assert "OBSERVATION list_tree path=." in provider.prompts[0]
+    assert "file app/main.py" in provider.prompts[0]
+    assert "OBSERVATION read_text_file path=app/main.py" in provider.prompts[1]
+    assert "requested examples/minitask/app/main.py" in provider.prompts[1]
+    assert "def render_board()" in provider.prompts[1]
+    assert [item.citation for item in outcome.report.evidence] == ["app/main.py:1"]
+    assert outcome.report.probable_files == ["app/main.py"]
+    assert outcome.rejected_citations == 0
+
+
+def test_the_seeded_listing_names_source_files_and_omits_documentation(tmp_path: Path):
+    checkout = tmp_path / "minitask"
+    app = checkout / "app"
+    static = checkout / "static"
+    app.mkdir(parents=True)
+    static.mkdir()
+    (checkout / "README.md").write_text("# MiniTask\n", encoding="utf-8")
+    (checkout / "Dockerfile").write_text("FROM python\n", encoding="utf-8")
+    (checkout / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (app / "main.py").write_text("print('board')\n", encoding="utf-8")
+    (static / "index.html").write_text("<h3>To do</h3>\n", encoding="utf-8")
+    (static / "app.js").write_text("function render() {}\n", encoding="utf-8")
+    provider = _OneTool(ToolName.READ_TEXT_FILE, "app/main.py")
+
+    InvestigatorAgent(provider, RepositoryTools(checkout), max_tool_calls=2).run(
+        title="Add task counters",
+        description="Modify the board.",
+        triage=_triage(),
+    )
+
+    seeded = provider.prompts[0]
+    assert "file app/main.py" in seeded
+    assert "file static/index.html" in seeded
+    assert "dir static" in seeded
+    assert "file README.md" not in seeded
+    assert "file Dockerfile" not in seeded
+    assert "file requirements.txt" not in seeded
+    assert "file static/app.js" not in seeded
+
+
+def test_a_missing_file_is_not_replaced_by_a_different_one(tmp_path: Path):
+    (tmp_path / "app.py").write_text("print('present')\n", encoding="utf-8")
+    provider = _OneTool(ToolName.READ_TEXT_FILE, "other.py")
+
+    outcome = InvestigatorAgent(provider, RepositoryTools(tmp_path), max_tool_calls=2).run(
+        title="Save fails",
+        description="The save button fails.",
+        triage=_triage(),
+    )
+
+    observed = "\n".join(provider.prompts)
+    assert "OBSERVATION read_text_file error=not_found path=other.py" in observed
+    assert "OBSERVATION list_tree path=." in observed
+    assert "file app.py" in observed
+    assert "OBSERVATION read_text_file path=app.py" not in observed
+    assert "print('present')" not in observed
+    assert outcome.report.evidence == []
+    assert outcome.rejected_citations == 1
+
+
+def test_a_trailing_slash_on_a_missing_directory_shows_the_root(tmp_path: Path):
+    checkout = tmp_path / "minitask"
+    app = checkout / "app"
+    app.mkdir(parents=True)
+    (app / "main.py").write_text("print('inside')\n", encoding="utf-8")
+    provider = _OneTool(ToolName.LIST_TREE, "examples/minitask/")
+
+    InvestigatorAgent(provider, RepositoryTools(checkout), max_tool_calls=2).run(
+        title="Add task counters",
+        description="Modify the MiniTask application in `examples/minitask/`.",
+        triage=_triage(),
+    )
+
+    observed = "\n".join(provider.prompts)
+    assert "error=invalid_path" not in observed
+    assert "OBSERVATION list_tree error=not_found path=examples/minitask/" in observed
+    assert "file app/main.py" in observed
+    assert "print('inside')" not in observed
+
+
+def test_a_missing_prefix_does_not_read_through_a_symlink(tmp_path: Path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("TOPSECRET\n", encoding="utf-8")
+    checkout = tmp_path / "checkout"
+    app = checkout / "app"
+    app.mkdir(parents=True)
+    (app / "main.py").write_text("print('inside')\n", encoding="utf-8")
+    (checkout / "escape").symlink_to(outside, target_is_directory=True)
+    provider = _OneTool(ToolName.READ_TEXT_FILE, "nosuch/escape/app/main.py")
+
+    outcome = InvestigatorAgent(provider, RepositoryTools(checkout), max_tool_calls=2).run(
+        title="Save fails",
+        description="The save button fails.",
+        triage=_triage(),
+    )
+
+    observed = "\n".join(provider.prompts)
+    assert "TOPSECRET" not in observed
+    assert "OBSERVATION read_text_file path=app/main.py" not in observed
+    assert "error=not_found path=nosuch/escape/app/main.py" in observed
+    assert outcome.report.evidence == []
+    assert (outside / "secret.txt").read_text(encoding="utf-8") == "TOPSECRET\n"
+
+
 async def test_task_without_a_repository_skips_investigation():
     provider = FakeProvider()
 
@@ -615,6 +759,34 @@ async def test_worker_investigates_the_registered_demo_bug(
     )
     assert DOCSTRING not in json.dumps(completed["payload"])
     _assert_checkpoint_omits(postgres_database_url, task_id, DOCSTRING)
+
+
+class _OneTool:
+    """Request one path, then cite that same path."""
+
+    def __init__(self, name: ToolName, path: str) -> None:
+        self.prompts: list[str] = []
+        self._name = name
+        self._path = path
+
+    def generate_structured(self, prompt: str, schema: type, options: object = None):
+        self.prompts.append(prompt)
+        if schema is InvestigatorStep:
+            return InvestigatorStep(
+                tool=ToolRequest(name=self._name, relative_path=self._path),
+                report=None,
+            )
+        citation = EvidenceCitation(relative_path=self._path, start_line=1, end_line=1)
+        return InvestigationReport(
+            summary="The requested file explains the report.",
+            hypotheses=[Hypothesis(statement="Line 1 is the defect.", citations=[citation])],
+            evidence=[citation],
+            probable_files=[self._path],
+            unanswered_questions=[],
+        )
+
+    def close(self) -> None:
+        return None
 
 
 class _CitePaths:

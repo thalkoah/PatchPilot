@@ -61,7 +61,7 @@ def test_llm_settings_default_to_the_local_models(monkeypatch):
         "supervisor=ollama:qwen3.5:4b"
     )
     assert settings.ollama_base_url == "http://127.0.0.1:11434"
-    assert settings.llm_timeout_seconds == 180
+    assert settings.llm_timeout_seconds == 1800
     assert settings.llm_max_retries == 2
 
 
@@ -75,7 +75,7 @@ def test_llm_settings_default_to_the_local_models(monkeypatch):
         ("ollama_base_url", "http://127.0.0.1:11434/?token=secret"),
         ("llm_max_retries", 4),
         ("llm_timeout_seconds", 0),
-        ("llm_timeout_seconds", 601),
+        ("llm_timeout_seconds", 1801),
     ],
 )
 def test_llm_settings_reject_unsafe_values(field, value):

@@ -4,12 +4,17 @@ A citation survives only when `read_text_file` returned that path and those line
 numbers. Search hits and directory listings are not reads. File text stays in
 the prompt for the model and is not stored on the task.
 
-Quoted strings in the title and description are searched before the model
-chooses a tool. Matching Python files are read, up to a small cap, so a later
-citation of those lines can be kept. Up to two tool calls are held back from the
-model. After the report, including one forced at the end of the model's loop, a
-cited path that was never opened is read with those calls. The total stays inside
-the same budget.
+The checkout root is listed before the model chooses a tool. That listing names
+directories and source files (`.py` and `.html`). Documentation and config stay
+out of it and are read only when a tool asks for them. Quoted strings in
+the title and description are then searched. Matching Python files are read, up
+to a small cap, so a later citation of those lines can be kept. A missing path
+prefixed with `examples/` or the checkout directory name uses the longest
+remainder that exists. The read is stored under that remainder, and a citation
+of the missing path is kept as that file. Any other miss returns not_found and
+the root listing. Up to two tool calls are held back from the model. After the
+report, including one forced at the end of the model's loop, a cited path that
+was never opened is read with those calls. The total stays inside the same budget.
 """
 
 import re
@@ -47,24 +52,44 @@ _KEPT_ONLY = "The investigator kept only lines it had read."
 _SEEDED_QUERIES = 4
 _SEEDED_PYTHON_READS = 3
 _CITATION_RESERVE = 2
+_SOURCE_SUFFIXES = (".py", ".html")
 _QUOTED_TEXT = re.compile(r'"([^"\r\n]{2,200})"|\'([^\'\r\n]{2,200})\'')
+# Checkouts are registered under this host directory. A task can name it even
+# though the tools are already rooted inside the checkout.
+_HOST_CHECKOUT_DIR = "examples"
 
 
 @dataclass
 class EvidenceLedger:
-    """Line spans actually returned by `read_text_file` during this investigation."""
+    """Line spans actually returned by `read_text_file` during this investigation.
+
+    A missing requested path can be stored under the suffix that was read.
+    `resolve` maps that request back to the stored path.
+    """
 
     reads: dict[str, int] = field(default_factory=dict)
+    aliases: dict[str, str] = field(default_factory=dict)
 
     def record_read(self, path: str, line_count: int) -> None:
         if line_count > self.reads.get(path, 0):
             self.reads[path] = line_count
 
+    def record_alias(self, requested: str, resolved: str) -> None:
+        """Remember that a missing request was satisfied by `resolved`."""
+        if requested and resolved and requested != resolved:
+            self.aliases[requested] = resolved
+
+    def resolve(self, path: str) -> str:
+        """Return the path that was read for this request."""
+        resolved = self.aliases.get(path, path)
+        return self.aliases.get(resolved, resolved)
+
     def covers(self, citation: EvidenceCitation) -> bool:
-        parts = citation.relative_path.split("/")
-        if citation.relative_path.startswith("/") or ".." in parts:
+        path = self.resolve(citation.relative_path)
+        parts = path.split("/")
+        if path.startswith("/") or ".." in parts:
             return False
-        available = self.reads.get(citation.relative_path)
+        available = self.reads.get(path)
         if available is None:
             return False
         return citation.end_line <= available
@@ -113,13 +138,20 @@ class InvestigatorAgent:
     ) -> InvestigationOutcome:
         ledger = EvidenceLedger()
         self._check_lease()
-        observations = _seed_quoted_files(
+        observations = _seed_checkout(
             self._tools,
-            ledger,
-            title=title,
-            description=description,
             charge_tool=self._charge_tool,
             lease_lost=self._lease_lost,
+        )
+        observations.extend(
+            _seed_quoted_files(
+                self._tools,
+                ledger,
+                title=title,
+                description=description,
+                charge_tool=self._charge_tool,
+                lease_lost=self._lease_lost,
+            )
         )
         calls = 0
         model_limit = self._max_tool_calls - _citation_reserve(self._max_tool_calls)
@@ -195,40 +227,45 @@ def accept_report(
     for hypothesis in report.hypotheses:
         incoming.extend(hypothesis.citations)
     for citation in incoming:
-        identity = (citation.relative_path, citation.start_line, citation.end_line)
-        if ledger.covers(citation):
+        stored = _stored_citation(citation, ledger)
+        identity = (stored.relative_path, stored.start_line, stored.end_line)
+        if ledger.covers(stored):
             if identity not in seen:
                 seen.add(identity)
-                kept.append(citation)
+                kept.append(stored)
             continue
-        rejected.add(identity)
+        rejected.add((citation.relative_path, citation.start_line, citation.end_line))
         rejected_paths.add(citation.relative_path)
     for path in report.probable_files:
-        if path not in ledger.reads:
+        if ledger.resolve(path) not in ledger.reads:
             rejected_paths.add(path)
 
     evidence = kept[:_MAX_EVIDENCE]
     allowed = {(item.relative_path, item.start_line, item.end_line) for item in evidence}
-    unread = {path for path in rejected_paths if path not in ledger.reads}
+    unread = {path for path in rejected_paths if ledger.resolve(path) not in ledger.reads}
     hypotheses: list[Hypothesis] = []
     for hypothesis in report.hypotheses:
         if _tainted(hypothesis.statement, unread):
             continue
-        surviving = [
-            item
-            for item in hypothesis.citations
-            if (item.relative_path, item.start_line, item.end_line) in allowed
-        ]
+        surviving: list[EvidenceCitation] = []
+        for item in hypothesis.citations:
+            stored = _stored_citation(item, ledger)
+            identity = (stored.relative_path, stored.start_line, stored.end_line)
+            if identity in allowed:
+                surviving.append(stored)
         if not surviving:
             continue
         hypotheses.append(hypothesis.model_copy(update={"citations": surviving}))
         if len(hypotheses) == _MAX_HYPOTHESES:
             break
-    probable = [path for path in report.probable_files if path in ledger.reads][:8]
+    probable: list[str] = []
+    for path in report.probable_files:
+        resolved = ledger.resolve(path)
+        if resolved in ledger.reads and resolved not in probable:
+            probable.append(resolved)
+    probable = probable[:8]
     questions = [
-        question
-        for question in report.unanswered_questions
-        if not _tainted(question, unread)
+        question for question in report.unanswered_questions if not _tainted(question, unread)
     ]
     if rejected:
         questions.insert(0, _OMITTED)
@@ -300,11 +337,12 @@ def _unread_citation_paths(report: InvestigationReport, ledger: EvidenceLedger) 
         incoming.extend(hypothesis.citations)
     for citation in incoming:
         path = citation.relative_path
-        if path in seen or path in ledger.reads:
+        resolved = ledger.resolve(path)
+        if resolved in seen or resolved in ledger.reads:
             continue
         if not _path_can_be_read(path):
             continue
-        seen.add(path)
+        seen.add(resolved)
         paths.append(path)
     return paths
 
@@ -378,30 +416,164 @@ def _seed_quoted_files(
     return observations
 
 
-def _execute(tools: RepositoryTools, request: ToolRequest, ledger: EvidenceLedger) -> str:
+def _seed_checkout(
+    tools: RepositoryTools,
+    *,
+    charge_tool: Callable[[], None] | None,
+    lease_lost: Callable[[], bool] | None,
+) -> list[str]:
+    """List source files at the checkout root before the model chooses a path."""
+    if lease_lost is not None and lease_lost():
+        raise StopForLease
+    if charge_tool is not None:
+        charge_tool()
     try:
-        if request.name is ToolName.LIST_TREE:
-            return _format_tree(tools.list_tree(request.relative_path))
-        if request.name is ToolName.SEARCH_TEXT:
-            if not request.query:
-                return _error(request.name, "invalid_query")
-            return _format_search(
-                request.relative_path,
-                tools.search_text(request.query, request.relative_path),
-            )
-        document = tools.read_text_file(request.relative_path)
+        return [_format_tree(_source_listing(tools.list_tree(".")))]
     except SourceError as exc:
-        return _error(request.name, exc.code)
+        return [_error(ToolName.LIST_TREE, exc.code)]
+
+
+def _source_listing(listing: TreeListing) -> TreeListing:
+    """Directories and source files. Documentation in the same tree is omitted."""
+    entries = [entry for entry in listing.entries if _shown_in_seed(entry.kind, entry.path)]
+    return listing.model_copy(update={"entries": entries})
+
+
+def _shown_in_seed(kind: str, path: str) -> bool:
+    if kind == "dir":
+        return True
+    if kind != "file":
+        return False
+    name = path.rsplit("/", 1)[-1].casefold()
+    return name.endswith(_SOURCE_SUFFIXES)
+
+
+def _execute(tools: RepositoryTools, request: ToolRequest, ledger: EvidenceLedger) -> str:
+    if request.name is ToolName.SEARCH_TEXT and not request.query:
+        return _error(request.name, "invalid_query")
+    requested = _tool_path(request.relative_path)
+    renamed = requested != request.relative_path
+    try:
+        return _perform(
+            tools,
+            request,
+            ledger,
+            requested,
+            requested=request.relative_path if renamed else None,
+        )
+    except SourceError as exc:
+        if exc.code != "not_found":
+            return _error(request.name, exc.code)
+    for candidate in _relocated_suffixes(tools, requested):
+        try:
+            return _perform(
+                tools,
+                request,
+                ledger,
+                candidate,
+                requested=request.relative_path,
+            )
+        except SourceError:
+            continue
+    return _not_found(tools, request)
+
+
+def _tool_path(value: str) -> str:
+    """Drop a trailing slash so `examples/minitask/` is a directory path."""
+    path = value.strip()
+    while len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    return path
+
+
+def _perform(
+    tools: RepositoryTools,
+    request: ToolRequest,
+    ledger: EvidenceLedger,
+    path: str,
+    *,
+    requested: str | None,
+) -> str:
+    """Run one tool at `path`. A read is recorded under the path the tool returned."""
+    if request.name is ToolName.LIST_TREE:
+        return _format_tree(tools.list_tree(path), requested=requested)
+    if request.name is ToolName.SEARCH_TEXT:
+        query = request.query or ""
+        if not query:
+            raise SourceError("invalid_query")
+        return _format_search(
+            path,
+            tools.search_text(query, path),
+            requested=requested,
+        )
+    document = tools.read_text_file(path)
     ledger.record_read(document.path, document.line_count)
-    return _format_read(document)
+    if requested is not None:
+        ledger.record_alias(requested, document.path)
+    return _format_read(document, requested=requested)
 
 
-def _error(name: ToolName, code: str) -> str:
-    return f"OBSERVATION {name.value} error={code}\nEND OBSERVATION"
+def _relocated_suffixes(tools: RepositoryTools, relative_path: str) -> list[str]:
+    """Paths left after removing the host checkout prefix, longest first.
+
+    `examples/<checkout>/app.py` and `<checkout>/app.py` can name `app.py`.
+    A missing `src/app.py` is not rewritten to `app.py`.
+    """
+    try:
+        parts = relative_parts(relative_path, allow_root=False)
+    except SourceError:
+        return []
+    if len(parts) < 2:
+        return []
+    name = tools.root.name
+    starts: list[int] = []
+    if parts[0] == _HOST_CHECKOUT_DIR:
+        starts.append(1)
+        if len(parts) > 2 and parts[1] == name:
+            starts.append(2)
+    if parts[0] == name:
+        starts.append(1)
+    suffixes: list[str] = []
+    for start in starts:
+        if start >= len(parts):
+            continue
+        suffix = "/".join(parts[start:])
+        if suffix not in suffixes:
+            suffixes.append(suffix)
+    suffixes.sort(key=len, reverse=True)
+    return suffixes
 
 
-def _format_tree(listing: TreeListing) -> str:
+def _not_found(tools: RepositoryTools, request: ToolRequest) -> str:
+    """Name the missing path and show the checkout root."""
+    notice = _error(request.name, "not_found", path=request.relative_path)
+    try:
+        listing = _format_tree(tools.list_tree("."))
+    except SourceError as exc:
+        return notice + "\n" + _error(ToolName.LIST_TREE, exc.code)
+    return notice + "\n" + listing
+
+
+def _stored_citation(citation: EvidenceCitation, ledger: EvidenceLedger) -> EvidenceCitation:
+    """Use the path that was read when the model cited a missing prefix."""
+    path = ledger.resolve(citation.relative_path)
+    if path == citation.relative_path:
+        return citation
+    return EvidenceCitation(
+        relative_path=path,
+        start_line=citation.start_line,
+        end_line=citation.end_line,
+    )
+
+
+def _error(name: ToolName, code: str, *, path: str | None = None) -> str:
+    location = f" path={path}" if path else ""
+    return f"OBSERVATION {name.value} error={code}{location}\nEND OBSERVATION"
+
+
+def _format_tree(listing: TreeListing, *, requested: str | None = None) -> str:
     lines = [f"OBSERVATION list_tree path={listing.path}"]
+    _note_request(lines, listing.path, requested)
     for entry in listing.entries[:_TREE_LINES]:
         if entry.kind == "file":
             lines.append(f"file {entry.path}")
@@ -413,8 +585,14 @@ def _format_tree(listing: TreeListing) -> str:
     return "\n".join(lines)
 
 
-def _format_search(relative_path: str, result: SearchResult) -> str:
+def _format_search(
+    relative_path: str,
+    result: SearchResult,
+    *,
+    requested: str | None = None,
+) -> str:
     lines = [f"OBSERVATION search_text query={result.query} path={relative_path}"]
+    _note_request(lines, relative_path, requested)
     for match in result.matches[:_SEARCH_HITS]:
         snippet = " ".join(match.text.split())[:_LINE_CHARS]
         lines.append(f"{match.path}:{match.line} {snippet}".rstrip())
@@ -424,8 +602,9 @@ def _format_search(relative_path: str, result: SearchResult) -> str:
     return "\n".join(lines)
 
 
-def _format_read(document: TextFile) -> str:
+def _format_read(document: TextFile, *, requested: str | None = None) -> str:
     lines = [f"OBSERVATION read_text_file path={document.path}"]
+    _note_request(lines, document.path, requested)
     for number, line in enumerate(document.content.splitlines(), start=1):
         shown = " ".join(line.split())[:_LINE_CHARS]
         lines.append(f"{number} | {shown}")
@@ -433,6 +612,11 @@ def _format_read(document: TextFile) -> str:
         lines.append("truncated")
     lines.append("END OBSERVATION")
     return "\n".join(lines)
+
+
+def _note_request(lines: list[str], path: str, requested: str | None) -> None:
+    if requested is not None and requested != path:
+        lines.append(f"requested {requested}")
 
 
 def _prompt(

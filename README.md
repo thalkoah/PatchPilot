@@ -235,7 +235,7 @@ Offline check:
 uv run python scripts/check_llm.py --provider fake
 ```
 
-`LLM_TIMEOUT_SECONDS` defaults to 180 seconds per attempt. A cold local model can use most of that. Raise it when a larger model still times out. The ceiling is 600 seconds, and `LLM_MAX_RETRIES` stays between 0 and 3.
+`LLM_TIMEOUT_SECONDS` defaults to 1800 seconds per attempt. A cold local model can use most of that. The ceiling is 1800 seconds, and `LLM_MAX_RETRIES` stays between 0 and 3.
 
 Manual Ollama on the host, using a model you already have:
 

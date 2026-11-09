@@ -64,7 +64,7 @@ class LLMSettings(BaseSettings):
     llm_provider: Literal["fake", "ollama", "openai"] = "ollama"
     llm_model: str = DEFAULT_LLM_MODEL
     ollama_base_url: str = "http://127.0.0.1:11434"
-    llm_timeout_seconds: float = Field(default=180.0, gt=0, le=MAX_LLM_TIMEOUT_SECONDS)
+    llm_timeout_seconds: float = Field(default=1800.0, gt=0, le=MAX_LLM_TIMEOUT_SECONDS)
     llm_max_retries: int = Field(default=2, ge=0, le=MAX_LLM_RETRIES)
     llm_retry_backoff_seconds: float = Field(default=0.5, ge=0, le=8)
     # Blank uses llm_provider and llm_model for every stage.

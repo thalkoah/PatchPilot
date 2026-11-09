@@ -32,6 +32,7 @@ _REASON_CHARS = 300
 ABSENT_REPO = "The task has no repository, so investigation is skipped."
 INVESTIGATE_REASON = "A registered repository is attached."
 INVESTIGATE_MORE_REASON = "The investigation cited no line."
+NO_PYTHON_REASON = "The investigation cited no Python file."
 PLAN_REASON = "The investigation is finished."
 REPLAN_REASON = "The plan named no permissible path."
 PROCEED_REASON = "The plan names a code change."
@@ -259,11 +260,12 @@ def route_records(value: object) -> tuple[dict[str, Any], ...]:
 
 def _after_investigation(state: Mapping[str, Any]) -> SupervisorDecision:
     count = _count(state, "investigation_count")
-    evidence = _evidence_count(state)
-    if count is None or evidence is None:
+    report = _investigation_report(state)
+    if count is None or report is None:
         return _one(SupervisorRoute.FINALIZE, INVESTIGATION_MISSING)
-    if evidence == 0 and count < MAX_INVESTIGATIONS:
-        return _one(SupervisorRoute.INVESTIGATE_MORE, INVESTIGATE_MORE_REASON)
+    if _python_citations(report) == 0 and count < MAX_INVESTIGATIONS:
+        reason = INVESTIGATE_MORE_REASON if not report.evidence else NO_PYTHON_REASON
+        return _one(SupervisorRoute.INVESTIGATE_MORE, reason)
     return _one(SupervisorRoute.PLAN, PLAN_REASON)
 
 
@@ -375,13 +377,24 @@ def _approved(state: Mapping[str, Any]) -> bool:
     return isinstance(approval, dict) and approval.get("decision") == "approve"
 
 
-def _evidence_count(state: Mapping[str, Any]) -> int | None:
+def _investigation_report(state: Mapping[str, Any]) -> InvestigationReport | None:
     raw = state.get("investigation")
     if not _mapping(raw):
         return None
     try:
-        report = InvestigationReport.model_validate(raw.get("report"))
+        return InvestigationReport.model_validate(raw.get("report"))
     except ValidationError:
+        return None
+
+
+def _python_citations(report: InvestigationReport) -> int:
+    """Citations of a `.py` file. Documentation and HTML do not let planning start."""
+    return sum(1 for item in report.evidence if item.relative_path.casefold().endswith(".py"))
+
+
+def _evidence_count(state: Mapping[str, Any]) -> int | None:
+    report = _investigation_report(state)
+    if report is None:
         return None
     return len(report.evidence)
 

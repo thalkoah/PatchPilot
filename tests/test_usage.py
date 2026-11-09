@@ -354,7 +354,7 @@ def test_tool_budget_stops_the_investigator_before_another_read():
             triage=DISCOUNT_TIER_TRIAGE,
         )
 
-    assert len(provider.calls) == 2
+    assert len(provider.calls) == 1
 
 
 def test_repair_budget_stops_before_another_fake_call():

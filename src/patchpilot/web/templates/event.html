@@ -1,11 +1,22 @@
-<li data-event-id="{{ event.id }}">
-  <time datetime="{{ event.iso }}">{{ event.display_time }}</time>
-  <span class="event-type">{{ event.event_label }}</span>
-  <span class="event-stage">{{ event.stage_label }}</span>
+<li
+  class="event-card {{ event.stage_class }}{% if event.tone == 'bad' %} event-bad{% endif %}"
+  data-event-id="{{ event.id }}"
+>
+  <header class="event-head">
+    <span class="event-index" aria-hidden="true">{{ event_number }}</span>
+    <div class="event-title">
+      <span class="event-type">{{ event.event_label }}</span>
+      <time datetime="{{ event.iso }}">{{ event.display_time }}</time>
+    </div>
+    <span class="event-stage">{{ event.stage_label }}</span>
+  </header>
   {% if event.details %}
-  <dl>
-    {% for key, value in event.details %}
-    <div><dt>{{ key }}</dt><dd>{{ value }}</dd></div>
+  <dl class="event-details">
+    {% for detail in event.details %}
+    <div class="detail">
+      <dt>{{ detail.key }}</dt>
+      <dd{% if detail.tone == 'good' %} class="tone-good"{% elif detail.tone == 'bad' %} class="tone-bad"{% endif %}>{{ detail.value }}</dd>
+    </div>
     {% endfor %}
   </dl>
   {% endif %}

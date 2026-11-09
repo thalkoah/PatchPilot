@@ -57,13 +57,22 @@ _KIND_LABELS = {"existing": "Existing file", "new_test": "New test"}
 
 
 @dataclass(frozen=True)
+class DetailView:
+    key: str
+    value: str
+    tone: str = ""
+
+
+@dataclass(frozen=True)
 class EventView:
     id: str
     iso: str
     display_time: str
     stage_label: str
     event_label: str
-    details: tuple[tuple[str, str], ...]
+    details: tuple[DetailView, ...] = ()
+    stage_class: str = "stage-other"
+    tone: str = ""
 
 
 @dataclass(frozen=True)
@@ -272,6 +281,13 @@ def stage_label(stage: str | None) -> str:
     return STAGE_LABELS.get(stage, stage.replace("_", " "))
 
 
+def stage_class(stage: str | None) -> str:
+    """Card color for one pipeline stage. Unknown stages share a neutral card."""
+    if stage in STAGE_LABELS:
+        return "stage-" + stage.replace("_", "-")
+    return "stage-other"
+
+
 def list_href(*, status: str | None = None, offset: int = 0) -> str:
     """Index URL. Status values come from the task enum, not from model text."""
     pairs: list[tuple[str, str]] = []
@@ -409,27 +425,93 @@ def task_page(loaded: LoadedTask, markers: tuple[str, ...]) -> TaskPage:
 
 def _event(row: TaskEvent, markers: tuple[str, ...]) -> EventView:
     iso, display = _times(row.timestamp)
+    details = _details(row.payload, markers)
     return EventView(
         id=str(row.id),
         iso=iso,
         display_time=display,
         stage_label=stage_label(row.stage),
         event_label=EVENT_LABELS.get(row.event_type, row.event_type),
-        details=_details(row.payload, markers),
+        details=details,
+        stage_class=stage_class(row.stage),
+        tone=_card_tone(row.event_type, details),
     )
 
 
-def _details(payload: object, markers: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
+def _details(payload: object, markers: tuple[str, ...]) -> tuple[DetailView, ...]:
     if not isinstance(payload, dict):
         return ()
     cleaned = bound_payload(payload)
-    rows: list[tuple[str, str]] = []
+    rows: list[DetailView] = []
     for key, value in cleaned.items():
         text = _detail_text(value)
         if text == "":
             continue
-        rows.append((redact_text(str(key), markers), redact_text(text, markers)))
+        shown = redact_text(text, markers)
+        name = redact_text(str(key), markers)
+        rows.append(
+            DetailView(
+                key=_detail_label(name),
+                value=shown,
+                tone=_detail_tone(str(key), shown),
+            )
+        )
     return tuple(rows)
+
+
+def _detail_label(key: str) -> str:
+    label = key.replace("_", " ").strip()
+    if label == "":
+        return key
+    return label[0].upper() + label[1:]
+
+
+def _detail_tone(key: str, value: str) -> str:
+    """Green or red for a decision the reader should see without reading the card."""
+    name = key.casefold().replace("-", "_").strip()
+    text = value.casefold().strip()
+    if name == "can_proceed":
+        if text == "yes":
+            return "good"
+        if text == "no":
+            return "bad"
+        return ""
+    if name == "decision":
+        if text == "approve":
+            return "good"
+        if text in {"reject", "rejected"}:
+            return "bad"
+        return ""
+    if name in {"error", "error_code"} or name.endswith("_error") or "failure" in name:
+        return "bad"
+    if name == "status" and text in {"failed", "failure", "rejected", "error"}:
+        return "bad"
+    if name in {"action", "policy"} and text in {
+        "fail",
+        "failed",
+        "failure",
+        "reject",
+        "rejected",
+        "exhausted",
+    }:
+        return "bad"
+    if name == "passed" and text == "no":
+        return "bad"
+    if name in {"critical", "timed_out"} and text == "yes":
+        return "bad"
+    return ""
+
+
+def _card_tone(event_type: str, details: tuple[DetailView, ...]) -> str:
+    """The whole step is a failure. A declined plan stays the stage color."""
+    if event_type in {"model_error", "task_rejected"}:
+        return "bad"
+    if event_type == "recovery" and any(
+        detail.key.casefold() == "action" and detail.value.casefold() == "exhausted"
+        for detail in details
+    ):
+        return "bad"
+    return ""
 
 
 def _detail_text(value: object) -> str:
