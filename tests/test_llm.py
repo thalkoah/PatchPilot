@@ -319,14 +319,19 @@ def test_invalid_model_output_fails_closed_without_leaking_text(caplog):
     assert_model_text_stays_out_of_the_error(caught.value, SECRET)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+    assert "body: json_invalid:" in caplog.text
+    assert "TriageResult rejected model output" in caplog.text
     assert SECRET not in caplog.text
 
 
-def test_schema_mismatch_is_rejected_without_the_payload():
+def test_schema_mismatch_is_rejected_without_the_payload(caplog):
     bad = json.dumps({"classification": "bug", "summary": SECRET})
     provider, seen, client = scripted_provider([chat_response(bad)], max_retries=0)
 
-    with pytest.raises(LLMResponseError, match="validation errors") as caught:
+    with (
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(LLMResponseError, match="validation errors") as caught,
+    ):
         try:
             provider.generate_structured("The save button fails.", TriageResult)
         finally:
@@ -337,6 +342,10 @@ def test_schema_mismatch_is_rejected_without_the_payload():
     assert_model_text_stays_out_of_the_error(caught.value, SECRET)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+    assert "severity: missing" in caplog.text
+    assert "acceptance_criteria: missing" in caplog.text
+    assert SECRET not in caplog.text
+    assert SECRET not in caught.value.detail
 
 
 def test_timeout_retries_then_raises_a_typed_timeout():

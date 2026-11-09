@@ -14,6 +14,9 @@ RelativePath = Annotated[str, Field(min_length=1, max_length=300)]
 # Stored summaries stay within this length. It is not a JSON Schema maxLength:
 # the sampler would otherwise stop the string on the 400th character.
 _SUMMARY_LIMIT = 400
+# end_line - start_line. JSON Schema cannot express the difference, and a
+# maximum on either line number would not stop a wide span.
+_MAX_CITATION_SPAN = 40
 _SENTENCE_MARKS = ".!?"
 
 
@@ -36,18 +39,32 @@ class EvidenceCitation(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     relative_path: RelativePath
-    start_line: int = Field(ge=1, le=100_000)
-    end_line: int = Field(ge=1, le=100_000)
+    start_line: int = Field(
+        ge=1,
+        le=100_000,
+        description="First cited line, inclusive.",
+    )
+    end_line: int = Field(
+        ge=1,
+        le=100_000,
+        description="Last cited line, inclusive. At most 40 lines after start_line.",
+    )
     citation: str = Field(default="", max_length=320)
 
     @model_validator(mode="after")
     def label_matches_the_span(self) -> Self:
+        """Keep a citation inside the span limit and derive its label.
+
+        The schema has no cross-field maximum, so a model can finish a wide
+        range. A range that already fits is kept. A wider one keeps start_line
+        and stops 40 lines later.
+        """
         if any(ord(character) < 32 or character == "\\" for character in self.relative_path):
             raise ValueError("relative_path is not a repository path")
         if self.end_line < self.start_line:
             raise ValueError("end_line precedes start_line")
-        if self.end_line - self.start_line > 40:
-            raise ValueError("line range is too wide")
+        if self.end_line - self.start_line > _MAX_CITATION_SPAN:
+            self.end_line = self.start_line + _MAX_CITATION_SPAN
         self.citation = citation_label(self.relative_path, self.start_line, self.end_line)
         return self
 

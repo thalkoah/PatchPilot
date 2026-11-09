@@ -892,6 +892,41 @@ def test_investigation_summary_schema_omits_max_length():
     assert statement["maxLength"] == 400
 
 
+def test_wide_citation_keeps_the_first_lines_inside_the_span_limit():
+    citation = EvidenceCitation(relative_path="static/index.html", start_line=10, end_line=90)
+    assert citation.start_line == 10
+    assert citation.end_line == 50
+    assert citation.citation == "static/index.html:10-50"
+
+    exact = EvidenceCitation(relative_path="static/index.html", start_line=1, end_line=41)
+    assert exact.end_line == 41
+    assert exact.citation == "static/index.html:1-41"
+
+    report = parse_structured_output(
+        json.dumps(
+            {
+                "summary": "The subtitle belongs in the task form.",
+                "evidence": [
+                    {
+                        "relative_path": "static/index.html",
+                        "start_line": 1,
+                        "end_line": 120,
+                        "citation": "static/index.html:1-120",
+                    }
+                ],
+            }
+        ),
+        InvestigationReport,
+    )
+    assert report.evidence[0].end_line == 41
+    assert report.evidence[0].citation == "static/index.html:1-41"
+
+    end_line = EvidenceCitation.model_json_schema()["properties"]["end_line"]
+    assert end_line["description"] == (
+        "Last cited line, inclusive. At most 40 lines after start_line."
+    )
+
+
 def test_summary_without_a_sentence_inside_the_cap_is_rejected():
     marker = "summary-without-a-fitting-sentence"
     raw = f"Check app.py and README.md {marker} " + ("n" * 400) + ". Finished now."
@@ -903,10 +938,15 @@ def test_summary_without_a_sentence_inside_the_cap_is_rejected():
 
     message = str(caught.value)
     assert message == "InvestigationReport rejected model output (1 validation error)"
+    assert "summary: value_error:" in caught.value.detail
+    assert "no complete sentence" in caught.value.detail
     assert marker not in message
+    assert marker not in caught.value.detail
     assert marker not in repr(caught.value)
     assert raw not in message
+    assert raw not in caught.value.detail
     assert "Finished" not in message
+    assert "Finished" not in caught.value.detail
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
 

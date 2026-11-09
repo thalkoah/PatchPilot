@@ -17,6 +17,7 @@ from patchpilot.llm.errors import (
     LLMTimeoutError,
     LLMTransientError,
     LLMTransportError,
+    log_failure_reason,
 )
 from patchpilot.llm.limits import (
     MAX_HTTP_BODY_BYTES,
@@ -113,17 +114,18 @@ class OpenAICompatibleProvider:
                 content = self._request_content(checked_prompt, checked_schema, resolved)
                 result = parse_structured_output(content, checked_schema)
             except (LLMTimeoutError, LLMResponseError, LLMTransientError) as exc:
+                reason = log_failure_reason(exc)
                 if attempt == attempts:
                     logger.warning(
                         "cloud structured output failed after %s attempt(s): %s",
                         attempt,
-                        type(exc).__name__,
+                        reason,
                     )
                     raise
                 logger.warning(
                     "cloud structured output attempt %s failed: %s",
                     attempt,
-                    type(exc).__name__,
+                    reason,
                 )
                 retry_pause(attempt, self._backoff_seconds, self._sleeper)
                 continue
