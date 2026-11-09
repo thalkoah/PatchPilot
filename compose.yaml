@@ -92,8 +92,9 @@ services:
       GITHUB_ALLOWED_REPOS: ${GITHUB_ALLOWED_REPOS:-}
       # Checkouts registered under this directory. The host path is
       # REPOSITORY_ROOT_HOST. The worker sees only /repositories, read-only.
-      # :Z is a private SELinux label. On enforcing Fedora the checkout is
-      # user_home_t, which container_t cannot read.
+      # :Z is a private SELinux label applied when this container is created.
+      # On enforcing Fedora a checkout added later stays user_home_t, which
+      # container_t cannot read. bootstrap.sh copies the mount label onto it.
       REPOSITORY_ROOT: /repositories
       # Private clones. Git writes only here, never into /repositories.
       WORKSPACE_ROOT: /workspaces

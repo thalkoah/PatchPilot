@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101c36" />
+    <meta name="description" content="MiniTask, a tiny task board for PatchPilot testing." />
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/app.js" defer></script>
+    <title>MiniTask · PatchPilot test app</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="header-inner">
+        <div class="brand">
+          <span class="brand-icon" aria-hidden="true">✓</span>
+          <span>MiniTask</span>
+          <span class="brand-divider" aria-hidden="true"></span>
+          <span class="brand-caption">PatchPilot test app</span>
+        </div>
+        <div class="header-pill"><span class="live-dot"></span> Local workspace</div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="intro" aria-labelledby="page-title">
+        <div class="intro-copy">
+          <p class="eyebrow">YOUR WORKSPACE</p>
+          <h1 id="page-title">A little progress, <span>every day.</span></h1>
+          <p class="intro-description">A minimal task board built for experimenting, breaking things, and fixing them again.</p>
+        </div>
+        <div class="stats" aria-label="Task statistics">
+          <div class="stat"><strong id="stat-total">0</strong><span>Total tasks</span></div>
+          <div class="stat"><strong id="stat-active">0</strong><span>In progress</span></div>
+          <div class="stat"><strong id="stat-done">0</strong><span>Completed</span></div>
+        </div>
+      </section>
+
+      <div class="workspace">
+        <aside class="new-task-panel" aria-labelledby="create-heading">
+          <div class="panel-title-row"><span class="panel-icon" aria-hidden="true">＋</span><h2 id="create-heading">Create a task</h2></div>
+          <p class="panel-description">What's on your list today?</p>
+          <form id="task-form">
+            <label for="task-title">Task title <span class="required">*</span></label>
+            <input id="task-title" name="title" maxlength="120" placeholder="e.g. Write some tests" required autocomplete="off" />
+            <label for="task-description">Description <span class="optional">(optional)</span></label>
+            <textarea id="task-description" name="description" maxlength="2000" rows="5" placeholder="Add a little more context..."></textarea>
+            <label for="task-status">Status</label>
+            <select id="task-status" name="status">
+              <option value="todo">To do</option>
+              <option value="in_progress">In progress</option>
+              <option value="done">Done</option>
+            </select>
+            <button id="create-button" type="submit" class="primary-button"><span aria-hidden="true">＋</span> Create task</button>
+          </form>
+          <div class="panel-footnote">Built with <strong>FastAPI</strong> · <strong>SQLite</strong> · <strong>Vanilla JS</strong></div>
+        </aside>
+
+        <section class="board" aria-label="Task board">
+          <div class="board-heading"><div><p class="eyebrow">OVERVIEW</p><h2>Your board</h2></div><span id="task-count" class="task-count">0 tasks</span></div>
+          <div id="notification" class="notification" role="status" aria-live="polite" hidden></div>
+          <div id="board-columns" class="board-columns">
+            <section class="task-column" aria-labelledby="todo-heading">
+              <div class="column-heading"><div><span class="column-dot todo-dot"></span><h3 id="todo-heading">To do</h3></div><span class="count-badge" id="count-todo">0</span></div>
+              <div id="column-todo" class="task-list"></div>
+            </section>
+            <section class="task-column" aria-labelledby="progress-heading">
+              <div class="column-heading"><div><span class="column-dot progress-dot"></span><h3 id="progress-heading">In progress</h3></div><span class="count-badge" id="count-in_progress">0</span></div>
+              <div id="column-in_progress" class="task-list"></div>
+            </section>
+            <section class="task-column" aria-labelledby="done-heading">
+              <div class="column-heading"><div><span class="column-dot done-dot"></span><h3 id="done-heading">Done</h3></div><span class="count-badge" id="count-done">0</span></div>
+              <div id="column-done" class="task-list"></div>
+            </section>
+          </div>
+        </section>
+      </div>
+      <footer>MiniTask v1.0 <span aria-hidden="true">·</span> A playground for PatchPilot</footer>
+    </main>
+  </body>
+</html>

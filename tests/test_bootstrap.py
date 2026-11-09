@@ -43,3 +43,6 @@ def test_bootstrap_discovers_models_instead_of_naming_them():
     assert "NoNewPrivs" in text
     assert 'up -d' in text
     assert "API is already ready" in text
+    assert "label_repository_root\n  register_demo\n  register_minitask" in text
+    assert "container_file_t" in text
+    assert "chcon -R" in text

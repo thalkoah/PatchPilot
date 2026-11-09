@@ -1,0 +1,1 @@
+"""MiniTask application package."""

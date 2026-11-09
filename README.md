@@ -102,7 +102,7 @@ Initialize the sample checkout, then register it. On the host, point `DATABASE_U
 uv run python scripts/init_demo_repo.py
 ```
 
-That creates `examples/demo_service/.git/`. The parent repository ignores it. Do not `git add` the demo directory while that directory exists, or Git records a gitlink instead of the source files. Then register:
+That creates `examples/demo_service/.git/` and `examples/minitask/.git/`. The parent repository ignores both. Do not `git add` either directory while the nested `.git` exists, or Git records a gitlink instead of the source files. From the repository root, `./scripts/add_all.sh` removes those directories, runs `git add --all`, and recreates the checkouts. It does not commit. Then register:
 
 ```bash
 REPOSITORY_ROOT="$PWD/examples" uv run python -m patchpilot.source register \
@@ -111,7 +111,7 @@ REPOSITORY_ROOT="$PWD/examples" uv run python -m patchpilot.source register \
 uv run python -m patchpilot.source list
 ```
 
-Compose mounts `${REPOSITORY_ROOT_HOST:-./examples}` on `/repositories` in the worker only, with `:ro,Z`. The `Z` option applies a private SELinux label so an enforcing Fedora worker can read the checkout. Without it, registration raises `PermissionError` on `/repositories/demo_service/.git/HEAD`. The worker process sees `REPOSITORY_ROOT=/repositories`. The API container does not receive that mount. After the worker image contains this command, the same registration can run inside it:
+Compose mounts `${REPOSITORY_ROOT_HOST:-./examples}` on `/repositories` in the worker only, with `:ro,Z`. The `Z` option applies a private SELinux label when the worker container is created, so an enforcing Fedora worker can read the checkout. A checkout added after that stays `user_home_t`, and registration fails with `PermissionError` on `/repositories/<name>/.git/HEAD`. `./scripts/bootstrap.sh` copies the mount label onto those files before it registers them. The worker process sees `REPOSITORY_ROOT=/repositories`. The API container does not receive that mount. After the worker image contains this command, the same registration can run inside it:
 
 ```bash
 docker compose exec worker python -m patchpilot.source register \
@@ -120,6 +120,8 @@ docker compose exec worker python -m patchpilot.source register \
 ```
 
 `examples/demo_service` is a small FastAPI project. Known customer tiers return a discount. An unknown tier currently produces HTTP 500; the intended response is HTTP 422. See `examples/demo_service/README.md` for the baseline pytest command and the regression that fails on purpose.
+
+`examples/minitask` is a small task-board FastAPI project. The same script creates its checkout. Register it with `--name "MiniTask"` and `--path minitask`. See `examples/minitask/README.md`.
 
 Read-only tools are `list_tree`, `read_text_file`, and `search_text`. Each takes a relative path under that one checkout. They refuse `..`, absolute paths, symlink escapes, `.git`, credential names, binaries, and files past the byte limit. Listings omit denied names. Search uses a literal substring and skips symlinks. The investigator is the only caller. The limits are 200 tree entries, depth 6, 32768 bytes, 400 lines, 100 searched files, and 40 matches. One investigation may make at most `INVESTIGATOR_MAX_TOOL_CALLS` tool calls (default 6, hard maximum 12).
 

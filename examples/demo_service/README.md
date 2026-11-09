@@ -32,4 +32,4 @@ Registration requires a Git checkout. Create one without changing the parent rep
 uv run python scripts/init_demo_repo.py
 ```
 
-The script is idempotent. `examples/demo_service/.git/` is ignored by the parent repository. Do not `git add` this directory while that `.git` directory exists. Git would record a gitlink, and a clone of the parent repository would not contain these source files. Run the script after the source is committed, or remove `.git` before adding new demo files.
+The script is idempotent. `examples/demo_service/.git/` is ignored by the parent repository. Do not `git add` this directory while that `.git` directory exists. Git would record a gitlink, and a clone of the parent repository would not contain these source files. From the PatchPilot root, `./scripts/add_all.sh` removes the nested `.git` directories, runs `git add --all`, and recreates the checkouts. It does not commit.

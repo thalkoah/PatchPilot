@@ -445,17 +445,27 @@ wait_ready() {
   die "the API did not become ready. Logs: ${COMPOSE[*]} logs api"
 }
 
-register_demo() {
+register_checkout() {
+  local name=$1
+  local path=$2
   local _attempt
   for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     if compose_exec worker python -m patchpilot.source register \
-      --name "Demo service" \
-      --path demo_service; then
+      --name "$name" \
+      --path "$path"; then
       return 0
     fi
     sleep 2
   done
-  die "could not register examples/demo_service"
+  die "could not register examples/$path"
+}
+
+register_demo() {
+  register_checkout "Demo service" demo_service
+}
+
+register_minitask() {
+  register_checkout "MiniTask" minitask
 }
 
 refuse_no_new_privs() {
@@ -464,6 +474,59 @@ refuse_no_new_privs() {
   flag=$(sed -n 's/^NoNewPrivs:[[:space:]]*//p' /proc/self/status)
   [[ $flag == 1 ]] || return 0
   die "this shell has no_new_privs set, so SELinux denies nnp_transition and Podman cannot run. Start ./scripts/bootstrap.sh from a normal terminal."
+}
+
+repository_host_path() {
+  local value=${REPOSITORY_ROOT_HOST:-}
+  local line
+  if [[ -z $value && -f .env ]]; then
+    line=$(grep -E '^[[:space:]]*REPOSITORY_ROOT_HOST=' .env | tail -n 1 || true)
+    value=${line#*=}
+    value=${value%$'\r'}
+    value=${value#\"}
+    value=${value%\"}
+    value=${value#\'}
+    value=${value%\'}
+  fi
+  if [[ -z $value ]]; then
+    value=./examples
+  fi
+  printf '%s\n' "$value"
+}
+
+# :Z runs when the worker container is created. `compose up` leaves a running
+# worker mounted, so a checkout added afterwards stays user_home_t and
+# registration dies with EACCES on .git/HEAD. Copy the label already on the
+# mount point. Recreate the worker only when that mount was never labeled.
+label_repository_root() {
+  [[ $(getenforce 2>/dev/null || true) == Enforcing ]] || return 0
+  local root label type level unlabeled
+  root=$(repository_host_path)
+  [[ -d $root ]] || die "repository root is missing: $root"
+  label=$(stat -c %C "$root" 2>/dev/null || true)
+  case $label in
+    *container_file_t*) ;;
+    *)
+      echo "recreating the worker so SELinux can label $root"
+      "${COMPOSE[@]}" up -d --force-recreate --no-deps worker
+      label=$(stat -c %C "$root" 2>/dev/null || true)
+      ;;
+  esac
+  case $label in
+    *container_file_t*) ;;
+    *)
+      die "SELinux did not label $root for the worker (got ${label:-none})"
+      ;;
+  esac
+  if ! unlabeled=$(find "$root" -xdev ! -context '*container_file_t*' -print -quit); then
+    die "could not inspect SELinux labels under $root"
+  fi
+  [[ -n $unlabeled ]] || return 0
+  type=${label#*:*:}
+  type=${type%%:*}
+  level=${label#*:*:*:}
+  echo "applying the worker SELinux label under $root"
+  chcon -R -t "$type" -l "$level" "$root"
 }
 
 start_stack() {
@@ -475,7 +538,8 @@ start_stack() {
   choose_compose
   allow_compose_to_reach_ollama
   # Always apply the project. A ready API used to skip this, so a volume
-  # change such as the SELinux :Z label never reached the running worker.
+  # change never reached the running worker. :Z still applies only when the
+  # worker is created, so label_repository_root covers checkouts added later.
   if api_is_ready; then
     echo "API is already ready: $READY_BODY"
     echo "applying Compose (${COMPOSE[*]})"
@@ -485,7 +549,9 @@ start_stack() {
     "${COMPOSE[@]}" up --build -d
     wait_ready
   fi
+  label_repository_root
   register_demo
+  register_minitask
   echo "dashboard: http://127.0.0.1:8000/"
 }
 
