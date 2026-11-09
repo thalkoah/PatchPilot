@@ -1,5 +1,6 @@
 """Deterministic provider for tests and offline runs."""
 
+import difflib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from patchpilot.llm.investigation import (
     ToolRequest,
 )
 from patchpilot.llm.parsing import coerce_model, require_prompt, require_schema, resolve_options
-from patchpilot.llm.patch import FileEdit, PatchProposal
+from patchpilot.llm.patch import DEVELOP_SNIPPET_MAX_CHARS, DevelopDiff, FileEdit, PatchProposal
 from patchpilot.llm.plan import ChangePlan, ModificationKind, ProposedModification
 from patchpilot.llm.provider import GenerateOptions, ModelT
 from patchpilot.llm.review import FindingSeverity, ReviewAction, ReviewFinding, ReviewResult
@@ -532,6 +533,80 @@ def _fixed_lookup(prompt: str, attempt: int) -> PatchProposal:
     return PatchProposal(summary=DEMO_PATCH_SUMMARY, edits=edits)
 
 
+def _develop_diff_payload(proposal: PatchProposal, prompt: str) -> dict[str, Any]:
+    """The fixture patch as exact spans. The develop schema has no git diff."""
+    if not proposal.edits:
+        raise LLMResponseError("PatchProposal rejected model output (1 validation error)")
+    edits = []
+    for edit in proposal.edits:
+        before = _worktree_text(prompt, edit.relative_path)
+        after = edit.content if edit.content.endswith("\n") else f"{edit.content}\n"
+        if before == after:
+            continue
+        old, new = _changed_span(before, after)
+        if len(old) > DEVELOP_SNIPPET_MAX_CHARS or len(new) > DEVELOP_SNIPPET_MAX_CHARS:
+            raise LLMResponseError("PatchProposal rejected model output (1 validation error)")
+        edits.append({"relative_path": edit.relative_path, "old": old, "new": new})
+    if not edits:
+        raise LLMResponseError("PatchProposal rejected model output (1 validation error)")
+    return {"summary": proposal.summary, "edits": edits}
+
+
+def _changed_span(before: str | None, after: str) -> tuple[str, str]:
+    """The changed lines, plus one anchor line when the edit only inserts or deletes."""
+    if not after.endswith("\n"):
+        after = f"{after}\n"
+    if before is None:
+        return "", after
+    before_lines = before.splitlines(keepends=True)
+    after_lines = after.splitlines(keepends=True)
+    opcodes = [
+        opcode
+        for opcode in difflib.SequenceMatcher(
+            a=before_lines,
+            b=after_lines,
+            autojunk=False,
+        ).get_opcodes()
+        if opcode[0] != "equal"
+    ]
+    if not opcodes:
+        return before, after
+    _tag, i1, i2, j1, j2 = opcodes[0]
+    i2 = opcodes[-1][2]
+    j2 = opcodes[-1][4]
+    if i1 == i2 and i1 > 0 and j1 > 0:
+        i1 -= 1
+        j1 -= 1
+    elif i1 == i2 and i2 < len(before_lines) and j2 < len(after_lines):
+        i2 += 1
+        j2 += 1
+    if j1 == j2 and j1 > 0 and i1 > 0:
+        j1 -= 1
+        i1 -= 1
+    elif j1 == j2 and j2 < len(after_lines) and i2 < len(before_lines):
+        j2 += 1
+        i2 += 1
+    old = "".join(before_lines[i1:i2])
+    new = "".join(after_lines[j1:j2])
+    if not old or before.count(old) != 1:
+        raise LLMResponseError("PatchProposal rejected model output (1 validation error)")
+    return old, new
+
+
+def _worktree_text(prompt: str, path: str) -> str | None:
+    """The file as the prompt showed it, with the trailing newline source files keep."""
+    if _file_sha(prompt, path) in {None, ""}:
+        return None
+    for match in _FILE_BLOCK.finditer(prompt):
+        if match.group(1) != path:
+            continue
+        text = match.group(2)
+        if text.endswith("\n\n"):
+            text = text[:-2]
+        return text if text.endswith("\n") else f"{text}\n"
+    return None
+
+
 def _file_body(prompt: str, path: str) -> str | None:
     for match in _FILE_BLOCK.finditer(prompt):
         if match.group(1) != path:
@@ -767,6 +842,12 @@ class FakeProvider:
             result = coerce_model(checked_schema, builtin_change_plan(checked_prompt))
         elif checked_schema is PatchProposal:
             result = coerce_model(checked_schema, builtin_patch_proposal(checked_prompt))
+        elif checked_schema is DevelopDiff:
+            proposal = builtin_patch_proposal(checked_prompt)
+            result = coerce_model(
+                checked_schema,
+                _develop_diff_payload(proposal, checked_prompt),
+            )
         elif checked_schema is ReviewResult:
             result = coerce_model(checked_schema, builtin_review(checked_prompt))
         elif checked_schema is SupervisorRecommendation:

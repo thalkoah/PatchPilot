@@ -717,7 +717,7 @@ async def test_one_repair_then_accepts_the_tested_diff(
     assert finished.body["result_json"]["review"]["action"] == "accept"
     assert finished.body["result_json"]["review"]["policy"] == "accept"
     assert finished.body["result_json"]["review"]["repair_count"] == 1
-    assert finished.names.count("PatchProposal") == 2
+    assert finished.names.count("DevelopDiff") == 2
     assert finished.names.count("ReviewResult") == 2
     assert len(finished.repairs) == 1
     assert finished.repairs[0]["payload"]["index"] == 1
@@ -766,7 +766,7 @@ async def test_failed_tests_do_not_count_as_success(
     assert finished.body["result_json"]["review"]["policy"] == "fail"
     assert "Tests failed and the repair limit is exhausted" in finished.body["result_summary"]
     assert "person needs to intervene" in finished.body["result_summary"]
-    assert finished.names.count("PatchProposal") == 3
+    assert finished.names.count("DevelopDiff") == 3
     assert finished.names.count("ReviewResult") == 3
     assert len(finished.repairs) == 2
     assert [item["payload"]["index"] for item in finished.repairs] == [1, 2]
@@ -796,7 +796,7 @@ async def test_repeated_reviewer_rejection_stops_at_two_repairs(
     assert finished.body["result_json"]["review"]["policy"] == "fail"
     assert "A critical review finding blocks the patch" in finished.body["result_summary"]
     assert "person needs to intervene" in finished.body["result_summary"]
-    assert finished.names.count("PatchProposal") == 3
+    assert finished.names.count("DevelopDiff") == 3
     assert len(finished.repairs) == 2
     assert finished.names.count("ReviewResult") == 3
     assert finished.snapshot == finished.before
@@ -825,7 +825,7 @@ async def test_repair_limit_is_exhausted_when_the_reviewer_keeps_asking(
     assert finished.body["result_json"]["review"]["action"] == "repair"
     assert "Repair stopped after 2 attempts" in finished.body["result_summary"]
     assert "person needs to intervene" in finished.body["result_summary"]
-    assert finished.names.count("PatchProposal") == 3
+    assert finished.names.count("DevelopDiff") == 3
     assert finished.names.count("ReviewResult") == 3
     assert len(finished.repairs) == 2
     newest = client.get(f"/api/v1/tasks/{finished.task_id}/patch")

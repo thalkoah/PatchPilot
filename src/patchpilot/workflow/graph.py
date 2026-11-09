@@ -126,6 +126,7 @@ APPROVAL_FAILURE = "Approval resume did not continue the workflow."
 WORKSPACE_FAILURE = "The isolated workspace could not be created."
 PATCH_FAILURE = "The patch was rejected before it was applied."
 SYNTAX_PATCH = "The patch is not valid Python."
+MISMATCH_PATCH = "The edit did not match the file."
 EMPTY_PATCH = "The repair did not change any approved file."
 TEST_FAILURE = "The test result could not be read."
 REVIEW_FAILURE = "The review could not be completed."
@@ -844,6 +845,8 @@ def develop_node(state: TriageState, runtime: Runtime[WorkflowContext]) -> dict[
             message = EMPTY_PATCH
         elif exc.code == "syntax":
             message = SYNTAX_PATCH
+        elif exc.code == "mismatch":
+            message = MISMATCH_PATCH
         else:
             message = PATCH_FAILURE
         return _failed_update(message, stage=STAGE_DEVELOP)

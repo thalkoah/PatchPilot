@@ -17,7 +17,11 @@ from patchpilot.llm.fake import (
     NEEDS_CLARIFICATION_TRIAGE,
     FakeProvider,
 )
-from patchpilot.llm.limits import MAX_OLLAMA_HTTP_BODY_BYTES
+from patchpilot.llm.limits import (
+    MAX_MODEL_CONTENT_CHARS,
+    MAX_OLLAMA_HTTP_BODY_BYTES,
+    OLLAMA_NUM_CTX,
+)
 from patchpilot.llm.ollama import OllamaProvider
 from patchpilot.llm.provider import GenerateOptions
 from patchpilot.llm.triage import TriageResult
@@ -280,7 +284,8 @@ def test_ollama_posts_a_schema_constrained_chat_request_and_validates_it():
     assert body["stream"] is False
     assert body["think"] is False
     assert body["format"] == TriageResult.model_json_schema()
-    assert body["options"] == {"temperature": 0.0}
+    assert body["options"]["temperature"] == 0.0
+    assert 1 <= body["options"]["num_predict"] < OLLAMA_NUM_CTX
     assert body["messages"][1] == {"role": "user", "content": "The save button fails."}
     assert "patchpilot_dev" not in seen[0].content.decode()
 
@@ -469,6 +474,84 @@ def test_oversized_response_is_rejected_before_it_is_parsed():
 
     assert "yyyy" not in str(caught.value)
     assert caught.value.__context__ is None
+
+
+def test_overlong_model_text_logs_its_length_without_the_text(caplog):
+    content = "y" * (MAX_MODEL_CONTENT_CHARS + 1)
+    provider, _seen, client = scripted_provider([chat_response(content)], max_retries=0)
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(LLMResponseError) as caught:
+        try:
+            provider.generate_structured("The save button fails.", TriageResult)
+        finally:
+            provider.close()
+            client.close()
+
+    assert "yyyy" not in str(caught.value)
+    assert "yyyy" not in caplog.text
+    assert f"{MAX_MODEL_CONTENT_CHARS + 1} characters" in caplog.text
+
+
+def test_a_longer_prompt_gets_a_smaller_generation_cap():
+    provider, seen, client = scripted_provider(
+        [chat_response(GENERIC_BUG_TRIAGE.model_dump_json()) for _ in range(2)]
+    )
+
+    try:
+        provider.generate_structured("short", TriageResult)
+        provider.generate_structured("x" * 4_000, TriageResult)
+    finally:
+        provider.close()
+        client.close()
+
+    short = json.loads(seen[0].content)["options"]["num_predict"]
+    longer = json.loads(seen[1].content)["options"]["num_predict"]
+    assert longer < short
+    assert short < OLLAMA_NUM_CTX
+
+
+def test_develop_diff_encoding_fits_the_parser_cap():
+    from patchpilot.llm.patch import (
+        DEVELOP_MAX_EDITS,
+        DEVELOP_PATH_MAX,
+        DEVELOP_SNIPPET_MAX_CHARS,
+        DevelopDiff,
+        SnippetEdit,
+    )
+
+    encoded = DevelopDiff(
+        summary="\\" * 400,
+        edits=[
+            SnippetEdit(
+                relative_path='"' * DEVELOP_PATH_MAX,
+                old="\\" * DEVELOP_SNIPPET_MAX_CHARS,
+                new="\\" * DEVELOP_SNIPPET_MAX_CHARS,
+            )
+            for _ in range(DEVELOP_MAX_EDITS)
+        ],
+    ).model_dump_json()
+    schema = DevelopDiff.model_json_schema()
+    snippet = schema["$defs"]["SnippetEdit"]["properties"]
+
+    assert len(encoded) <= MAX_MODEL_CONTENT_CHARS
+    assert "unified_diff" not in schema["properties"]
+    assert schema["properties"]["edits"]["maxItems"] == DEVELOP_MAX_EDITS
+    assert "maxLength" not in snippet["old"]
+    assert "maxLength" not in snippet["new"]
+
+
+def test_a_bare_hunk_is_not_a_develop_diff():
+    from pydantic import ValidationError
+
+    from patchpilot.llm.patch import DevelopDiff
+
+    with pytest.raises(ValidationError):
+        DevelopDiff.model_validate(
+            {
+                "summary": "Add counters.",
+                "unified_diff": '@@ -1,41 +1,41 @@\n"""MiniTask FastAPI application."""\n',
+            }
+        )
 
 
 def test_check_llm_script_prints_a_valid_fake_result(monkeypatch, capsys):

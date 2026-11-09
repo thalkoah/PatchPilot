@@ -4,11 +4,31 @@ from typing import Annotated, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from patchpilot.llm.limits import MAX_MODEL_CONTENT_CHARS
+
 Summary = Annotated[str, Field(min_length=1, max_length=400)]
 RelativePath = Annotated[str, Field(min_length=1, max_length=300)]
 # Large enough that the apply tool, not the schema, rejects an overlong diff.
 FileContent = Annotated[str, Field(min_length=1, max_length=20_000)]
 UnifiedDiff = Annotated[str, Field(max_length=20_000)]
+# A maxLength on old or new is enforced by the response grammar as a hard cut.
+# That cut a function off in the middle of a dict, and the file then failed to
+# parse. The whole JSON object is still rejected above the parser cap. This
+# size is only how large a fixture span may be.
+DEVELOP_MAX_EDITS = 3
+DEVELOP_PATH_MAX = 120
+_DEVELOP_EDIT = '{"relative_path":"","old":"","new":""}'
+_DEVELOP_JSON_WRAPPER = len(
+    '{"summary":"","edits":[' + ",".join([_DEVELOP_EDIT] * DEVELOP_MAX_EDITS) + "]}"
+)
+_SUMMARY_ESCAPE_RESERVE = 400 * 2
+_PATH_ESCAPE_RESERVE = DEVELOP_MAX_EDITS * DEVELOP_PATH_MAX * 2
+_SNIPPET_FIELDS = DEVELOP_MAX_EDITS * 2
+DEVELOP_SNIPPET_MAX_CHARS = (
+    MAX_MODEL_CONTENT_CHARS - _DEVELOP_JSON_WRAPPER - _SUMMARY_ESCAPE_RESERVE - _PATH_ESCAPE_RESERVE
+) // (2 * _SNIPPET_FIELDS)
+DevelopPath = Annotated[str, Field(min_length=1, max_length=DEVELOP_PATH_MAX)]
+DevelopSnippet = str
 
 
 class FileEdit(BaseModel):
@@ -34,6 +54,33 @@ class FileEdit(BaseModel):
         if any(ord(character) < 32 or character == "\\" for character in self.relative_path):
             raise ValueError("relative_path is not a repository path")
         return self
+
+
+class SnippetEdit(BaseModel):
+    """One exact replacement. `old` is empty only when the test file is new."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    relative_path: DevelopPath
+    old: DevelopSnippet
+    new: DevelopSnippet
+
+    @field_validator("relative_path")
+    @classmethod
+    def path_is_a_single_line(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ord(character) < 32 or character == "\\" for character in value):
+            raise ValueError("relative_path is not a repository path")
+        return value
+
+
+class DevelopDiff(BaseModel):
+    """The object the develop model fills. Exact replacements, not a git diff."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    summary: Summary
+    edits: list[SnippetEdit] = Field(min_length=1, max_length=DEVELOP_MAX_EDITS)
 
 
 class PatchProposal(BaseModel):

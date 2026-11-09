@@ -24,6 +24,7 @@ from patchpilot.llm.limits import (
     MAX_OLLAMA_HTTP_BODY_BYTES,
     normalize_model_name,
     normalize_ollama_base_url,
+    ollama_num_predict,
 )
 from patchpilot.llm.parsing import (
     parse_structured_output,
@@ -150,17 +151,15 @@ class OllamaProvider:
         options: GenerateOptions,
     ) -> str:
         schema_document = schema.model_json_schema()
+        system = (
+            "Reply with one JSON object that matches the schema. "
+            "Do not include prose or markdown.\n"
+            + json.dumps(schema_document, separators=(",", ":"), sort_keys=True)
+        )
         body = {
             "model": self._model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Reply with one JSON object that matches the schema. "
-                        "Do not include prose or markdown.\n"
-                        + json.dumps(schema_document, separators=(",", ":"), sort_keys=True)
-                    ),
-                },
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
@@ -168,7 +167,11 @@ class OllamaProvider:
             # discarded, and it can be larger than the body cap.
             "think": False,
             "format": schema_document,
-            "options": {"temperature": options.temperature},
+            "options": {
+                "temperature": options.temperature,
+                # Stop before the context window shifts and discards the JSON.
+                "num_predict": ollama_num_predict(len(system) + len(prompt)),
+            },
         }
         try:
             response = self._client.post(

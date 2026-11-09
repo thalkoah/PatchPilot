@@ -163,7 +163,7 @@ async def test_approve_survives_restart_and_a_repeated_decision(
             stop_runner(runner)
 
     assert [call.schema_name for call in provider.calls[calls:]] == [
-        "PatchProposal",
+        "DevelopDiff",
         "ReviewResult",
     ]
     done = client.get(f"/api/v1/tasks/{task_id}")
@@ -194,7 +194,8 @@ async def test_approve_survives_restart_and_a_repeated_decision(
     assert patch_body["checksum"] == patch_meta["checksum"]
     assert patch_body["proposal_checksum"] == patch_meta["proposal_checksum"]
     assert "diff --git a/src/demo_service/discounts.py" in patch_body["diff"]
-    assert patch_body["proposal"]["edits"]
+    assert patch_body["proposal"]["edits"] == []
+    assert patch_body["proposal"]["unified_diff"].startswith("diff --git ")
     assert patch_body["diff"] not in json.dumps(patch_body["proposal"])
     tests_meta = body["result_json"]["tests"]
     assert tests_meta["passed"] is True

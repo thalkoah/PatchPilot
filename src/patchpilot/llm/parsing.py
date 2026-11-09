@@ -44,11 +44,16 @@ def resolve_options(options: GenerateOptions | None) -> GenerateOptions:
 def parse_structured_output(content: str, schema: type[ModelT]) -> ModelT:
     """Validate model text. The raised error does not carry that text."""
 
-    if not isinstance(content, str) or len(content) > MAX_MODEL_CONTENT_CHARS:
-        raise LLMResponseError(f"{schema.__name__} rejected model output")
+    if not isinstance(content, str):
+        raise LLMResponseError(f"{schema.__name__} rejected model output", detail="not text")
+    if len(content) > MAX_MODEL_CONTENT_CHARS:
+        raise LLMResponseError(
+            f"{schema.__name__} rejected model output",
+            detail=f"{len(content)} characters",
+        )
     text = content.strip()
     if not text:
-        raise LLMResponseError(f"{schema.__name__} rejected model output")
+        raise LLMResponseError(f"{schema.__name__} rejected model output", detail="empty")
 
     detail = ""
     try:

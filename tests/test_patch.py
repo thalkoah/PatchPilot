@@ -11,15 +11,21 @@ import pytest
 
 from patchpilot.agents.developer import DeveloperAgent
 from patchpilot.llm.investigation import InvestigationReport
-from patchpilot.llm.patch import FileEdit, PatchProposal
+from patchpilot.llm.patch import DevelopDiff, FileEdit, PatchProposal, SnippetEdit
 from patchpilot.llm.plan import ChangePlan, ModificationKind, ProposedModification
 from patchpilot.patching.apply import apply_patch
 from patchpilot.patching.errors import PatchError
-from patchpilot.workflow.graph import SYNTAX_PATCH, WorkflowContext, develop_node
+from patchpilot.workflow.graph import (
+    MISMATCH_PATCH,
+    SYNTAX_PATCH,
+    WorkflowContext,
+    develop_node,
+)
 from patchpilot.workspace.git import prepare_isolated_workspace
 from patchpilot.workspace.layout import branch_name, clone_relative, worktree_relative
 
 SUMMARY = "Replace the constant and add a regression test."
+_MISMATCH_PROMPT = "The previous old text was not found once in the approved file."
 
 
 def test_clean_edit_applies_inside_the_worktree_only(tmp_path: Path):
@@ -201,6 +207,54 @@ def test_developer_retries_once_when_the_edit_does_not_parse(tmp_path: Path):
     assert original.strip() in provider.prompts[1]
 
 
+def test_a_unique_snippet_is_applied(tmp_path: Path):
+    _source, worktree = _worktree(tmp_path)
+    provider = _Proposals(_snippet("VALUE = 1\n", "VALUE = 2\n"))
+
+    outcome = DeveloperAgent(provider, worktree).run(
+        title="rename the service",
+        description="Change the constant.",
+        plan=_plan(),
+        report=_report(),
+    )
+
+    assert (worktree / "src/app.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert outcome.proposal.unified_diff.startswith("diff --git a/src/app.py b/src/app.py\n")
+    assert "Copy a unique span into old" in provider.prompts[0]
+    assert "copied verbatim from that file" in provider.prompts[0]
+    assert "old and new must be complete lines." in provider.prompts[0]
+    assert "Return one unified diff" not in provider.prompts[0]
+
+
+def test_a_missing_snippet_retries_once_then_fails(tmp_path: Path):
+    _source, worktree = _worktree(tmp_path)
+    missing = _snippet("MISSING = 1\n", "VALUE = 2\n")
+    provider = _Proposals(missing, missing)
+    update = _develop(worktree, provider)
+
+    assert update["status"] == "failed"
+    assert update["error"] == MISMATCH_PATCH
+    assert update["result_summary"] == MISMATCH_PATCH
+    assert (worktree / "src/app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert len(provider.prompts) == 2
+    assert _MISMATCH_PROMPT not in provider.prompts[0]
+    assert _MISMATCH_PROMPT in provider.prompts[1]
+
+
+def test_a_repeated_snippet_retries_once_then_fails(tmp_path: Path):
+    _source, worktree = _worktree(tmp_path, app_text="VALUE = 1\nVALUE = 1\n")
+    repeated = _snippet("VALUE = 1\n", "VALUE = 2\n")
+    provider = _Proposals(repeated, repeated)
+    update = _develop(worktree, provider)
+
+    assert update["status"] == "failed"
+    assert update["failed_stage"] == "develop"
+    assert update["error"] == MISMATCH_PATCH
+    assert (worktree / "src/app.py").read_text(encoding="utf-8") == "VALUE = 1\nVALUE = 1\n"
+    assert len(provider.prompts) == 2
+    assert _MISMATCH_PROMPT in provider.prompts[1]
+
+
 def test_a_second_unparsed_edit_fails_develop(tmp_path: Path):
     _source, worktree = _worktree(tmp_path)
     task_id = UUID(worktree.parent.name)
@@ -307,6 +361,49 @@ def test_a_symlink_is_not_a_writable_target(tmp_path: Path):
     assert outside.read_text(encoding="utf-8") == "OUTSIDE = 1\n"
     assert link.is_symlink()
     assert _snapshot(source) == _snapshot(source)
+
+
+def _snippet(old: str, new: str, path: str = "src/app.py") -> DevelopDiff:
+    return DevelopDiff(
+        summary=SUMMARY,
+        edits=[SnippetEdit(relative_path=path, old=old, new=new)],
+    )
+
+
+def _develop(worktree: Path, provider: object) -> dict[str, object]:
+    task_id = UUID(worktree.parent.name)
+    state = {
+        "task_id": str(task_id),
+        "title": "rename the service",
+        "description": "Change the constant.",
+        "plan": {"plan": _plan().model_dump(mode="json"), "rejected_paths": 0},
+        "investigation": {
+            "report": _report().model_dump(mode="json"),
+            "tool_calls": 1,
+            "rejected_citations": 0,
+        },
+        "approval": {
+            "kind": "plan",
+            "decision": "approve",
+            "approval_id": str(uuid4()),
+        },
+        "workspace": {
+            "base_sha": "a" * 40,
+            "branch": branch_name(task_id),
+            "clone_path": clone_relative(task_id),
+            "worktree_path": worktree_relative(task_id),
+        },
+        "repair_count": 0,
+    }
+    return develop_node(
+        state,  # type: ignore[arg-type]
+        SimpleNamespace(
+            context=WorkflowContext(
+                provider=provider,
+                workspace_root=worktree.parent.parent,
+            )
+        ),
+    )
 
 
 def _plan() -> ChangePlan:
