@@ -57,7 +57,7 @@ _ALLOWED_SUFFIXES = frozenset(
         ".yaml",
         ".yml",
         ".in",
-        ".html"
+        ".html",
     }
 )
 _ALLOWED_BARE_NAMES = frozenset(

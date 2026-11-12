@@ -109,8 +109,7 @@ def test_a_read_line_keeps_its_sentence_when_another_path_was_not_read():
     ledger.record_read("src/demo_service/app.py", 10)
     report = InvestigationReport(
         summary=(
-            "The title is set in src/demo_service/app.py. "
-            "README.md also contains the old name."
+            "The title is set in src/demo_service/app.py. README.md also contains the old name."
         ),
         evidence=[
             EvidenceCitation(relative_path="src/demo_service/app.py", start_line=7, end_line=7),

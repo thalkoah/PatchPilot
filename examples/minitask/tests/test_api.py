@@ -1,8 +1,7 @@
 from datetime import datetime
 
-from fastapi.testclient import TestClient
-
 from app.main import app
+from fastapi.testclient import TestClient
 
 
 def test_home_and_static_assets(client):
@@ -84,7 +83,13 @@ def test_invalid_payloads_rejected(client):
     for payload in bad_creates:
         assert client.post("/api/tasks", json=payload).status_code == 422
     task = client.post("/api/tasks", json={"title": "Valid"}).json()
-    for payload in [{}, {"status": None}, {"title": "   "}, {"description": None}, {"status": "not-real"}]:
+    for payload in [
+        {},
+        {"status": None},
+        {"title": "   "},
+        {"description": None},
+        {"status": "not-real"},
+    ]:
         assert client.patch(f"/api/tasks/{task['id']}", json=payload).status_code == 422
     assert client.get("/api/tasks").json() == [task]
 

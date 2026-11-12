@@ -104,9 +104,7 @@ class InvestigationReport(BaseModel):
             return value
         fitted = _summary_through_last_sentence(value, _SUMMARY_LIMIT)
         if fitted is None:
-            raise ValueError(
-                f"summary has no complete sentence within {_SUMMARY_LIMIT} characters"
-            )
+            raise ValueError(f"summary has no complete sentence within {_SUMMARY_LIMIT} characters")
         return fitted
 
 

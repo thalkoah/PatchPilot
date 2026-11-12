@@ -10,7 +10,6 @@ from fastapi.staticfiles import StaticFiles
 from app import database
 from app.models import Task, TaskCreate, TaskUpdate
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 

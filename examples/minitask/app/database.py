@@ -2,11 +2,10 @@
 
 import os
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterator
-
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "minitask.db"
 
@@ -16,7 +15,7 @@ def db_path() -> Path:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
 @contextmanager
@@ -53,9 +52,7 @@ def initialize() -> None:
 
 def list_tasks() -> list[dict]:
     with connect() as db:
-        rows = db.execute(
-            "SELECT * FROM tasks ORDER BY created_at DESC, id DESC"
-        ).fetchall()
+        rows = db.execute("SELECT * FROM tasks ORDER BY created_at DESC, id DESC").fetchall()
         return [dict(row) for row in rows]
 
 
@@ -86,9 +83,7 @@ def update_task(task_id: int, changes: dict) -> dict | None:
     assignments = ", ".join(f"{field} = ?" for field in changes)
     params = [*changes.values(), utc_now(), task_id]
     with connect() as db:
-        cursor = db.execute(
-            f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id = ?", params
-        )
+        cursor = db.execute(f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id = ?", params)
         if cursor.rowcount == 0:
             return None
         row = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
