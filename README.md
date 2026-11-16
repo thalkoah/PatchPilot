@@ -5,6 +5,8 @@ Local-first, human-supervised software maintenance. PostgreSQL stores bug-report
 
 <img width="1864" height="1630" alt="Kuvakaappaus_20261109_133321" src="https://github.com/user-attachments/assets/fba49cad-fe7a-43c7-9e05-f28f99e56d79" />
 
+Typical flow:
+
 <img width="1741" height="439" alt="Kuvakaappaus_20261116_104127" src="https://github.com/user-attachments/assets/e97fc60a-41db-4d15-ae32-ad669c1baaf9" />
 
 
