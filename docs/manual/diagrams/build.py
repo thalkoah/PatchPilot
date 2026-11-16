@@ -107,9 +107,7 @@ class Svg:
         tspans = []
         for i, line in enumerate(lines):
             dy = 0 if i == 0 else lead
-            tspans.append(
-                f'<tspan x="{x:.1f}" dy="{dy:.1f}">{_esc(line)}</tspan>'
-            )
+            tspans.append(f'<tspan x="{x:.1f}" dy="{dy:.1f}">{_esc(line)}</tspan>')
         self.parts.append(
             f'<text x="{x:.1f}" y="{start:.1f}" text-anchor="{anchor}" '
             f'font-family="Liberation Sans, Nimbus Sans, sans-serif" '
@@ -135,11 +133,7 @@ class Svg:
 
 
 def _esc(value: str) -> str:
-    return (
-        value.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def node(
@@ -185,14 +179,44 @@ def diamond(
 def system() -> None:
     s = Svg(880, 560)
     node(s, 24, 28, 168, 64, "Person", ["creates tasks, decides"], BLUE_F, BLUE_S)
-    node(s, 268, 18, 230, 84, "API and dashboard", ["127.0.0.1:8000", "database URL only"], BLUE_F, BLUE_S)
-    node(s, 572, 14, 284, 92, "PostgreSQL", ["tasks, events, approvals", "artifacts and checkpoints"], GRAY_F, GRAY_S)
+    node(
+        s,
+        268,
+        18,
+        230,
+        84,
+        "API and dashboard",
+        ["127.0.0.1:8000", "database URL only"],
+        BLUE_F,
+        BLUE_S,
+    )
+    node(
+        s,
+        572,
+        14,
+        284,
+        92,
+        "PostgreSQL",
+        ["tasks, events, approvals", "artifacts and checkpoints"],
+        GRAY_F,
+        GRAY_S,
+    )
     s.arrow([(192, 60), (268, 60)])
     s.label(230, 48, "HTTP")
     s.arrow([(498, 60), (572, 60)])
     s.label(535, 48, "read / write")
 
-    node(s, 292, 168, 250, 88, "Worker", ["one task at a time", "model key and GitHub token"], GREEN_F, GREEN_S)
+    node(
+        s,
+        292,
+        168,
+        250,
+        88,
+        "Worker",
+        ["one task at a time", "model key and GitHub token"],
+        GREEN_F,
+        GREEN_S,
+    )
     s.arrow([(714, 106), (714, 140), (500, 140), (500, 168)])
     s.label(600, 128, "claim, stage, lease")
 
@@ -202,11 +226,42 @@ def system() -> None:
         s.arrow([(x, 292), (x, 318)])
 
     node(s, 24, 318, 192, 86, "Checkouts", ["read-only mount", "worker only"], GRAY_F, GRAY_S)
-    node(s, 234, 318, 192, 86, "Private worktrees", ["bare clone, task branch", "not the registered .git"], GREEN_F, GREEN_S)
+    node(
+        s,
+        234,
+        318,
+        192,
+        86,
+        "Private worktrees",
+        ["bare clone, task branch", "not the registered .git"],
+        GREEN_F,
+        GREEN_S,
+    )
     node(s, 444, 318, 192, 86, "Host Ollama", ["optional", "no credentials sent"], BLUE_F, BLUE_S)
-    node(s, 654, 318, 202, 86, "GitHub API", ["second approval", "draft, never main"], AMBER_F, AMBER_S, dash="5 3")
+    node(
+        s,
+        654,
+        318,
+        202,
+        86,
+        "GitHub API",
+        ["second approval", "draft, never main"],
+        AMBER_F,
+        AMBER_S,
+        dash="5 3",
+    )
 
-    node(s, 234, 456, 192, 80, "Restricted runner", ["fixed pytest", "no network, no secrets"], AMBER_F, AMBER_S)
+    node(
+        s,
+        234,
+        456,
+        192,
+        80,
+        "Restricted runner",
+        ["fixed pytest", "no network, no secrets"],
+        AMBER_F,
+        AMBER_S,
+    )
     s.arrow([(330, 404), (330, 456)])
     s.label(392, 430, "job id only")
     s.save("system.svg")
@@ -216,11 +271,25 @@ def submodels() -> None:
     s = Svg(880, 592)
     s.rect(16, 14, 412, 78, BLUE_F, BLUE_S, rx=8)
     s.text(222, 38, ["qwen3.5:4b"], size=16, weight="700", fill=BLUE_S)
-    s.text(222, 60, ["one shared client  ·  triage, plan, supervisor"], size=11, weight="500", fill=MUTED)
+    s.text(
+        222,
+        60,
+        ["one shared client  ·  triage, plan, supervisor"],
+        size=11,
+        weight="500",
+        fill=MUTED,
+    )
 
     s.rect(452, 14, 412, 78, GREEN_F, GREEN_S, rx=8)
     s.text(658, 38, ["qwen2.5-coder:7b"], size=16, weight="700", fill=GREEN_S)
-    s.text(658, 60, ["one shared client  ·  investigate, develop, review"], size=11, weight="500", fill=MUTED)
+    s.text(
+        658,
+        60,
+        ["one shared client  ·  investigate, develop, review"],
+        size=11,
+        weight="500",
+        fill=MUTED,
+    )
 
     stages = [
         (28, "triage", "TriageResult", "stored on the task", BLUE_F, BLUE_S, 222),
@@ -239,7 +308,14 @@ def submodels() -> None:
         node(s, x, 310, 120, 64, "checker", [check], AMBER_F, AMBER_S)
 
     s.rect(16, 408, 848, 168, GRAY_F, GRAY_S, rx=8)
-    s.text(440, 432, ["Same graph, no model call. Each returns to the supervisor."], size=13, weight="700", fill=GRAY_S)
+    s.text(
+        440,
+        432,
+        ["Same graph, no model call. Each returns to the supervisor."],
+        size=13,
+        weight="700",
+        fill=GRAY_S,
+    )
     quiet = [
         (36, "plan approval", "interrupt, then a person"),
         (206, "workspace", "private clone"),
@@ -249,7 +325,14 @@ def submodels() -> None:
     ]
     for x, title, sub in quiet:
         node(s, x, 456, 150, 64, title, [sub], WHITE, GRAY_S)
-    s.text(440, 548, ["The supervisor names the next node. These five do not call a model."], size=11, weight="500", fill=MUTED)
+    s.text(
+        440,
+        548,
+        ["The supervisor names the next node. These five do not call a model."],
+        size=11,
+        weight="500",
+        fill=MUTED,
+    )
     s.save("submodels.svg")
 
 
@@ -288,18 +371,6 @@ def pipeline() -> None:
 
 def call_flow() -> None:
     s = Svg(880, 300)
-    boxes = [
-        (16, "Stage", "schema"),
-        (128, "Capability", "structured?"),
-        (240, "Circuit", "two failures?"),
-        (352, "Budget", "calls, tokens,"),
-        (464, "Local lock", "Ollama only"),
-        (576, "Provider", "Ollama or API"),
-        (688, "Validate", "Pydantic"),
-        (800, "Usage row", "no prompt text"),
-    ]
-    # last box would overflow 880 if width 100 at x=800. Recalculate.
-    s.parts.clear()
     xs = [12, 122, 232, 342, 452, 562, 672, 782]
     labels = [
         ("Stage", "asks for schema"),
@@ -323,7 +394,17 @@ def call_flow() -> None:
     for x, word in stops:
         s.arrow([(x + 48, 94), (x + 48, 150)])
         node(s, x, 150, 96, 52, "stop", [word], RED_F, RED_S)
-    s.text(440, 250, ["A stop is recorded and the provider is not called. Invalid JSON retries, then opens the circuit."], size=12, weight="500", fill=MUTED)
+    s.text(
+        440,
+        250,
+        [
+            "A stop is recorded and the provider is not called. "
+            "Invalid JSON retries, then opens the circuit."
+        ],
+        size=12,
+        weight="500",
+        fill=MUTED,
+    )
     s.save("call.svg")
 
 
@@ -380,7 +461,14 @@ def flow_front() -> None:
     s.arrow([(mid, y + 64), (mid, y + 100)])
     s.label(mid + 16, y + 84, "yes")
     s.rect(cx + 15, y + 100, 200, 36, GREEN_F, GREEN_S, rx=8)
-    s.text(mid, y + 119, ["continues in figure: after approval"], size=11, weight="600", fill=GREEN_S)
+    s.text(
+        mid,
+        y + 119,
+        ["continues in figure: after approval"],
+        size=11,
+        weight="600",
+        fill=GREEN_S,
+    )
     s.save("flow-front.svg")
 
 
