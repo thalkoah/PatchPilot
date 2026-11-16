@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="300" viewBox="0 0 880 300">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<rect x="12.0" y="24.0" width="96.0" height="70.0" rx="7" fill="#e7eef6" stroke="#2c4a6e" stroke-width="1.6"/>
+<text x="60.0" y="52.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="60.0" dy="0.0">Stage</tspan></text>
+<text x="60.0" y="70.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="60.0" dy="0.0">asks for schema</tspan></text>
+<rect x="122.0" y="24.0" width="96.0" height="70.0" rx="7" fill="#e7eef6" stroke="#2c4a6e" stroke-width="1.6"/>
+<text x="170.0" y="52.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="170.0" dy="0.0">Capability</tspan></text>
+<text x="170.0" y="70.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="170.0" dy="0.0">advertised?</tspan></text>
+<path d="M 108.0 59.0 L 114.0 59.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="122.0,59.0 114.0,62.8 114.0,55.2" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="232.0" y="24.0" width="96.0" height="70.0" rx="7" fill="#e7eef6" stroke="#2c4a6e" stroke-width="1.6"/>
+<text x="280.0" y="52.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="280.0" dy="0.0">Circuit</tspan></text>
+<text x="280.0" y="70.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="280.0" dy="0.0">already open?</tspan></text>
+<path d="M 218.0 59.0 L 224.0 59.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="232.0,59.0 224.0,62.8 224.0,55.2" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="342.0" y="24.0" width="96.0" height="70.0" rx="7" fill="#e7eef6" stroke="#2c4a6e" stroke-width="1.6"/>
+<text x="390.0" y="52.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="390.0" dy="0.0">Budget</tspan></text>
+<text x="390.0" y="70.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="390.0" dy="0.0">room left?</tspan></text>
+<path d="M 328.0 59.0 L 334.0 59.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="342.0,59.0 334.0,62.8 334.0,55.2" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="452.0" y="24.0" width="96.0" height="70.0" rx="7" fill="#e7eef6" stroke="#2c4a6e" stroke-width="1.6"/>
+<text x="500.0" y="52.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="500.0" dy="0.0">Local lock</tspan></text>
+<text x="500.0" y="70.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="500.0" dy="0.0">Ollama only</tspan></text>
+<path d="M 438.0 59.0 L 444.0 59.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="452.0,59.0 444.0,62.8 444.0,55.2" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="562.0" y="24.0" width="96.0" height="70.0" rx="7" fill="#e7f2ea" stroke="#1f5c38" stroke-width="1.6"/>
+<text x="610.0" y="52.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="610.0" dy="0.0">Provider</tspan></text>
+<text x="610.0" y="70.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="610.0" dy="0.0">HTTP call</tspan></text>
+<path d="M 548.0 59.0 L 554.0 59.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="562.0,59.0 554.0,62.8 554.0,55.2" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="672.0" y="24.0" width="96.0" height="70.0" rx="7" fill="#e7f2ea" stroke="#1f5c38" stroke-width="1.6"/>
+<text x="720.0" y="52.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="720.0" dy="0.0">Validate</tspan></text>
+<text x="720.0" y="70.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="720.0" dy="0.0">Pydantic</tspan></text>
+<path d="M 658.0 59.0 L 664.0 59.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="672.0,59.0 664.0,62.8 664.0,55.2" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="782.0" y="24.0" width="96.0" height="70.0" rx="7" fill="#f4f6f8" stroke="#5c6b7a" stroke-width="1.6"/>
+<text x="830.0" y="52.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="830.0" dy="0.0">Usage row</tspan></text>
+<text x="830.0" y="70.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="830.0" dy="0.0">tokens, cost</tspan></text>
+<path d="M 768.0 59.0 L 774.0 59.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="782.0,59.0 774.0,62.8 774.0,55.2" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<path d="M 170.0 94.0 L 170.0 142.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="170.0,150.0 166.2,142.0 173.8,142.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="122.0" y="150.0" width="96.0" height="52.0" rx="7" fill="#f8ecec" stroke="#8a3030" stroke-width="1.6"/>
+<text x="170.0" y="169.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="170.0" dy="0.0">stop</tspan></text>
+<text x="170.0" y="187.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="170.0" dy="0.0">missing</tspan></text>
+<path d="M 280.0 94.0 L 280.0 142.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="280.0,150.0 276.2,142.0 283.8,142.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="232.0" y="150.0" width="96.0" height="52.0" rx="7" fill="#f8ecec" stroke="#8a3030" stroke-width="1.6"/>
+<text x="280.0" y="169.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="280.0" dy="0.0">stop</tspan></text>
+<text x="280.0" y="187.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="280.0" dy="0.0">open</tspan></text>
+<path d="M 390.0 94.0 L 390.0 142.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="390.0,150.0 386.2,142.0 393.8,142.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="342.0" y="150.0" width="96.0" height="52.0" rx="7" fill="#f8ecec" stroke="#8a3030" stroke-width="1.6"/>
+<text x="390.0" y="169.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="390.0" dy="0.0">stop</tspan></text>
+<text x="390.0" y="187.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="390.0" dy="0.0">exhausted</tspan></text>
+<text x="440.0" y="250.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="12" font-weight="500" fill="#3d4c5c"><tspan x="440.0" dy="0.0">A stop is recorded and the provider is not called. Invalid JSON retries, then opens the circuit.</tspan></text>
+</svg>

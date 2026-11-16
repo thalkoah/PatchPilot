@@ -1,14 +1,34 @@
 # PatchPilot
 
-Local-first, human-supervised software maintenance. PostgreSQL stores bug-report tasks. FastAPI creates and reads them. A separate worker claims each queued task and runs a LangGraph triage workflow. Model calls go through `generate_structured` and stay out of the API.
+Local-first, human-supervised software maintenance, version 0.1.0. PostgreSQL stores bug-report tasks. FastAPI creates and reads them. A separate worker claims each queued task and runs a LangGraph workflow. Model calls go through `generate_structured` and stay out of the API. A person approves a plan before any edit, and approves again before a task branch can be pushed. Nothing in the loop merges a pull request or deploys.
 
+The model, the bug report, and the text inside a registered repository are untrusted, including comments that tell the model to ignore its instructions. The person who starts Compose is the administrator. The API listens on localhost and has no authentication.
 
-<img width="1864" height="1630" alt="Kuvakaappaus_20261109_133321" src="https://github.com/user-attachments/assets/fba49cad-fe7a-43c7-9e05-f28f99e56d79" />
+![Processes and mounts. The worker is the only process with model settings and, when publication is on, the GitHub token. The dashed GitHub box stays unused until that second approval. The runner receives a job id and nothing else.](docs/manual/diagrams/system.svg)
 
+Four processes share one database and a set of volumes. The API can create tasks and record decisions. It is not given a model key or a GitHub token. The worker is the only process that receives model settings and, when publication is enabled, the token. The runner exits if its environment already contains a secret. Pytest then inherits a shorter allowlist.
 
-## Typical flow:
+| Volume or mount | Seen by | What is written |
+| --- | --- | --- |
+| `pgdata` | API, worker | Business rows and LangGraph checkpoints. The runner has no database URL. |
+| `artifacts` | API, worker | Plan, proposal, applied diff, test report, and review. The API reads them and does not show filesystem paths. |
+| `workspaces` | Worker | A bare clone and a worktree per task. The API does not receive this mount. |
+| Runner volume | Worker writes the request. Runner writes the result. | A copy of one worktree, a job file that contains only a job id, and a result file. |
+| `REPOSITORY_ROOT` | Worker, read-only | Registered checkouts, mounted on `/repositories` with `:ro,Z`. |
 
-<img width="1741" height="439" alt="Kuvakaappaus_20261116_104127" src="https://github.com/user-attachments/assets/e97fc60a-41db-4d15-ae32-ad669c1baaf9" />
+The runner volume is one tree for every job, so worker concurrency stays 1. A Postgres advisory lock also gives local Ollama calls one shared slot across workers. Named volumes survive `docker compose down`. `docker compose down -v` deletes them.
+
+## Typical flow
+
+A task with no repository finalizes after triage. A task with a repository is investigated, then planned. A "no" branch leaves the registered checkout untouched. Investigate runs a second time only when no Python line was cited. Plan runs a second time only when every proposed path was forbidden.
+
+![From the bug report to plan approval.](docs/manual/diagrams/flow-front.svg)
+
+After approval, pytest runs on the unmodified worktree before the developer writes anything. The same `test` node serves both passes. With no patch it stores a baseline report. With a patch it stores the patched report under a new job id. Policy can accept a suite that only repeats pytest `FAILED` or `ERROR` node ids already present in the baseline. A new node id, a timeout, truncated output, or an empty failure list counts as a new failure. A repair returns to develop at most twice. Publication, when it is configured, is a second interrupt. Rejecting it finishes the local task and does not call GitHub.
+
+![After approval. The baseline test runs before any patch. Repair is capped at two. Publication is a second interrupt.](docs/manual/diagrams/flow-back.svg)
+
+`investigate_more` and `replan` are further trips through `investigate` and `plan`. `MAX_INVESTIGATIONS` and `MAX_PLANS` are both 2, counting the first pass. The repair cap is 2 and cannot be raised by a setting. The graph stops after 24 supervisor decisions, after the supervisor deadline (default 2700 seconds from the first decision, hard maximum 3600), or at LangGraph's recursion limit of 40.
 
 
 ## Prerequisites
@@ -68,7 +88,7 @@ Podman reads the same `compose.yaml`. When the Docker CLI is absent, use `podman
 
 Stop the stack with `docker compose down`. Named volumes `pgdata`, `artifacts`, and `workspaces` stay, so tasks, plans, and private worktrees are still there after the API and worker restart. `docker compose down -v` deletes those volumes. Compose rotates each service log at 10 MB and keeps three files.
 
-A five-minute walkthrough is in `docs/DEMO.md`. The runtime picture is in `docs/ARCHITECTURE.md`. The decisions behind the worker, the graph, PostgreSQL checkpoints, deterministic routing, and the restricted runner are in `docs/adr/`.
+A five-minute walkthrough is in `docs/DEMO.md`. A shorter runtime note is in `docs/ARCHITECTURE.md`. The printable manual is `docs/PatchPilot.pdf` (source `docs/manual/manual.typ`): the same diagrams as this file, how each stage is checked, the problems the implementation had to solve, and the limits still in force for 0.1.0. The SVGs are `docs/manual/diagrams/*.svg`, drawn by `docs/manual/diagrams/build.py`. The decisions behind the worker, the graph, PostgreSQL checkpoints, deterministic routing, and the restricted runner are in `docs/adr/`. `docs/progress.md` is the build log, including limits that later work removed.
 
 ## Task API
 
@@ -158,7 +178,20 @@ The layout is one column on a narrow screen. Database URLs, bearer tokens, `sk-`
 
 ## Triage workflow
 
-The worker runs a LangGraph `StateGraph`. Every specialist node returns to `supervisor`, which chooses the next node. The choice is a deterministic rule. Set `SUPERVISOR_MODEL=true` to also ask the configured model for a recommendation. The model result is schema-validated, and a route the rules did not allow is ignored. The model cannot approve a plan, write a file, or raise a limit. A task with no `repo_id` is finalized after triage. A task with a `repo_id` is investigated, then planned. An investigation that cited no line may run once more. A plan whose paths are all forbidden may be replanned once. A plan that declines continues to `finalize`. A plan that names a code change continues to `request_plan_approval`, which calls `interrupt()` and does not write the checkout. The graph stops after 24 supervisor decisions, after 2700 seconds, or at LangGraph's recursion limit of 40. The graph is compiled with the async Postgres checkpointer from `langgraph-checkpoint-postgres`. The LangGraph `thread_id` is the task UUID, with no extra prefix. Each finished node is stored before the next node starts (`durability="sync"`).
+What each stage hands to the next. The upper row stops at a person. The lower row starts only after that approval, and only inside the private worktree. Policy, not the review model, chooses accept, repair, or failure.
+
+![Typed objects with narrowing permissions. Approval is the gate between the two rows.](docs/manual/diagrams/pipeline.svg)
+
+| Object | May influence | Must not |
+| --- | --- | --- |
+| `TriageResult` | Whether a repository task continues, and the text later prompts quote. | Name a path, write a file, or set `can_proceed`. |
+| `InvestigationReport` | Which lines count as evidence, and therefore which existing `.py` files the planner may treat as supported. | Cite a line that was not read. A search hit is not a read. |
+| `ChangePlan` | The path allowlist for the later patch, the problem statement, and whether approval is offered. | Write the checkout. `can_proceed` is recomputed after the path filter. |
+| `DevelopDiff` | One to three exact line-oriented replacements on approved paths. | Return a unified diff or a full file, choose a shell command, or touch a path the plan did not keep. |
+| `ReviewResult` | Findings and a recommendation of accept, repair, or escalate. | Accept a suite by itself. Policy can repair a passing recommendation, and it can refuse a repair. |
+| `SupervisorRecommendation` | At most a choice between routes the rule already listed. | Approve a plan, write a file, raise a budget, or skip a node. |
+
+The worker runs a LangGraph `StateGraph`. Every specialist node returns to `supervisor`, which chooses the next node. The choice is a deterministic rule. Set `SUPERVISOR_MODEL=true` to also ask the configured model for a recommendation. The model result is schema-validated, and a route the rules did not allow is ignored. The model cannot approve a plan, write a file, or raise a limit. Most decisions have an allowed set of one route, so the model cannot move them. Two decisions have a real choice: a plan whose paths were all forbidden may be replanned or finalized, and a repair that is still inside the cap may be repaired or escalated. The model's own reason text is not stored. A task with no `repo_id` is finalized after triage. A task with a `repo_id` is investigated, then planned. An investigation that cited no line may run once more. A plan whose paths are all forbidden may be replanned once. A plan that declines continues to `finalize`. A plan that names a code change continues to `request_plan_approval`, which calls `interrupt()` and does not write the checkout. The graph stops after 24 supervisor decisions, after 2700 seconds, or at LangGraph's recursion limit of 40. The graph is compiled with the async Postgres checkpointer from `langgraph-checkpoint-postgres`. The LangGraph `thread_id` is the task UUID, with no extra prefix. Each finished node is stored before the next node starts (`durability="sync"`).
 
 Checkpoint tables live in the same PostgreSQL database and stay out of Alembic. `AsyncPostgresSaver.setup()` creates `checkpoint_migrations`, `checkpoints`, `checkpoint_blobs`, and `checkpoint_writes`. The business result stays on `tasks`: status, stage, `result_summary`, and `result_json`.
 
@@ -184,13 +217,13 @@ A plan that finishes, including one that is waiting for approval, is stored as a
 
 `request_plan_approval` pauses the thread. The worker writes one `approvals` row, sets the task to `waiting_approval`, records `approval_requested`, and ends the lease so the task is not claimed again. `GET /api/v1/tasks/{id}/approvals` lists those rows. `POST /api/v1/tasks/{id}/decisions` accepts `approval_id`, `decision` (`approve` or `reject`), and an optional `reason`. The same decision again returns the stored row and does not queue another run. A different decision is HTTP 409. A new decision sets the task back to `queued` and writes `approval_decided`. The next worker claim resumes the same `thread_id` with `Command(resume=...)`.
 
-Nothing in that pause writes the registered checkout. After an approval, `prepare_workspace` makes a private bare clone under `WORKSPACE_ROOT` and adds a worktree on `patchpilot/<task-id>` at the source HEAD. Git writes the worktree metadata into that clone, not into the registered `.git`. Creating the workspace does not fetch or push. The `workspaces` row stores the base commit, the branch, and the relative clone and worktree paths. Those paths are derived from the task id. `result_json` stores the base commit and the branch, not a host path. Compose mounts a `workspaces` volume on the worker at `/workspaces`. The API does not receive it. Rejection and a declined plan do not create a workspace. Rejection becomes terminal `rejected` with the reason, or `The plan was rejected.` when no reason was sent, and writes `task_rejected`. A declined plan never opens an approval. It completes at `finalize`.
+Nothing in that pause writes the registered checkout. After an approval, `prepare_workspace` makes a private bare clone under `WORKSPACE_ROOT` and adds a worktree on `patchpilot/<task-id>` at the source HEAD. The supervisor then runs pytest on that unmodified worktree and stores a baseline report before any patch is written. Git writes the worktree metadata into that clone, not into the registered `.git`. Creating the workspace does not fetch or push. The `workspaces` row stores the base commit, the branch, and the relative clone and worktree paths. Those paths are derived from the task id. `result_json` stores the base commit and the branch, not a host path. Compose mounts a `workspaces` volume on the worker at `/workspaces`. The API does not receive it. Rejection and a declined plan do not create a workspace. Rejection becomes terminal `rejected` with the reason, or `The plan was rejected.` when no reason was sent, and writes `task_rejected`. A declined plan never opens an approval. It completes at `finalize`.
 
-`develop` runs only after that worktree exists. It asks for a few exact text replacements, renders those as one unified diff, stores that as a `PatchProposal`, then calls `apply_patch`. Each replacement has to fit the response cap, so the model is not asked for a full file or a git diff. The tool accepts a path only when it is in the approved plan and is still an existing `.py` file or a new `tests/test_*.py` file. Symlinks, secrets, `.git`, CI workflows, Docker files, dependency manifests, traversal, binary bytes, a stale base hash, and a diff larger than 16384 bytes are refused. `git apply --check` runs before `git apply`. There is no shell. The model proposal and the applied diff are stored as separate artifacts, `proposal` and `diff`, with different sha256 values. `GET /api/v1/tasks/{id}/patch` returns both. `result_json` keeps the checksums and the paths, not the diff text. The registered checkout is not modified.
+`develop` runs only after that worktree exists and the baseline report is stored. It asks for one to three exact text replacements, renders those as one unified diff, stores that as a `PatchProposal`, then calls `apply_patch`. Each replacement has to fit the response cap, so the model is not asked for a full file or a git diff. The tool accepts a path only when it is in the approved plan and is still an existing `.py` file or a new `tests/test_*.py` file. Symlinks, secrets, `.git`, CI workflows, Docker files, dependency manifests, traversal, binary bytes, a stale base hash, and a diff larger than 16384 bytes are refused. `git apply --check` runs before `git apply`. There is no shell. The model proposal and the applied diff are stored as separate artifacts, `proposal` and `diff`, with different sha256 values. `GET /api/v1/tasks/{id}/patch` returns both. `result_json` keeps the checksums and the paths, not the diff text. The registered checkout is not modified.
 
-`test` runs only after that patch. The worker copies the private worktree into `RUNNER_ROOT` and writes a request that contains a job id and nothing else. A separate `runner` Compose service reads that file and runs one fixed `pytest` command in that job directory. The model cannot choose the executable or the arguments. The worker waits for the result file and does not start pytest itself. Compose runs the runner as uid 1000 with `network_mode: none`, a read-only root, a writable `/runner` volume and `/tmp`, dropped capabilities, `no-new-privileges`, and CPU, memory, PID, and time limits. The runner process is not given the database password or model settings. The shared volume is one tree for every job, which is weaker isolation than a fresh mount per task, so worker concurrency stays 1. A passing, failing, or timed-out pytest is stored as a `test-report` artifact. `GET /api/v1/tasks/{id}/tests` returns the exit code and the bounded output. `result_json` keeps the status and the checksum, not the output. If the runner never writes a result, the task fails at stage `test` and the registered checkout is still unchanged. A later repair publishes a new job id, so the suite runs again. Resuming the same pass reuses the result file that is already there.
+`test` runs twice on a repository task, through the same node. If `patch` is absent, the node writes `baseline_tests` and sets the phase to `baseline`. If a patch is present, it writes `tests` and sets the phase to `test`. The baseline job id is a UUID v5 of the task id plus `:baseline`. The first patched pass uses the task id. Each repair uses a UUID v5 of the task id plus the repair count. Resuming the same pass reuses the result file and does not ask the runner to execute pytest again. The worker copies the private worktree into `RUNNER_ROOT` and writes a request that contains a job id and nothing else. A separate `runner` Compose service reads that file and runs one fixed `pytest` command in that job directory. The model cannot choose the executable or the arguments. The worker waits for the result file and does not start pytest itself. Compose runs the runner as uid 1000 with `network_mode: none`, a read-only root, a writable `/runner` volume and `/tmp`, dropped capabilities, `no-new-privileges`, and CPU, memory, PID, and time limits. The runner process is not given the database password or model settings. The shared volume is one tree for every job, which is weaker isolation than a fresh mount per task, so worker concurrency stays 1. A passing, failing, or timed-out pytest is stored as a `test-report` artifact. `GET /api/v1/tasks/{id}/tests` returns the exit code and the bounded output. `result_json` keeps the status and the checksum, not the output. If the runner never writes a result, the task fails at stage `test` and the registered checkout is still unchanged.
 
-`review` runs after a stored test report. The reviewer sees the approved plan, the applied diff, the investigation citations, and the test report. It returns findings, a severity, evidence, and one action: `accept`, `repair`, or `escalate`. It has no file tool. Evidence that names a path absent from the diff, the test output, and the citations is omitted. Policy then decides. A passing suite, an allowed diff, no critical finding, and an accept recommendation finish the task. A failing suite, a repair request, or a critical repair request goes back through `develop` and `test` at most twice. Each repair writes a `repair` event with the reason. Escalation, a diff outside the approved paths, a critical finding the reviewer did not ask to repair, and a third request all end as status `failed` at stage `review`, with a summary that a person needs to intervene. The model proposal, the applied diff, and the review are separate artifacts. `GET /api/v1/tasks/{id}/review` returns the verdict and the policy decision, not the diff. `result_json.review` keeps the action, the policy, the repair count, and the checksum.
+`review` runs after a stored test report. The reviewer sees the approved plan, the applied diff, the investigation citations, and the test report. It returns findings, a severity, evidence, and one action: `accept`, `repair`, or `escalate`. It has no file tool. Evidence that names a path absent from the diff, the test output, and the citations is omitted. Policy then decides. A passing suite, an allowed diff, no critical finding, and an accept recommendation finish the task. A suite that only repeats failures already present in the baseline can also be accepted, and only when every finding's evidence is in the baseline output and not in the diff. A failing suite, a repair request, or a critical repair request goes back through `develop` and `test` at most twice. Each repair writes a `repair` event with the reason. Escalation, a diff outside the approved paths, a critical finding the reviewer did not ask to repair, and a third request all end as status `failed` at stage `review`, with a summary that a person needs to intervene. The model proposal, the applied diff, and the review are separate artifacts. `GET /api/v1/tasks/{id}/review` returns the verdict and the policy decision, not the diff. `result_json.review` keeps the action, the policy, the repair count, and the checksum.
 
 Publication is off unless `GITHUB_ENABLED=true`. The worker is the only process that receives `GITHUB_TOKEN`. The API and the runner do not. A token is used only for an `owner/name` that is both stored on the registered checkout (`python -m patchpilot.source register --github owner/name`) and listed in `GITHUB_ALLOWED_REPOS`. After policy accepts a patch, the graph pauses a second time. Nothing is pushed while that approval is pending. Approving it pushes only `patchpilot/<task-id>`, never the default branch, and opens a draft pull request. The body contains the issue, the plan's reasoning, a compare link, the test result, and a machine-generated disclosure. Rejecting it finishes the local task and does not call GitHub. A retry reuses the existing draft instead of opening another. There is no merge and no deploy. The main demo leaves these settings unset.
 
@@ -228,7 +261,13 @@ uv run python scripts/check_workflow.py --api-url http://127.0.0.1:8000 --timeou
 
 ## Language model
 
-`generate_structured(prompt, schema, options)` is the model call. `TriageResult` carries classification, severity, a short summary, acceptance criteria, confidence, and `needs_clarification`. `FakeProvider` returns deterministic fixtures. `OllamaProvider` posts to Ollama `/api/chat` with `stream` false and the JSON schema in `format`. Pydantic validates every response. Invalid JSON and timeouts retry at most `LLM_MAX_RETRIES` extra times (0–3, default 2). The next failure raises `LLMResponseError` or `LLMTimeoutError`. Those messages omit the model text.
+Six stages can call a model. Classification stages share one client. Code stages share another. A stage set to `fake` or `openai` does not use these Ollama tags. Under each stage is the schema it must return, then the checker that runs after validation. Plan approval, the workspace, both test passes, publish approval, publish, and finalize are in the same graph and do not call `generate_structured`.
+
+![Default composition. `qwen3.5:4b` serves triage, plan, and supervisor. `qwen2.5-coder:7b` serves investigate, develop, and review.](docs/manual/diagrams/submodels.svg)
+
+![One structured call. Capability, circuit, and budget can stop the call before any HTTP request. The local lock is taken only for Ollama. The usage row stores provider, model, latency, reported tokens, and outcome, not the prompt.](docs/manual/diagrams/call.svg)
+
+`generate_structured(prompt, schema, options)` is the model call. The graph does not talk to Ollama itself. `StageModels.for_stage` returns a small provider that looks up that stage's choice and then runs the call inside `CallMeter`. Providers are built once per `(provider, model)` pair, so triage and plan share one Ollama client when they name the same tag. A cloud client is constructed only for a stage that selects `openai`. `TriageResult` carries classification, severity, a short summary, acceptance criteria, confidence, and `needs_clarification`. `FakeProvider` returns deterministic fixtures. `OllamaProvider` posts to Ollama `/api/chat` with `stream` false and the JSON schema in `format`. Pydantic validates every response. Invalid JSON and timeouts retry at most `LLM_MAX_RETRIES` extra times (0–3, default 2). The next failure raises `LLMResponseError` or `LLMTimeoutError`. Those messages omit the model text.
 
 The worker defaults to local Ollama. `triage`, `plan`, and `supervisor` use `qwen3.5:4b`. `investigate`, `develop`, and `review` use `qwen2.5-coder:7b`. pytest and CI set `LLM_PROVIDER=fake` and leave `LLM_STAGE_MODELS` empty, which keeps those runs offline.
 
@@ -291,38 +330,48 @@ uv run python -m patchpilot.benchmark --provider ollama --database-url "$DATABAS
 
 That command needs Ollama on the configured base URL. It is not part of `uv run pytest`.
 
-## Screenshots
-
-These files are not in the repository yet. Capture them from a live demo and keep the names:
-
-- `docs/screenshots/01-task-list.png` — task list and the create form
-- `docs/screenshots/02-waiting-approval.png` — plan waiting for a decision
-- `docs/screenshots/03-diff-and-tests.png` — applied diff, pytest report, and review
-
 ## Cost limits
 
-A task stops when it exceeds one of these ceilings. The defaults are also the values in `.env.example`.
+A task stops when it exceeds one of these ceilings. The defaults are also the values in `.env.example`. Hard maxima are rejected when settings load.
 
 | Limit | Default | Hard maximum |
 | --- | --- | --- |
 | Model calls | 24 | 48 |
 | Tool calls | 12 | 24 |
 | Reported tokens | 100000 | 500000 |
-| Runtime | 900 seconds | 3600 seconds |
+| Task runtime | 900 seconds | 3600 seconds |
+| Supervisor deadline | 2700 seconds | 3600 seconds |
+| Supervisor steps | 24 | 24 |
+| Graph recursion | 40 | 40 |
 | Parallelism | 1 | 1 |
 | Repairs | 2 | 2 |
+| Investigations | 2 | 2 |
+| Plans | 2 | 2 |
+| LLM attempt timeout | 1800 seconds | 1800 seconds |
+| Diff bytes | 16384 | 16384 |
+
+These clocks are not one budget. The task runtime is the workflow's wallet and defaults to 900 seconds. One Ollama attempt may wait 1800 seconds, so a cold model can exhaust the task budget inside a single call. The supervisor deadline starts at the first routing decision and defaults to 2700 seconds. Retries add further attempts. Model-call counts are seeded from `model_calls` on resume. A second investigation spends a fresh tool budget.
 
 Tokens count only when the provider reports them. Cost is `unknown` unless `LLM_PRICING_PATH` points at a local JSON file that marks that exact model `verified`. A price is never invented. Cloud calls stay off unless `LLM_CLOUD_ENABLED=true` and a base URL, API key, and capability list are set. `GET /api/v1/tasks/{id}/usage` reads the stored rows and does not call a model.
 
 ## Limitations
 
-- The API listens on localhost and has no authentication. Do not publish port 8000.
-- `FakeProvider` makes the automated demo and the benchmark deterministic. Those scores measure this repository's fixtures. They are not an industry benchmark and they are not SWE-bench.
+Version 0.1.0. The longer list, including the sharp edges inside the rules, is in `docs/PatchPilot.pdf`.
+
+- The API listens on localhost and has no authentication. Do not publish port 8000. Anyone who can open that port can create tasks and record decisions.
+- Patches are Python. An existing change must be a `.py` file. A new file must be `tests/test_*.py` under a `tests` directory that already exists. Docker files, CI workflows, and dependency manifests are refused even when the bug is in them.
+- The only executed check is one fixed pytest command. The model cannot select a runner, a file, or an argument. A repository whose tests are not pytest does not get a meaningful signal.
+- `FakeProvider` makes the automated demo and the benchmark deterministic. Those scores measure this repository's fixtures. They are not an industry benchmark and they are not SWE-bench. The live-model benchmark skips the faults only the fixtures can force.
 - The runner volume is shared by every job. That is weaker isolation than a fresh mount per task, so worker concurrency stays 1.
-- Publication is off unless you set `GITHUB_ENABLED`, a token, an allowlist entry, and `registration.github` for a repository you own. There is no merge and no deploy.
-- Checkpoint tables come from `AsyncPostgresSaver.setup()`, not from Alembic.
+- Publication is off unless you set `GITHUB_ENABLED`, a token, an allowlist entry, and `registration.github` for a repository you own. There is no merge and no deploy. A live call to `api.github.com` is an operator action and is not part of the default demo.
+- Uncommitted files in the registered checkout are not copied. The worktree is the committed HEAD. A successful worktree stays on the volume until something calls retire. A failed patch or a failed review deletes that task's directory.
+- The dashboard cannot register a repository, edit a plan, or edit a diff. Registration is a shell command. Decisions are approve or reject, and those buttons need JavaScript.
+- Dashboard redaction does not strip a configured secret shorter than eight characters from free text. Connection strings, bearer tokens, `sk-` keys, and longer configured secrets are still removed.
+- Checkpoint tables come from `AsyncPostgresSaver.setup()`, not from Alembic. Running only `alembic upgrade head` does not create the graph store.
 - A hard link inside a checkout is refused. The operator who registers a repository is still trusted to point `REPOSITORY_ROOT` at the intended tree.
-- Host Ollama is optional. Compose leaves the provider on `fake`. Binding Ollama beyond loopback is a separate choice and is described above.
+- Default local tags are `qwen3.5:4b` and `qwen2.5-coder:7b`. Compose uses that split unless you override it. Pytest and CI set `LLM_PROVIDER=fake` and leave `LLM_STAGE_MODELS` empty. Native tool calling stays off unless `OLLAMA_TOOL_CALLING=true`. Binding Ollama beyond loopback is a separate choice and is described above. The worker container cannot reach an Ollama that listens only on `127.0.0.1`.
+- The task runtime (900 seconds), the per-attempt timeout (1800 seconds), and the supervisor deadline (2700 seconds) are three different clocks. One setting does not bound the others.
+- mypy checks `src/patchpilot`. It does not check `tests/`.
 
 ## Threat model
 
@@ -335,7 +384,8 @@ What the system is built to prevent:
 - A patch is applied only after plan approval, only in the private worktree, and only on paths the approved plan still allows. Docker files, CI workflows, dependency manifests, symlinks, hard links, and mode bits other than a normal file are refused. `git apply --check` runs before `git apply`. There is no shell.
 - A second approval is required before a task branch is pushed. The client has no merge method. The push refuses `main` and `master`. A repeated decision does not open a second pull request.
 - A crashed worker loses its lease. Recovery resumes the checkpoint until `WORKER_MAX_ATTEMPTS`, then the task stays `failed`. Event inserts with the same idempotency key do not replace the first payload.
-- Supervisor rules choose the route. A model recommendation that the rules did not allow is ignored.
+- Supervisor rules choose the route. A model recommendation that the rules did not allow is ignored. Review policy, not the reviewer, chooses accept, repair, or failure.
+- A citation is kept only when `read_text_file` returned that path and those lines. A comment that names another file cannot add a path the tools did not open.
 
 What this does not claim:
 

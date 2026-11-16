@@ -31,7 +31,7 @@ The runner reads a copy of the worktree from the shared runner volume. It does n
 
 ## Workflow
 
-Every specialist node returns to `supervisor`. The rules choose the next node. A task with no repository finalizes after triage. A task with a repository is investigated and planned. A plan that names a code change pauses until a person approves it. Approval creates the worktree. The patch, the tests, and the review then run. Publication, when it is configured, pauses a second time before any push.
+Every specialist node returns to `supervisor`. The rules choose the next node. A task with no repository finalizes after triage. A task with a repository is investigated and planned. A plan that names a code change pauses until a person approves it. Approval creates the worktree. Pytest runs on that unmodified tree and stores a baseline report. The patch, a second test run, and the review then run. Policy can accept a patched suite that only repeats failures already in the baseline. Publication, when it is configured, pauses a second time before any push.
 
 ```mermaid
 flowchart TD
@@ -42,7 +42,7 @@ flowchart TD
   supervisor --> approval[request_plan_approval]
   supervisor --> workspace[prepare_workspace]
   supervisor --> develop
-  supervisor --> test
+  supervisor --> test["test (baseline, then patched)"]
   supervisor --> review
   supervisor --> publishApproval[request_publish_approval]
   supervisor --> publish
@@ -59,7 +59,7 @@ flowchart TD
   finalize --> endNode[END]
 ```
 
-`investigate_more`, `replan`, and `repair` are further trips through `investigate`, `plan`, and `develop`. They are capped: one extra investigation, one replan, and two repairs. Escalation ends at `finalize` with a failed task.
+`investigate_more`, `replan`, and `repair` are further trips through `investigate`, `plan`, and `develop`. They are capped: one extra investigation, one replan, and two repairs. The first visit to `test` is the unmodified worktree. `develop` runs after that report is stored, and the next visit to `test` is the patched tree. Escalation ends at `finalize` with a failed task.
 
 ## Where state lives
 

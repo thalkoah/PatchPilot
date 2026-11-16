@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="900" viewBox="0 0 760 900">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<rect x="270.0" y="16.0" width="200.0" height="32.0" rx="16" fill="#e7f2ea" stroke="#1f5c38" stroke-width="1.6"/>
+<text x="370.0" y="33.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="12" font-weight="700" fill="#1f5c38"><tspan x="370.0" dy="0.0">after approval</tspan></text>
+<path d="M 370.0 48.0 L 370.0 62.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="370.0,70.0 366.2,62.0 373.8,62.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="250.0" y="70.0" width="240.0" height="52.0" rx="7" fill="#e7f2ea" stroke="#1f5c38" stroke-width="1.6"/>
+<text x="370.0" y="89.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="370.0" dy="0.0">prepare workspace</tspan></text>
+<text x="370.0" y="107.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="370.0" dy="0.0">bare clone, task branch</tspan></text>
+<path d="M 370.0 122.0 L 370.0 132.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="370.0,140.0 366.2,132.0 373.8,132.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="250.0" y="140.0" width="240.0" height="52.0" rx="7" fill="#fbf3e4" stroke="#8a5a12" stroke-width="1.6"/>
+<text x="370.0" y="159.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="370.0" dy="0.0">baseline test</tspan></text>
+<text x="370.0" y="177.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="370.0" dy="0.0">pytest, tree still unmodified</tspan></text>
+<path d="M 370.0 192.0 L 370.0 202.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="370.0,210.0 366.2,202.0 373.8,202.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="250.0" y="210.0" width="240.0" height="52.0" rx="7" fill="#e7f2ea" stroke="#1f5c38" stroke-width="1.6"/>
+<text x="370.0" y="229.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="370.0" dy="0.0">develop</tspan></text>
+<text x="370.0" y="247.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="370.0" dy="0.0">up to three exact replacements</tspan></text>
+<path d="M 370.0 262.0 L 370.0 272.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="370.0,280.0 366.2,272.0 373.8,272.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="250.0" y="280.0" width="240.0" height="52.0" rx="7" fill="#fbf3e4" stroke="#8a5a12" stroke-width="1.6"/>
+<text x="370.0" y="299.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="370.0" dy="0.0">patched test</tspan></text>
+<text x="370.0" y="317.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="370.0" dy="0.0">new job id per repair</tspan></text>
+<path d="M 370.0 332.0 L 370.0 342.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="370.0,350.0 366.2,342.0 373.8,342.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="250.0" y="350.0" width="240.0" height="52.0" rx="7" fill="#e7f2ea" stroke="#1f5c38" stroke-width="1.6"/>
+<text x="370.0" y="369.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="370.0" dy="0.0">review</tspan></text>
+<text x="370.0" y="387.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="370.0" dy="0.0">recommendation only</tspan></text>
+<path d="M 370.0 402.0 L 370.0 420.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="370.0,428.0 366.2,420.0 373.8,420.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<polygon points="370.0,428.0 470.0,462.0 370.0,496.0 270.0,462.0" fill="#fbf3e4" stroke="#8a5a12" stroke-width="1.6" stroke-linejoin="round"/>
+<text x="370.0" y="463.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="12" font-weight="700" fill="#1c2430"><tspan x="370.0" dy="0.0">Policy</tspan></text>
+<path d="M 270.0 462.0 L 150.0 462.0 L 150.0 236.0 L 242.0 236.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="250.0,236.0 242.0,239.8 242.0,232.2" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="120.8" y="328.5" width="94.4" height="14.0" rx="2" fill="#ffffff" stroke="#ffffff" stroke-width="0"/>
+<text x="168.0" y="337.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10" font-weight="500" fill="#3d4c5c"><tspan x="168.0" dy="0.0">repair, at most 2</tspan></text>
+<path d="M 470.0 462.0 L 592.0 462.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="600.0,462.0 592.0,465.8 592.0,458.2" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="560.0" y="438.0" width="176.0" height="48.0" rx="7" fill="#f8ecec" stroke="#8a3030" stroke-width="1.6"/>
+<text x="648.0" y="455.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="648.0" dy="0.0">finalize</tspan></text>
+<text x="648.0" y="473.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="648.0" dy="0.0">failed, person needed</tspan></text>
+<rect x="516.0" y="442.5" width="28.0" height="14.0" rx="2" fill="#ffffff" stroke="#ffffff" stroke-width="0"/>
+<text x="530.0" y="451.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10" font-weight="500" fill="#3d4c5c"><tspan x="530.0" dy="0.0">fail</tspan></text>
+<path d="M 370.0 496.0 L 370.0 520.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="370.0,528.0 366.2,520.0 373.8,520.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="373.4" y="506.5" width="37.2" height="14.0" rx="2" fill="#ffffff" stroke="#ffffff" stroke-width="0"/>
+<text x="392.0" y="515.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10" font-weight="500" fill="#3d4c5c"><tspan x="392.0" dy="0.0">accept</tspan></text>
+<polygon points="370.0,528.0 475.0,560.0 370.0,592.0 265.0,560.0" fill="#fbf3e4" stroke="#8a5a12" stroke-width="1.6" stroke-linejoin="round"/>
+<text x="370.0" y="561.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="12" font-weight="700" fill="#1c2430"><tspan x="370.0" dy="0.0">Publication on?</tspan></text>
+<path d="M 475.0 560.0 L 592.0 560.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="600.0,560.0 592.0,563.8 592.0,556.2" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="560.0" y="536.0" width="176.0" height="48.0" rx="7" fill="#f4f6f8" stroke="#5c6b7a" stroke-width="1.6"/>
+<text x="648.0" y="553.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="648.0" dy="0.0">finalize</tspan></text>
+<text x="648.0" y="571.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="648.0" dy="0.0">local only</tspan></text>
+<rect x="516.0" y="540.5" width="28.0" height="14.0" rx="2" fill="#ffffff" stroke="#ffffff" stroke-width="0"/>
+<text x="530.0" y="549.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10" font-weight="500" fill="#3d4c5c"><tspan x="530.0" dy="0.0">off</tspan></text>
+<path d="M 370.0 592.0 L 370.0 616.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="370.0,624.0 366.2,616.0 373.8,616.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="374.0" y="602.5" width="28.0" height="14.0" rx="2" fill="#ffffff" stroke="#ffffff" stroke-width="0"/>
+<text x="388.0" y="611.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10" font-weight="500" fill="#3d4c5c"><tspan x="388.0" dy="0.0">on</tspan></text>
+<rect x="250.0" y="624.0" width="240.0" height="52.0" rx="7" fill="#fbf3e4" stroke="#8a5a12" stroke-width="1.6"/>
+<text x="370.0" y="643.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="370.0" dy="0.0">publish approval</tspan></text>
+<text x="370.0" y="661.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="370.0" dy="0.0">interrupt, nothing pushed</tspan></text>
+<path d="M 370.0 676.0 L 370.0 686.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="370.0,694.0 366.2,686.0 373.8,686.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="250.0" y="694.0" width="240.0" height="52.0" rx="7" fill="#fbf3e4" stroke="#8a5a12" stroke-width="1.6"/>
+<text x="370.0" y="713.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="370.0" dy="0.0">publish</tspan></text>
+<text x="370.0" y="731.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="370.0" dy="0.0">task branch, draft PR</tspan></text>
+<path d="M 370.0 746.0 L 370.0 756.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="370.0,764.0 366.2,756.0 373.8,756.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="250.0" y="764.0" width="240.0" height="52.0" rx="7" fill="#f4f6f8" stroke="#5c6b7a" stroke-width="1.6"/>
+<text x="370.0" y="783.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="13" font-weight="700" fill="#1c2430"><tspan x="370.0" dy="0.0">finalize</tspan></text>
+<text x="370.0" y="801.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="10.5" font-weight="500" fill="#3d4c5c"><tspan x="370.0" dy="0.0">business row for the API</tspan></text>
+<path d="M 370.0 816.0 L 370.0 824.0" fill="none" stroke="#3d4c5c" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+<polygon points="370.0,832.0 366.2,824.0 373.8,824.0" fill="#3d4c5c" stroke="#3d4c5c" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="330.0" y="832.0" width="80.0" height="30.0" rx="15" fill="#1c2430" stroke="#1c2430" stroke-width="1.6"/>
+<text x="370.0" y="848.0" text-anchor="middle" font-family="Liberation Sans, Nimbus Sans, sans-serif" font-size="12" font-weight="700" fill="#ffffff"><tspan x="370.0" dy="0.0">END</tspan></text>
+</svg>
