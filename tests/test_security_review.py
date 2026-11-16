@@ -548,7 +548,7 @@ def test_portfolio_docs_and_ci_match_the_running_system():
     assert "```mermaid" in architecture
     assert "supervisor" in architecture
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    for phrase in ("Threat model", "Cost limits", "Limitations", "docs/screenshots/"):
+    for phrase in ("Threat model", "Cost limits", "Limitations", "docs/manual/diagrams/"):
         assert phrase in readme
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "uv run ruff check ." in workflow
